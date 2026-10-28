@@ -1,0 +1,21 @@
+{
+  "model": "opus",
+  "permissions": {
+    "allow": [
+      "Edit(//sandbox/ekka-workspace/.ekka/**)",
+      "Bash(git remote get-url origin)",
+      "Bash(env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.allow=never -c protocol.https.allow=always -c http.followRedirects=false -c credential.helper=/usr/local/bin/ekka-git-credential clone --template= --no-local --no-recurse-submodules -- *)",
+      "Bash(rm -rf -- /sandbox/ekka-workspace/*)"
+    ],
+    "deny": [
+      "Bash(rm -rf -- /sandbox/ekka-workspace/)",
+      "Bash(rm -rf -- /sandbox/ekka-workspace/.)",
+      "Bash(rm -rf -- /sandbox/ekka-workspace/.ekka)",
+      "Bash(rm -rf -- /sandbox/ekka-workspace/*/*)",
+      "Bash(rm -rf -- /sandbox/ekka-workspace/* *)",
+      "Bash(rm -rf -- *..*)",
+      "Bash(rm -rf -- *$*)",
+      "Bash(rm -rf -- *`*)"
+    ]
+  }
+}
