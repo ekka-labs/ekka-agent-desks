@@ -2,12 +2,9 @@
 
 Runs on NVIDIA OpenShell.
 
-An agent desk is a sandbox where an AI coding agent works on your code, within
-permissions you control. This repository will hold the open source setup for
-EKKA agent desks: one command that installs NVIDIA OpenShell and EKKA together,
-on one machine or on a server your team reaches over your VPN.
+This repository contains the base Docker image for EKKA agent desks. A desk is an isolated workspace where an AI coding agent works on your code.
 
-**The full setup is coming soon.** This first release is the desk base image.
+For installation, policies, provider connections, and a working integration, use the **[EKKA OpenShell example](https://github.com/ekka-labs/ekka-openshell-example)**.
 
 ## The desk base image
 
