@@ -19,7 +19,7 @@ What is in it:
 | `git`, `gh`, `curl`, `jq`, `less`, `procps`, `ca-certificates` | the tools the agent uses on your code |
 | `iproute2`, `nftables` | optional; NVIDIA's reference image lists them for bypass detection |
 | Claude Code, the native binary, at `/usr/local/bin/claude` | the agent; a pinned version, checked against its SHA-256 for each architecture |
-| `/usr/local/bin/ekka-git-credential` | Git's credential helper for the desk's GitHub connection |
+| `/usr/local/bin/ekka-git-credential` | Git's credential helper for the desk's GitHub and Bitbucket connections |
 | `/etc/claude-code/managed-settings.json` | the agent's model and a short list of allowed and refused commands |
 | `/sandbox/ekka-workspace`, `/sandbox/.ekka-inputs` | the folders the desk works in, owned by the non-root `node` user |
 
