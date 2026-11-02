@@ -45,7 +45,7 @@ RUN set -eu; \
     rm -f /tmp/claude; \
     /usr/local/bin/claude --version
 
-# Git's credential helper for the desk's GitHub connection, as a root-owned file. A clone names it with
+# Git's credential helper for the desk's GitHub and Bitbucket connections, as a root-owned file. A clone names it with
 # -c credential.helper=...; an inline shell-function helper is held for approval, and nobody can approve one.
 COPY ekka-git-credential /usr/local/bin/ekka-git-credential
 RUN chown root:root /usr/local/bin/ekka-git-credential && chmod 0755 /usr/local/bin/ekka-git-credential
