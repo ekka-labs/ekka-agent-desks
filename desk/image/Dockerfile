@@ -12,7 +12,10 @@
 # and allowing node to reach Anthropic would allow every node process to. The
 # native binary connects as /usr/local/bin/claude, the path the desk's Claude
 # Code provider names.
-FROM node:20
+# Node 24 LTS on Debian trixie, pinned by digest (ekka-labs/ekka-agent-desks#3). Node 20 reached end of life in April
+# 2026, and bookworm's GLIBC 2.36 cannot start binaries built on current Ubuntu (APM 0.35.0 needs 2.38). A tag alone
+# is whatever was last pushed under it; the digest is the image we tested.
+FROM node:24-trixie@sha256:5c6e2e57d7dd6652ce6f087ba0328312059d7c77f93baa8751865dbf103f1acb
 
 ARG CLAUDE_CODE_VERSION=2.1.294
 # The SHA-256 of that exact version's binary, per architecture, from Anthropic's release manifest
