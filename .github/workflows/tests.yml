@@ -1,0 +1,150 @@
+# The offline tests on every push and pull request: Python 3's standard library only, nothing installed.
+# They check this repository's own files (provider profiles, pins), not OpenShell, EKKA or a model.
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, edited]   # edited: a PR's title or body changed
+permissions:
+  contents: read
+jobs:
+  unittest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: The offline suite
+        run: python3 -m unittest discover -s tests -v
+  public-check:
+    # This repository is public: a pull request's commit messages, title and body must carry no email address
+    # (example domains aside), no private EKKA repository reference and no session link (tools/public_check.py).
+    # The PR's text reaches the check through environment variables only, never pasted into the shell.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Commit messages, title and body carry nothing private
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -o pipefail   # a git log that fails must fail the step, not hand the check an empty text
+          git log --format=%B "$BASE_SHA..$HEAD_SHA" | python3 tools/public_check.py --stdin
+          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | python3 tools/public_check.py --stdin
+  unittest-python39:
+    # The same suite on Amazon Linux 2023's own python3, which is 3.9 (a supported server, README). The gateway
+    # preflight once imported tomllib (3.11+) and so could not start a gateway there at all.
+    # openssl, because the minimal image lacks it while every server has it (certs.sh makes the CA with it), and
+    # the people bundle's trust-ca.sh prints the CA's fingerprint with it (tests/test_trust_ca.py).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: The offline suite on Amazon Linux 2023's Python 3.9
+        run: |
+          docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD":/repo:ro -w /repo \
+            public.ecr.aws/amazonlinux/amazonlinux@sha256:c07ab0773eddf9449c0994a87d8148300db98bdf8d8dad672a9dc26321c104fc \
+            sh -c 'dnf install -q -y git-core openssl findutils && git config --global --add safe.directory /repo \
+                   && python3 --version && python3 -m unittest discover -s tests'
+  pins:
+    # NVIDIA signs neither the gateway nor the supervisor image, so this setup pins the binary: the committed
+    # sha256 in deploy/pins.json must equal the binary in NVIDIA's checksummed release tarball AND the
+    # binary inside the pinned image. Online on purpose; setup itself compares only against committed values.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: The committed pins match NVIDIA's release and the pinned images
+        run: python3 tools/verify_pins.py --online --images
+      - name: The pinned backend adapter is signed by its release workflow, as up.sh checks it at install
+        # The same check as up.sh's step_backend_image, from the same values (tools/backend_image.py), with no
+        # registry login: a pin that is not a signed ekka-labs release fails here, not on a customer's machine.
+        run: |
+          docker run --rm "$(python3 tools/backend_image.py cosign-image)" verify \
+            --certificate-identity-regexp "$(python3 tools/backend_image.py identity)" \
+            --certificate-oidc-issuer "$(python3 tools/backend_image.py issuer)" \
+            "$(python3 tools/backend_image.py image)" >/dev/null
+  install:
+    # The installer on a fresh GitHub-hosted machine, x86_64 and aarch64, as far as such a machine allows. It has
+    # root, systemd and Docker, and no public name, no EKKA sign-in and no API key: the install stops for the EKKA
+    # sign-in at best (step_enroll prints ACTION NEEDED), so no desk is made through EKKA here. What each run reached
+    # is in its log and its step summary. Online on purpose: it downloads every pinned file for its processor type.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    name: install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      NAME: desks-ci.example.invalid
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: This machine
+        run: |
+          set -euo pipefail
+          echo "uname -m: $(uname -m)   kernel: $(uname -r)"
+          echo "Landlock ABI: $(python3 -c 'import ctypes; print(ctypes.CDLL(None, use_errno=True).syscall(444, None, 0, 1))')"
+          echo "LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unreadable)"
+          echo "systemd: $([[ -d /run/systemd/system ]] && echo running || echo absent)"
+          echo "Docker: $(docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}')"
+      - name: Every pinned download, for this processor type (sha256 and ELF type checked)
+        run: EKKA_ONLINE_DOWNLOADS=1 python3 -m unittest tests.test_downloads_online -v
+      - name: cosign, pinned (sha256 from sigstore's cosign_checksums.txt for v2.6.5)
+        run: |
+          set -euo pipefail
+          case $(uname -m) in
+            x86_64)  f=cosign-linux-amd64; sha=c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644 ;;
+            aarch64) f=cosign-linux-arm64; sha=426193b4c5da4d4d643e822f48fe0cc8a476ca1782a272704831f5a0cef716d7 ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/cosign" "https://github.com/sigstore/cosign/releases/download/v2.6.5/$f"
+          echo "$sha  $RUNNER_TEMP/cosign" | sha256sum -c -
+          sudo install -m 0755 "$RUNNER_TEMP/cosign" /usr/local/bin/cosign
+          cosign version | grep GitVersion
+      - name: The installer, as far as this machine goes
+        run: |
+          # Actions runs this with `bash -e`; the install's own exit status is read below, so -e is off here.
+          set +e -uo pipefail
+          sudo ADMIN_EMAIL=ci@example.com ./up.sh server "$NAME" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee "$RUNNER_TEMP/up.log"
+          rc=${PIPESTATUS[0]}
+          { echo "### up.sh on $(uname -m): exit $rc"; echo '```'; grep -E '^(== |   ok: |up: |-- )' "$RUNNER_TEMP/up.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if (( rc == 0 )) && grep -q -- '-- ACTION NEEDED --' "$RUNNER_TEMP/up.log" && grep -q 'Sign in to EKKA' "$RUNNER_TEMP/up.log"; then
+            echo "reached the EKKA sign-in, the furthest a machine with no EKKA account goes"
+          else
+            echo "::error::the install stopped before the EKKA sign-in (exit $rc); see the log above"; exit 1
+          fi
+      - name: What the install put on this machine is built for this machine
+        run: |
+          set -euo pipefail
+          case $(uname -m) in x86_64) elf='x86-64' ;; aarch64) elf='ARM aarch64' ;; esac
+          arch=$(docker version --format '{{.Server.Arch}}')
+          file -L /usr/local/bin/ekka | tee /dev/stderr | grep -q "$elf"
+          sudo file /var/lib/ekka-agent-desks/supervisor/openshell-supervisor | tee /dev/stderr | grep -q "$elf"
+          image=$(python3 tools/backend_image.py image)
+          [[ $(docker image inspect --format '{{.Architecture}}' "$image") == "$arch" ]]
+          docker run --rm --network none "$image" --version
+          (cd deploy && sudo bash setup.sh compose ps --format '{{.Service}} {{.Status}}')
+      - name: The desk image, built on this machine, is this machine's and runs its tools
+        run: |
+          set -euo pipefail
+          [[ $(docker image inspect --format '{{.Architecture}}' ekka-desk:local) == "$(docker version --format '{{.Server.Arch}}')" ]]
+          docker run --rm --network none --entrypoint sh ekka-desk:local -c \
+            'echo "dpkg: $(dpkg --print-architecture)"; claude --version; git --version; gh --version | head -1'
+      - name: Which services run
+        if: always()
+        run: sudo docker ps --format '{{.Names}} {{.Image}} {{.Status}}' || true
