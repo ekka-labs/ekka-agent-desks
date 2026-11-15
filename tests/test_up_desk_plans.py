@@ -79,7 +79,7 @@ class SharedDeskPlans(unittest.TestCase):
     ask plans is offered to the organization and accepted. Only a version EKKA just reported `unlisted`: an offer of a
     version already at `org` goes to EKKA's PUBLIC catalog, and up.sh runs again on every upgrade."""
 
-    def share(self, created, published="requested for org", approved="is now org", sharing=None, text=None):
+    def share(self, created, published="requested for org", approved="is now org", sharing=None, text=None, held=""):
         state = tempfile.mkdtemp()
         calls = os.path.join(state, "calls")
         fn = function() if text is None else "".join(
@@ -97,6 +97,26 @@ docker() {{
   case "$*" in
     *"plan create "*"/plans/plan-setup"*) echo "plan create setup" >> {calls}; printf '%s\\n' "${{CREATED//NAME/setup}}" ;;
     *"plan create "*"/plans/plan-ask"*) echo "plan create ask" >> {calls}; printf '%s\\n' "${{CREATED//NAME/ask}}" ;;
+    *"plan list --all --json"*) [ -n "$HELD" ] && python3 - "$DESKS_STATE/plans" "$HELD" <<'PY'
+import json, os, sys
+rows = []
+for n in sorted(os.listdir(sys.argv[1])):
+    p = json.load(open(os.path.join(sys.argv[1], n)))["plan"]
+    rows.append({{"plan_code": p["code"], "plan_identity": "ekka." + p["code"] + "@1.0.3", "version": "1.0.3",
+                 "status": "active", "visibility": sys.argv[2], "owner_agent": {{"agent_code": "desks"}}}})
+print(json.dumps({{"plans": rows, "total": len(rows)}}))
+PY
+      ;;
+    *"plan show "*"--definition --json"*) [ -n "$HELD" ] && python3 - "$DESKS_STATE/plans" "$*" <<'PY'
+import json, os, sys
+code = [w for w in sys.argv[2].split() if w.startswith("ekka.")][0].split("@")[0][len("ekka."):]
+for n in sorted(os.listdir(sys.argv[1])):
+    d = json.load(open(os.path.join(sys.argv[1], n)))
+    if d["plan"]["code"] == code:
+        print(json.dumps({{"plan_code": code, "name": d["plan"].get("name"), "plan_json": d["definition"],
+                          "owner_agent": {{"agent_code": "desks"}}}}))
+PY
+      ;;
     *"plan publish "*) echo "publish ${{@: -1}}" >> {calls}; printf '%s\\n' "✓ ${{@: -1}}: $PUBLISHED" ;;
     *"plan approve "*) echo "approve ${{@: -1}}" >> {calls}; printf '%s\\n' "✓ ${{@: -1}} $APPROVED" ;;
     *) return 0 ;;
@@ -105,7 +125,7 @@ docker() {{
 {fn}
 create_desk_plans business-desk agent-1 {sharing or ""}
 """
-        env = dict(os.environ, CREATED=created, PUBLISHED=published, APPROVED=approved)
+        env = dict(os.environ, CREATED=created, PUBLISHED=published, APPROVED=approved, HELD=held)
         out = subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, env=env)
         done = open(calls).read().splitlines() if os.path.exists(calls) else []
         return out, done
@@ -120,6 +140,21 @@ create_desk_plans business-desk agent-1 {sharing or ""}
                                  "plan create ask", "publish ekka.example.desk.ask.businessDesk.v1@1.0.3",
                                  "approve ekka.example.desk.ask.businessDesk.v1@1.0.3"])
         self.assertIn("every member of this organization may run it", out.stdout)
+
+    def test_an_unchanged_plan_left_unshared_by_an_earlier_run_is_shared_now(self):
+        # Not created again, but an earlier run that made the version and then failed to share it is finished.
+        out, calls = self.share(self.UNLISTED, held="unlisted")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(calls, ["publish ekka.example.desk.setup.businessDesk.v1@1.0.3",
+                                 "approve ekka.example.desk.setup.businessDesk.v1@1.0.3",
+                                 "publish ekka.example.desk.ask.businessDesk.v1@1.0.3",
+                                 "approve ekka.example.desk.ask.businessDesk.v1@1.0.3"])
+        self.assertEqual(out.stdout.count("(unchanged, no new version)"), 2, out.stdout)
+
+    def test_an_unchanged_plan_already_shared_is_neither_created_nor_offered(self):
+        out, calls = self.share(self.UNLISTED, held="org")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(calls, [], "no create, and no offer of an org version to EKKA's public catalog")
 
     def test_a_version_already_at_org_is_never_offered_again(self):
         out, calls = self.share("✓ Plan created: ekka.example.desk.NAME.businessDesk.v1@1.0.3 · org")

@@ -378,6 +378,26 @@ if a[:1] == ["compose"]:
                           {"connector_type": "api", "node_id": os.environ["NODE"], "instance_id": os.environ["GATE"]}]))
     elif cmd == ["gate", "grant", "list", "--json"]: print(os.environ["GRANTS"])
     elif cmd[:3] == ["gate", "grant", "revoke"]: log(kind="revoke", grant=cmd[3])
+    elif cmd[:4] == ["plan", "list", "--all", "--json"] and os.environ.get("EKKA_HOLDS"):
+        # EKKA already holds every plan the step wrote (EKKA_HOLDS=same) or older versions of them (=older).
+        rows = []
+        d = os.path.join(os.environ["DESKS_STATE"], "plans")
+        for name in sorted(os.listdir(d)):
+            with open(os.path.join(d, name)) as f: p = json.load(f)["plan"]
+            rows.append({"plan_code": p["code"], "plan_identity": f"ekka.{p['code']}@2.0.1", "version": "2.0.1",
+                         "status": "active", "visibility": "unlisted",
+                         "owner_agent": {"agent_code": "desks"}})   # by code, as EKKA answers
+        log(kind="listed"); print(json.dumps({"plans": rows, "total": len(rows)}))
+    elif cmd[:2] == ["plan", "show"] and os.environ.get("EKKA_HOLDS"):
+        code = cmd[2].split("@")[0][len("ekka."):]
+        d = os.path.join(os.environ["DESKS_STATE"], "plans")
+        for name in sorted(os.listdir(d)):
+            with open(os.path.join(d, name)) as f: whole = json.load(f)
+            if whole["plan"]["code"] == code: break
+        definition = whole["definition"] if os.environ["EKKA_HOLDS"] == "same" else {**whole["definition"], "inputs": {}}
+        log(kind="shown", identity=cmd[2])
+        print(json.dumps({"plan_code": code, "name": whole["plan"].get("name"), "plan_json": definition,
+                          "owner_agent": {"agent_code": "desks"}}))
     elif cmd[:2] == ["plan", "create"]:
         name = os.path.basename(cmd[2])
         with open(cmd[2]) as f: log(kind="cp", name=name, plan=json.load(f), to=cmd[2])   # what the Enclave's user reads
@@ -407,7 +427,7 @@ CC = "sha256:" + "7" * 64
 
 def run_step(grants="[]", image=True, digest_fails=False, providers=f"github={GH},claude-code={CC}", provider_fails="",
              adapter_files=True, plan_fails="", up=None, dev_id="", pre_limits=None, own_profiles=None, kc_fails=False,
-             window=None, projects=None, linked_project=None, adapter_health="healthy"):
+             window=None, projects=None, linked_project=None, adapter_health="healthy", ekka_holds=""):
     import subprocess, tempfile
     d = tempfile.mkdtemp()
     os.makedirs(os.path.join(d, "bin"))
@@ -460,7 +480,7 @@ step_desk_grant
 """
     env = dict(os.environ, PATH=f"{d}/bin:{os.environ['PATH']}", CALLS=calls, DESK_ID=IMAGE, POLICY_DIGEST=POLICY_DIGEST,
                NODE="b0000001-0000-4000-8000-000000000001", AGENT=AGENT, GATE=GATE, GRANTS=grants,
-               PROVIDER_DIGESTS=providers, PROVIDER_FAILS=provider_fails, PLAN_FAILS=plan_fails, ADAPTER_HEALTH=adapter_health,
+               PROVIDER_DIGESTS=providers, PROVIDER_FAILS=provider_fails, PLAN_FAILS=plan_fails, ADAPTER_HEALTH=adapter_health, EKKA_HOLDS=ekka_holds,
                **({"DIGEST_FAILS": "1"} if digest_fails else {}), **({"KC_FAILS": "1"} if kc_fails else {}), **({"DEV_ID": dev_id} if dev_id else {}))
     r = subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, env=env, timeout=60,
                        stdin=subprocess.DEVNULL)
@@ -498,6 +518,24 @@ class UpShStep(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("the backend adapter is not running and healthy", r.stderr)
         self.assertEqual([c["kind"] for c in calls if c["kind"] in ("provider", "add", "revoke")], [])
+
+    def test_a_plan_ekka_already_holds_unchanged_makes_no_new_version(self):
+        # `ekka plan create` makes a new version on every call: eight new versions per grant step, nothing changed.
+        r, calls, _ = run_step(ekka_holds="same")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c["name"] for c in calls if c["kind"] == "plan"], [], "no plan created again")
+        self.assertEqual(r.stdout.count("(unchanged, no new version)"), 8, r.stdout)
+
+    def test_a_plan_that_changed_is_created(self):
+        r, calls, _ = run_step(ekka_holds="older")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 8)
+
+    def test_an_ekka_that_cannot_list_its_plans_gets_every_plan_created(self):
+        # The stub answers no plan list without EKKA_HOLDS: unreadable is never "the same".
+        r, calls, _ = run_step()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 8)
 
     def test_an_adapter_that_becomes_healthy_while_waited_for_is_asked(self):
         for name, health in (("after three asks", "starting,starting,healthy"),
