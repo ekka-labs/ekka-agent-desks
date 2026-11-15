@@ -816,9 +816,9 @@ step_start() {
 
 # The setup and ask plans for one desk, owned by the desks agent: create_desk_plans <desk> <agent id>.
 # A plan names its desk as a literal resource, so each desk has its own copy, made from ekka/plans/ by
-# tools/desk_plans.py (example.desk.ask.<deskName>.v1). Created every time: EKKA never refuses an identical plan,
-# it makes a patch version ("nothing it promises changed", measured on staging), and a changed template becomes
-# the newer version a bare plan code runs. ANY refusal stops here with EKKA's reason: treating one as "kept"
+# tools/desk_plans.py (example.desk.ask.<deskName>.v1). Created only when it changed (install_plans): EKKA never
+# refuses an identical plan, it makes a patch version on every create, and a changed template becomes the newer
+# version a bare plan code runs. ANY refusal stops here with EKKA's reason: treating one as "kept"
 # would leave this machine running the old plan after an upgrade it never got.
 # Shared by default: every member of the organization may run them (the desk installation checks), so a second
 # member asks a desk without the administrator. `private` keeps them the administrator's alone.
@@ -832,7 +832,7 @@ create_desk_plans() {
 # The eight desk administration plans, owned by the desks agent: create_desk_admin_plans <api gate> <agent id>.
 # `ekka desk create`, `stop`, `status` and the rest each run one (ekka.desk.<op>.v1), and creating them is what
 # declares api.write on the desks agent: before they exist, EKKA refuses the desks grant ("This agent does not
-# declare 'api.write'"). The desk is an input, so one set serves every desk. Created every time, as above.
+# declare 'api.write'"). The desk is an input, so one set serves every desk. Created only when changed, as above.
 create_desk_admin_plans() {
   local gate=$1 agent=$2 dir=$DESKS_STATE/plans made
   install -d -m 0755 "$dir"
@@ -844,9 +844,22 @@ create_desk_admin_plans() {
 # install_plans "<path> <code>"... shared|private. A shared plan is offered to the organization and accepted (share_plan).
 install_plans() {
   local sharing=${2:-private}
-  local path code out identity rung
+  local path code out identity rung listed newest
+  # `ekka plan create` makes a new version on every call, so a plan that is already EKKA's newest version, with the
+  # same definition, name and agent, is not created again (tools/plan_same.py). Anything unreadable creates one.
+  listed=$(ekka_in plan list --all --json 2>/dev/null </dev/null || true)
   # Every command in this loop gets /dev/null as input: otherwise the first one swallows the rest of the list.
   while read -r path code; do
+    newest=""; rung=""   # nothing printed (no version held, or one unreadable) leaves both empty: create
+    read -r newest rung < <(python3 tools/plan_same.py latest "$path" "$DESKS_AGENT" <<<"$listed" 2>/dev/null || true) || true
+    if [[ -n ${newest:-} ]] && ekka_in plan show "$newest" --definition --json 2>/dev/null </dev/null \
+         | python3 tools/plan_same.py same "$path" "$DESKS_AGENT" >/dev/null 2>&1; then
+      ok "plan $newest, owned by $DESKS_AGENT (unchanged, no new version)"
+      # A shared plan must also be offered to the organization: a version an earlier run made but could not share
+      # is shared now (share_plan offers only an `unlisted` version, never one already at `org`).
+      [[ $sharing == shared ]] && share_plan "$newest" "${rung:-}"
+      continue
+    fi
     enclave_home_file "plans/$(basename "$path")" 0600 < "$path"   # a file the Enclave's user may read
     out=$(ekka_in plan create "$ENCLAVE_HOME/plans/$(basename "$path")" 2>&1 </dev/null) \
       || die "the plan $code was not created: $(grep -v -E '^\s*$|STAGING|rehearsal' <<<"$out" | head -3 | tr '\n' ' ')
