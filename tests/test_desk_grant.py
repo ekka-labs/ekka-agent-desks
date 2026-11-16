@@ -140,6 +140,19 @@ class TheLimits(unittest.TestCase):
         self.assertNotIn("discovery", build(), "no window: no desk may enter auto approval mode")
 
 
+class TheProviderCap(unittest.TestCase):
+    def test_sixteen_providers_fit_and_seventeen_are_refused_never_cut(self):
+        """The FULL schema holds at most 16 providers. Seventeen are refused by name, never cut to fit."""
+        def providers(n):
+            return {f"p{i:02d}": "sha256:" + f"{i:02d}" * 32 for i in range(n)}
+        lim = build(provider_digests=providers(16))
+        self.assertEqual(len(lim["providers"]), 16)
+        self.assertEqual(errors(lim), [])
+        with self.assertRaises(dg.Refused) as e:
+            build(provider_digests=providers(17))
+        self.assertIn("at most 16 providers", str(e.exception))
+
+
 class TheDiscoveryWindow(unittest.TestCase):
     """`sudo ekka desk grant discovery --image <ref> --providers <a,b> [--minutes N]`: the project's image and the
     grant's `discovery` block, for NVIDIA OpenShell's auto approval mode on one discovery desk. No policy, address
