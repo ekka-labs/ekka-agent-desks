@@ -460,9 +460,29 @@ kc() {  # the realm script against this machine's Keycloak admin listener
 # The backend adapter's credential, from Keycloak into the Enclave's vault through a pipe only: never a
 # file, an argument or a terminal. The connection is the `desks` catalog row: the adapter's socket, this machine only.
 connect_desk_admin() {
-  kc admin-client on | ekka_in api connect desks --input socket=/run/ekka-backend/backend.sock --reach loopback --stdin >/dev/null \
-    || die "the backend adapter's credential did not reach the Enclave's vault; nothing was stored on disk"
-  ok "the backend adapter's credential is in the Enclave's vault (connection desks, this machine only)"
+  local err
+  if err=$(kc admin-client on | ekka_in api connect desks --input socket=/run/ekka-backend/backend.sock --reach loopback --stdin 2>&1 >/dev/null); then
+    ok "the backend adapter's credential is in the Enclave's vault (connection desks, this machine only)"; return 0
+  fi
+  # EKKA's desks catalog entry widened the paths the adapter's connection may reach (1.1.0: the adapter's whole /v1/
+  # space; the adapter itself refuses any route its contract does not name). The Enclave refuses to replace a
+  # connection whose paths changed, so when the paths are the ONLY difference it is replaced on purpose: disconnect,
+  # then connect again. The desks grant names the resource apis/desks, and a disconnect never revokes it. This
+  # connection is the installer's own (one destination, one setting, its own credential), so replacing it can only
+  # put back these values; a different destination, sign-in or setting is still refused below.
+  if [[ $(grep -c '^  what differs: ' <<<"$err") == 1 ]] && grep -qx '  what differs: the paths it may reach' <<<"$err"; then
+    local derr
+    derr=$(ekka_in api disconnect desks --yes 2>&1 >/dev/null) || {
+      printf '%s\n' "$derr" >&2
+      die "the desks API did not disconnect cleanly to take the paths EKKA's catalog now gives it (reason above); it may already be removed: run sudo ./up.sh again to connect it"
+    }
+    kc admin-client on | ekka_in api connect desks --input socket=/run/ekka-backend/backend.sock --reach loopback --stdin >/dev/null \
+      || die "the desks API was disconnected and did not connect again with its new paths; run sudo ./up.sh again"
+    ok "the desks API reconnected with the paths EKKA's catalog now gives it (the adapter's whole route space)"
+    ok "the backend adapter's credential is in the Enclave's vault (connection desks, this machine only)"; return 0
+  fi
+  printf '%s\n' "$err" >&2
+  die "the backend adapter's credential did not reach the Enclave's vault; nothing was stored on disk"
 }
 
 install_cli() {  # always NVIDIA's pinned CLI at our own path: a different openshell already on the PATH is never used
