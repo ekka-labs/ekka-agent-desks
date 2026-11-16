@@ -12,12 +12,14 @@ Writes <out-dir>/plan-setup-<desk>.json and <out-dir>/plan-ask-<desk>.json, and 
 
     python3 tools/desk_plans.py --admin <api gate> <out-dir> [<agent id>]
 
-The nine desk administration plans of an organization: `ekka desk create`, `delete`, `stop`, `start`,
-`allow`/`deny`/`policy set`, `disconnect`, `status`, `policy show` and `grant show` each run one of them,
-by name (ekka.desk.<op>.v1). Each is one call through the Enclave's API gate to the backend adapter on `apis/desks`,
-may be run only by an organization
-admin, and reads two facts from the adapter's answer: `outcome` and `desk_ready`. Unlike the example plans the
-desk is an input when needed; grantfacts has no inputs. One set serves every desk.
+The eleven desk administration plans of an organization: nine per-operation plans kept for older runners,
+plus two general plans, ekka.desk.read.v1 and ekka.desk.write.v1, for any adapter operation. The older runners
+call `create`, `delete`, `stop`, `start`, `policy`, `detach`, `status`, `policyread` and `grantfacts` by name
+(ekka.desk.<op>.v1). Each plan is one call through the Enclave's API gate to the backend adapter on `apis/desks`,
+may be run only by an organization admin, and reads two facts from the adapter's answer: `outcome` and
+`desk_ready`. The general plans take the route as a whole input; the write also takes the whole request and
+its body hash. The per-operation plans take the desk as an input when needed; grantfacts has no inputs.
+One set serves every desk.
 Writes <out-dir>/plan-desk-<op>.json, and prints each plan code.
 Standard library only.
 """
@@ -127,7 +129,10 @@ ADMIN_INPUTS = {
     "body": "The exact request body, a JSON object, as the CLI built it.",
     "body_sha256": "The SHA-256 of the body as the API gate encodes it, lowercase hex. With no body, the SHA-256 of "
                    "zero bytes, so a body slipped in is refused.",
+    "path": "The adapter route, starting with /v1/, for example /v1/grant-facts or /v1/desks/code-desk/stop.",
+    "request": "The request: method is POST, PUT or DELETE; body is the optional exact JSON object as the CLI built it.",
 }
+GENERAL_ADMIN_PLANS = ("read", "write")
 # What a plan reads from the adapter's answer. `running` is left out on purpose: the adapter answers it only at its
 # deadline, as an HTTP 202, and a fact outside the enum fails the step. Not `required`: Govern refuses a required
 # field the API gate does not promise, and a fact that is missing fails the run through the transitions' default.
@@ -144,8 +149,6 @@ ADMIN_USAGE = "python3 tools/desk_plans.py --admin <api gate> <out-dir> [<agent 
 
 def admin_plan(op, api_gate, agent=None):
     """One desk administration plan, ekka.desk.<op>.v1, calling the adapter through `api_gate`."""
-    if not API_GATE.match(api_gate or ""):
-        raise ValueError(f"'{api_gate}' is not an API gate instance id, for example enclaveb0000002Api")
     rows = {r[0]: r for r in ADMIN_PLANS}
     if op not in rows:
         raise ValueError(f"'{op}' is not a desk administration plan; there are: {', '.join(rows)}")
@@ -162,6 +165,40 @@ def admin_plan(op, api_gate, agent=None):
     else:
         call["expect"] = {"status": 200}
         contract["expect"] = {"type": "object"}
+    return _admin_plan(op, name, access, inputs, call, contract, api_gate, agent)
+
+
+def general_admin_plan(op, api_gate, agent=None):
+    """A general adapter call: the route and write request are whole-value inputs."""
+    if op not in GENERAL_ADMIN_PLANS:
+        raise ValueError(f"'{op}' is not a general desk administration plan; there are: read, write")
+    call = {"resource": "apis/desks", "key": "@input.path"}
+    contract = {"resource": {"type": "string"}, "key": {"type": "string"}}
+    if op == "write":
+        name = "Change something on the desk server"
+        inputs = ("path", "request", "body_sha256")
+        # Embedded references are resolved only in value.body, never value.method. Bind the whole request.
+        call.update(value="@input.request", body_sha256="@input.body_sha256")
+        contract["value"] = {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["POST", "PUT", "DELETE"], "required": True},
+                "body": {"type": "object"},
+            },
+        }
+        contract["body_sha256"] = {"type": "string"}
+    else:
+        name = "Read from the desk server"
+        inputs = ("path",)
+        call["expect"] = {"status": 200}
+        contract["expect"] = {"type": "object"}
+    return _admin_plan(op, name, op, inputs, call, contract, api_gate, agent)
+
+
+def _admin_plan(op, name, access, inputs, call, contract, api_gate, agent):
+    """The shared envelope, facts and transitions for every organization-owned administration plan."""
+    if not API_GATE.match(api_gate or ""):
+        raise ValueError(f"'{api_gate}' is not an API gate instance id, for example enclaveb0000002Api")
     plan = {
         "plan": {"code": f"desk.{op}.v1", "name": name},
         "definition": {
@@ -201,8 +238,10 @@ def main_admin(argv):
     api_gate, out = argv[0], argv[1]
     agent = argv[2] if len(argv) == 3 else None
     try:
-        for op, *_ in ADMIN_PLANS:
-            d = admin_plan(op, api_gate, agent)
+        plans = [admin_plan(op, api_gate, agent) for op, *_ in ADMIN_PLANS]
+        plans.extend(general_admin_plan(op, api_gate, agent) for op in GENERAL_ADMIN_PLANS)
+        for d in plans:
+            op = d["plan"]["code"].split(".")[1]
             path = os.path.join(out, f"plan-desk-{op}.json")
             with open(path, "w") as f:
                 json.dump(d, f, indent=2)

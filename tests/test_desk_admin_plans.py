@@ -1,6 +1,7 @@
-"""The nine desk administration plans of an organization.
+"""The eleven desk administration plans of an organization.
 
-`ekka desk <op>` runs one of them by name: one call through the Enclave's API gate to the backend adapter on
+Nine per-operation plans stay for older runners; two general plans read or write any adapter route.
+`ekka desk <op>` runs a plan by name: one call through the Enclave's API gate to the backend adapter on
 `apis/desks`, run only by an organization admin, reading `outcome` and `desk_ready` from the adapter's answer.
 The inputs are the one table the CLI sends. The routes and the answers are the adapter contract's own,
 read from vendor/ekka-contracts (published @ekka-ai/contracts 0.83.0), never restated here.
@@ -20,6 +21,8 @@ import desk_plans  # noqa: E402
 
 GATE = "enclaveb0000002Api"
 OPS = [op for op, *_ in desk_plans.ADMIN_PLANS]
+GENERAL_OPS = ["read", "write"]
+ALL_OPS = OPS + GENERAL_OPS
 EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 # The one table of plan inputs, as `ekka desk <op>` sends them, written here from the plan and not read
@@ -47,6 +50,11 @@ def vendored(path):
 
 def step(plan):
     return plan["definition"]["operations"][0]["steps"][0]
+
+
+def admin_plan(op):
+    builder = desk_plans.general_admin_plan if op in GENERAL_OPS else desk_plans.admin_plan
+    return builder(op, GATE)
 
 
 def facts_accept(contract, answer):
@@ -146,6 +154,78 @@ class TheNinePlans(unittest.TestCase):
             self.assertEqual(s["action_input"], {}, op)
 
 
+class TheGeneralPlans(unittest.TestCase):
+    def test_are_named_for_read_and_write_with_the_given_owner_and_gate(self):
+        names = {"read": "Read from the desk server", "write": "Change something on the desk server"}
+        self.assertEqual(list(desk_plans.GENERAL_ADMIN_PLANS), GENERAL_OPS)
+        for op, name in names.items():
+            with self.subTest(op=op):
+                plan = desk_plans.general_admin_plan(op, "exampleApi", "example-agent")
+                self.assertEqual(plan["plan"], {"code": f"desk.{op}.v1", "name": name, "agent": "example-agent"})
+                d = plan["definition"]
+                self.assertEqual(d["schema_version"], "ekka.plan.v2")
+                self.assertNotIn("runs_as", d)
+                self.assertEqual(d["requires_role"], "admin")
+                self.assertEqual(len(d["operations"]), 1)
+                operation = d["operations"][0]
+                self.assertEqual(operation["max_visits"], 1)
+                self.assertEqual(operation["execution"], {"preferred": {"mode": "async", "runtime": "node"}})
+                self.assertEqual(len(operation["steps"]), 1)
+                s = step(plan)
+                self.assertEqual((s["op"], s["feature"]), (op, f"api.{op}"))
+                self.assertEqual((s["action_ref"], s["target"]), ("ekka.gate.api.v1", "exampleApi"))
+                self.assertEqual(s["identity"], {"requires_user_context": True})
+                self.assertEqual(s["action_input"], {})
+
+    def test_read_binds_the_whole_route_and_requires_only_path(self):
+        plan = desk_plans.general_admin_plan("read", GATE)
+        self.assertEqual(list(plan["definition"]["inputs"]), ["path"])
+        s = step(plan)
+        self.assertEqual(s["inputs"], {"resource": "apis/desks", "key": "@input.path", "expect": {"status": 200}})
+        self.assertEqual(s["step_input_contract"], {
+            "type": "object",
+            "properties": {"resource": {"type": "string"}, "key": {"type": "string"}, "expect": {"type": "object"}},
+            "required": ["expect", "key", "resource"],
+        })
+
+    def test_write_binds_the_whole_request_and_pins_its_body(self):
+        plan = desk_plans.general_admin_plan("write", GATE)
+        self.assertEqual(list(plan["definition"]["inputs"]), ["path", "request", "body_sha256"])
+        self.assertEqual(plan["definition"]["inputs"]["body_sha256"], desk_plans.ADMIN_INPUTS["body_sha256"])
+        s = step(plan)
+        self.assertEqual(s["inputs"], {
+            "resource": "apis/desks", "key": "@input.path", "value": "@input.request", "body_sha256": "@input.body_sha256",
+        })
+        self.assertEqual(s["step_input_contract"], {
+            "type": "object",
+            "properties": {
+                "resource": {"type": "string"},
+                "key": {"type": "string"},
+                "value": {
+                    "type": "object",
+                    "properties": {
+                        "method": {"type": "string", "enum": ["POST", "PUT", "DELETE"], "required": True},
+                        "body": {"type": "object"},
+                    },
+                },
+                "body_sha256": {"type": "string"},
+            },
+            "required": ["body_sha256", "key", "resource", "value"],
+        })
+
+    def test_omitting_the_agent_keeps_the_product_default(self):
+        for op in GENERAL_OPS:
+            self.assertNotIn("agent", desk_plans.general_admin_plan(op, GATE)["plan"])
+
+    def test_refuses_invalid_gates_and_unknown_operations(self):
+        for op in GENERAL_OPS:
+            for bad in ["", "enclave 1", "-x", "../gate"]:
+                with self.subTest(op=op, gate=bad), self.assertRaises(ValueError):
+                    desk_plans.general_admin_plan(op, bad)
+        with self.assertRaises(ValueError):
+            desk_plans.general_admin_plan("connect", GATE)
+
+
 class TheFacts(unittest.TestCase):
     """EKKA output validation: each plan's facts, checked against the adapter's own answers."""
 
@@ -155,8 +235,8 @@ class TheFacts(unittest.TestCase):
                         if n.startswith("result.")}   # the answers only: the config, marker and hold samples are not
 
     def test_are_outcome_and_desk_ready_and_nothing_else(self):
-        for op in OPS:
-            contract = step(desk_plans.admin_plan(op, GATE))["step_output_contract"]
+        for op in ALL_OPS:
+            contract = step(admin_plan(op))["step_output_contract"]
             self.assertEqual(contract["properties"], {
                 "outcome": {"type": "string", "enum": ["ready", "refused", "unknown"]},
                 "desk_ready": {"type": "boolean"},
@@ -164,8 +244,8 @@ class TheFacts(unittest.TestCase):
             self.assertNotIn("required", contract, f"{op}: Govern refuses a required field the gate does not promise")
 
     def test_take_every_answer_a_plan_reaches_and_refuse_running(self):
-        for op in OPS:
-            contract = step(desk_plans.admin_plan(op, GATE))["step_output_contract"]
+        for op in ALL_OPS:
+            contract = step(admin_plan(op))["step_output_contract"]
             for name, answer in self.samples.items():
                 with self.subTest(op=op, sample=name):
                     self.assertEqual(facts_accept(contract, answer), answer["outcome"] != "running",
@@ -173,8 +253,8 @@ class TheFacts(unittest.TestCase):
         self.assertIn("running", {a["outcome"] for a in self.samples.values()}, "the running answer is vendored")
 
     def test_only_ready_ends_the_run_well(self):
-        for op in OPS:
-            transitions = desk_plans.admin_plan(op, GATE)["definition"]["operations"][0]["transitions"]
+        for op in ALL_OPS:
+            transitions = admin_plan(op)["definition"]["operations"][0]["transitions"]
             self.assertEqual(transitions, {"output.outcome == 'ready'": "end", "default": "fail"}, op)
 
 
@@ -227,13 +307,20 @@ class TheGrantFactsRead(unittest.TestCase):
 
 
 class TheTool(unittest.TestCase):
-    def test_writes_the_nine_plans_and_names_each(self):
+    def test_writes_the_eleven_plans_and_names_each(self):
         out = tempfile.mkdtemp()
         r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "desk_plans.py"), "--admin", GATE, out, "a-1"],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(sorted(os.listdir(out)), sorted(f"plan-desk-{op}.json" for op in OPS))
-        self.assertEqual([line.split()[1] for line in r.stdout.splitlines()], [f"ekka.desk.{op}.v1" for op in OPS])
+        self.assertEqual(len(ALL_OPS), 11)
+        self.assertEqual(sorted(os.listdir(out)), sorted(f"plan-desk-{op}.json" for op in ALL_OPS))
+        self.assertEqual([line.split()[1] for line in r.stdout.splitlines()], [f"ekka.desk.{op}.v1" for op in ALL_OPS])
+        for op in ALL_OPS:
+            with open(os.path.join(out, f"plan-desk-{op}.json")) as f:
+                plan = json.load(f)
+            self.assertEqual(plan["plan"]["agent"], "a-1")
+            self.assertNotIn("runs_as", plan["definition"])
+            self.assertEqual(step(plan)["target"], GATE)
 
     def test_refuses_a_bad_gate_by_name(self):
         r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "desk_plans.py"), "--admin", "bad gate",
