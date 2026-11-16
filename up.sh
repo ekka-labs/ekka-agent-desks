@@ -1052,11 +1052,14 @@ print(agent[0] if agent else "", api[0] if api else "")') || true
   [[ -f $extras_file ]] && extra_args=(--window "$extras_file")
   # The ceiling comes from the very profile files the gateway holds (sync_profiles imports the same ones), so a
   # profile can never sit outside it: an install's own providers.local file in place of the shipped one.
-  local profile_args=() pname psrc
+  local profile_args=() profile_files=() pname psrc
   for pname in $(profile_names); do
     psrc=$(profile_source "$pname") || die "profile $pname could not be read; no grant was changed"
-    profile_args+=(--profile "$psrc")
+    profile_args+=(--profile "$psrc"); profile_files+=("$psrc")
   done
+  # The same ceiling as a record EKKA's desk commands read (each profile's hosts): root's, from / down.
+  python3 tools/desk_records.py ceiling "$DESKS_STATE/backend/provider-ceiling.json" "${profile_files[@]}" \
+    || die "the provider ceiling record could not be confirmed; no grant was changed"
   # A project (sudo ekka desk grant project add …) adds its own image and its own policy, from the record it wrote;
   # `project remove` deletes that record. Unlike a window it has no end, so every run of this step keeps it.
   local project_args=() pfile

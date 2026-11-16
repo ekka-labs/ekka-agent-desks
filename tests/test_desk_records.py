@@ -1,4 +1,4 @@
-"""The two records the installer writes for EKKA's desk commands (tools/desk_records.py).
+"""The records the installer writes for EKKA's desk commands (tools/desk_records.py).
 
 What matters is who can change them: root only. So the tests plant the ways someone else could: a link where the
 record goes, a link or a writable folder on the way to it, a folder owned by someone else. Each is refused before a
@@ -8,6 +8,7 @@ in place and says so: replaced, and the disk did not confirm it is saved.
 Most tests run as any user, with their own folder as the trusted top and their own uid as the owner. The last one
 needs root: as another user it reads the record and is refused writing, deleting or renaming over it.
 """
+import glob
 import io
 import json
 import os
@@ -21,6 +22,7 @@ from unittest import mock
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import desk_records as dr  # noqa: E402
+import desk_grant as dg  # noqa: E402
 
 ME = os.getuid()
 ID = "sha256:" + "ab" * 32
@@ -172,6 +174,86 @@ class Inputs(unittest.TestCase):
                 dr.image_bytes(bad)
 
 
+class Ceiling(Top):
+    def profile(self, name="model.yaml", text="endpoints:\n  - host: model.example.com\n"):
+        path = self.path(name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def command(self, files):
+        dest = self.path("state", "backend", "provider-ceiling.json")
+        real_write = dr.write
+        with mock.patch.object(dr, "write", side_effect=lambda dest, data:
+                               real_write(dest, data, top=self.top, owner=ME)) as write, \
+                mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err, \
+                mock.patch.object(sys, "stdout", new_callable=io.StringIO) as out:
+            code = dr.main(["ceiling", dest, *files])
+        return code, err.getvalue(), out.getvalue(), dest, write
+
+    def assertRefused(self, files, says, code=1):
+        result, err, out, dest, write = self.command(files)
+        self.assertEqual(result, code, err)
+        self.assertIn(says, err)
+        self.assertEqual(out, "")
+        write.assert_not_called()
+        self.assertFalse(os.path.exists(dest))
+        self.assertFalse(os.path.exists(self.path("state")), "no output folder is made either")
+
+    def test_the_shipped_profiles_and_their_union_are_the_grants_ceiling(self):
+        files = sorted(glob.glob(os.path.join(ROOT, "providers", "*.yaml")))
+        code, err, _, dest, write = self.command(list(reversed(files)))
+        self.assertEqual(code, 0, err)
+        write.assert_called_once()
+        with open(dest) as f:
+            doc = json.load(f)
+        expected = {"bitbucket": ["api.bitbucket.org", "bitbucket.org"],
+                    "claude-code": ["api.anthropic.com"],
+                    "codex": ["ab.chatgpt.com", "api.openai.com", "auth.openai.com", "chatgpt.com"],
+                    "github": ["api.github.com", "github.com"]}
+        self.assertEqual(doc["profiles"], [{"name": n, "hosts": hs} for n, hs in sorted(expected.items())])
+        self.assertEqual(doc["hosts"], dg.profile_hosts(files=files))
+        self.assertEqual(doc["hosts"], sorted({h for p in doc["profiles"] for h in p["hosts"]}))
+        self.assertEqual((stat.S_IMODE(os.stat(dest).st_mode), os.stat(dest).st_uid), (0o644, ME))
+
+    def test_hosts_are_unique_per_profile_and_across_profiles_and_names_come_from_files(self):
+        text = "id: different\nendpoints:\n  - host: model.example.com\n  - host: model.example.com\n"
+        files = [self.profile("second.yaml", text), self.profile("first.yaml", text)]
+        self.assertEqual(json.loads(dr.ceiling_bytes(files)), {
+            "profiles": [{"name": name, "hosts": ["model.example.com"]} for name in ("first", "second")],
+            "hosts": ["model.example.com"]})
+
+    def test_a_bad_host_is_refused_before_writing(self):
+        self.assertRefused([self.profile(text="endpoints:\n  - host: bad_host.example.com\n")],
+                           "names a host the limits cannot hold")
+
+    def test_a_non_yaml_or_odd_profile_name_is_refused_before_writing(self):
+        for name in ("model.json", "model.yml", "model.YAML", ".yaml", ".hidden.yaml", "two words.yaml",
+                     "-model.yaml", "model;.yaml", "model.yaml\n", "model\n.yaml", "Model.yaml", "m" * 64 + ".yaml"):
+            with self.subTest(name=name):
+                self.assertRefused([self.profile(name)], "is not a provider profile file")
+
+    def test_a_repeated_name_is_refused_even_from_different_folders(self):
+        first = self.profile("shipped/model.yaml")
+        second = self.profile("local/model.yaml")
+        for files in ([first, first], [first, second]):
+            with self.subTest(files=files):
+                self.assertRefused(files, "two profile files are named")
+
+    def test_no_files_are_refused_before_writing(self):
+        with self.assertRaisesRegex(dr.Refused, "no provider profile was given"):
+            dr.ceiling_bytes([])
+        self.assertRefused([], "ceiling <dest> <profile.yaml>...", code=2)
+
+    def test_an_empty_ceiling_is_refused_before_writing(self):
+        self.assertRefused([self.profile(text="id: model\nendpoints: []\n")], "the ceiling would be empty")
+
+    def test_a_union_that_differs_from_the_grants_ceiling_is_refused_before_writing(self):
+        with mock.patch.object(dg, "profile_hosts", return_value=["other.example.com"]):
+            self.assertRefused([self.profile()], "do not add up to the grant's ceiling")
+
+
 class CommandLineWrites(Top):
     def run_image_command(self, dest):
         write = dr.write
@@ -231,6 +313,14 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(self.run_tool().returncode, 2)
         self.assertEqual(self.run_tool("other", "a", "b").returncode, 2)
 
+    def test_ceiling_usage_requires_a_destination_and_at_least_one_profile(self):
+        for args in ((), ("ceiling",), ("ceiling", "dest.json")):
+            with self.subTest(args=args):
+                r = self.run_tool(*args)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("ceiling <dest> <profile.yaml>...", r.stderr)
+                self.assertEqual(r.stdout, "")
+
     @unittest.skipIf(os.geteuid() == 0, "as root, a temporary folder can be root's")
     def test_the_command_line_trusts_only_root_from_slash(self):
         """The command line takes no top and no owner: as anyone but root, under folders that are not root's,
@@ -240,6 +330,16 @@ class CommandLine(unittest.TestCase):
             r = self.run_tool("baseline", POLICY, dest)
             self.assertEqual(r.returncode, 1, r.stderr)
             self.assertIn("REFUSED", r.stderr)
+            self.assertFalse(os.path.exists(dest))
+
+    @unittest.skipIf(os.geteuid() == 0, "as root, a temporary folder can be root's")
+    def test_the_ceiling_command_line_keeps_the_root_only_trust_checks(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "provider-ceiling.json")
+            r = self.run_tool("ceiling", dest, os.path.join(ROOT, "providers", "github.yaml"))
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("REFUSED", r.stderr)
+            self.assertIn("the ceiling record was not written", r.stderr)
             self.assertFalse(os.path.exists(dest))
 
 
