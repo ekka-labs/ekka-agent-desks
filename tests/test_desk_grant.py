@@ -1,7 +1,7 @@
 """The desks grant's limits and whether the grant in place holds them.
 
-The limits are checked against the vendored @ekka-ai/contracts governance/grant-constraints/desks.v1 schema itself,
-including its optional, closed `discovery` block (0.76.0), which a discovery window writes.
+The limits are checked against the vendored governance/grant-constraints/desks.v1 schema itself,
+including its optional, closed `discovery` block, which a discovery window writes.
 The policy digest below is the REAL `ekka-backend digest policy` over desk/policy.json, measured on 2026-11-15 with
 `ekka-backend` built from its v0.1.4 tag (fd8b393), which gave the earlier pin for the policy before `/dev/shm`; the test of the decision uses Govern's grant rows as
 `ekka gate grant list --json` prints them (verbatim rows).
@@ -239,8 +239,8 @@ class TheDiscoveryWindow(unittest.TestCase):
         self.assertIn("no discovery window: the shipped limits are in force", dg.show(build(), None, now=NOW))
 
     def test_show_names_the_image_the_policy_and_the_providers_in_words(self):
-        # A client box, 3 Nov 2026: "providers: none   host ceiling: ..." on one line, and two bare digests. Nobody could
-        # tell which image or policy was granted, what "none" meant, or how to connect a key.
+        # Label each digest and explain an empty provider list, so the reader knows what was granted
+        # and how to connect a key.
         t = dg.show(build(provider_digests={}), None, ["claude-code", "github"])
         self.assertIn("ekka-desk:local, built by the install\n      " + IMAGE, t)
         self.assertIn("desk/policy.json, the shipped policy\n      " + POLICY_DIGEST, t)
@@ -431,10 +431,10 @@ def run_step(grants="[]", image=True, digest_fails=False, providers=f"github={GH
     import subprocess, tempfile
     d = tempfile.mkdtemp()
     os.makedirs(os.path.join(d, "bin"))
-    # By this step step_desk_admin has written and checked the adapter's configuration, and init the CA
+    # By this step step_backend_image wrote the baseline, step_desk_admin the configuration, and init the CA
     # (tools/backend_preflight.py); the adapter is run by name below, so its files are checked again.
     if adapter_files:
-        for rel in ("backend/config.json", "tls/ca.crt"):
+        for rel in ("backend/config.json", "tls/ca.crt", "backend/baseline-policy.json"):
             os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
             with open(os.path.join(d, rel), "w") as f:
                 f.write("{}")

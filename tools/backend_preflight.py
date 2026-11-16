@@ -1,9 +1,9 @@
-"""Before the backend adapter starts: its configuration and the gateway's CA must be real files, and its discovery
+"""Before the backend adapter starts: its configuration, baseline and the gateway's CA must be real files, and its discovery
 permits folder a real folder.
 
     python3 tools/backend_preflight.py <state folder> [--always]
 
-The adapter bind-mounts two files, read-only: `backend/config.json` and `tls/ca.crt`. If either is
+The adapter bind-mounts three files, read-only: `backend/config.json`, `backend/baseline-policy.json` and `tls/ca.crt`. If any is
 missing, Docker's short bind syntax CREATES AN EMPTY DIRECTORY in its place and the container starts on it.
 compose.yml asks for the opposite (`create_host_path: false`), and Compose v2.38.2 and v5.5.1 honor it (measured),
 but that is Compose's behavior, version by version, and an older Compose renders and treats it differently.
@@ -24,6 +24,7 @@ import sys
 FILES = (
     ("backend/config.json", "the adapter's configuration, written once this machine is enrolled: run sudo ./up.sh"),
     ("tls/ca.crt", "the gateway's CA, made by setup.sh init: run sudo ./up.sh"),
+    ("backend/baseline-policy.json", "the reviewed baseline policy, root's, written by sudo ./up.sh"),
 )
 DIRS = (
     ("backend/permits", "the discovery permits folder, the Enclave's user's, 0750, made by sudo ./up.sh"),

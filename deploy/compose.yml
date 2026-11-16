@@ -161,6 +161,11 @@ services:
         target: /etc/ekka-backend/ca.pem
         read_only: true
         bind: {create_host_path: false}
+      - type: bind                                  # the reviewed baseline policy, root's (tools/desk_records.py)
+        source: ${DESKS_STATE:-/var/lib/ekka-agent-desks}/backend/baseline-policy.json
+        target: /etc/ekka-backend/baseline-policy.json
+        read_only: true
+        bind: {create_host_path: false}
     healthcheck:
       test: ["CMD", "/usr/local/bin/ekka-backend", "health"]  # the image's ENTRYPOINT binary; distroless, no shell
       interval: 5s

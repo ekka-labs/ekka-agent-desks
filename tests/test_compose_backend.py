@@ -99,16 +99,16 @@ class TheAdapterService(unittest.TestCase):
                          [("ekka-backend-state", "/var/lib/ekka-backend")],
                          "the recovery store, and no other volume: no ekka-home")
         # The socket folder is the host's /run/ekka-backend (tmpfiles, 0700 ekka), where the native Enclave dials it,
-        # the discovery permits folder the Enclave reads, and two FILES, read-only: its configuration and the gateway's
+        # the discovery permits folder the Enclave reads, and three FILES, read-only: its configuration, baseline and the gateway's
         # CA. Never a folder of the home, never docker.sock.
-        self.assertEqual(sorted(files), ["/etc/ekka-backend/ca.pem", "/etc/ekka-backend/config.json", "/run/ekka-backend",
+        self.assertEqual(sorted(files), ["/etc/ekka-backend/baseline-policy.json", "/etc/ekka-backend/ca.pem", "/etc/ekka-backend/config.json", "/run/ekka-backend",
                                          "/var/lib/ekka-backend/permits"])
         self.assertEqual(files["/run/ekka-backend"]["source"], "/run/ekka-backend")
         writable = ("/run/ekka-backend", "/var/lib/ekka-backend/permits")
         self.assertTrue(all(v.get("read_only") is True for t, v in files.items() if t not in writable))
         self.assertEqual(sorted(os.path.basename(v["source"]) for v in files.values()),
-                         ["ca.crt", "config.json", "ekka-backend", "permits"])
-        self.assertEqual(len(self.svc["volumes"]), 5)
+                         ["baseline-policy.json", "ca.crt", "config.json", "ekka-backend", "permits"])
+        self.assertEqual(len(self.svc["volumes"]), 6)
 
     def test_writes_the_discovery_permits_into_the_host_folder_the_enclave_reads(self):
         # The adapter writes <state_dir>/permits/<sandbox id>.json (state_dir: the adapter configuration's default,
@@ -137,12 +137,13 @@ class TheAdapterService(unittest.TestCase):
         # The adapter's configuration (tools/adapter_config.py) names https://host.openshell.internal:8080.
         self.assertIn("host.openshell.internal", aliases)
 
-    def test_reads_its_one_configuration_file_and_the_ca_read_only(self):
+    def test_reads_its_configuration_ca_and_baseline_read_only(self):
         # `serve` first: the adapter serves only with it, and anything else prints its usage and exits (ekka-backend
         # main.rs `command`). This test used to pin the command WITHOUT it, so the adapter never started.
         self.assertEqual(self.svc["command"], ["serve", "--config", "/etc/ekka-backend/config.json"])
         mounts = {v["target"]: v for v in self.svc["volumes"]}
-        for target in ("/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem"):
+        for target in ("/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem",
+                       "/etc/ekka-backend/baseline-policy.json"):
             self.assertIn(target, mounts)
             self.assertIs(mounts[target].get("read_only"), True, target)
 
@@ -154,13 +155,14 @@ class TheAdapterService(unittest.TestCase):
         self.assertEqual(self.svc["healthcheck"]["test"], ["CMD", "/usr/local/bin/ekka-backend", "health"],
                          "the image is distroless: the binary checks itself")
 
-    def test_the_configuration_and_ca_are_read_only_long_syntax_binds(self):
+    def test_the_configuration_ca_and_baseline_are_read_only_long_syntax_binds(self):
         # Long syntax, so Compose honors compose.yml's `create_host_path: false`: a missing source is refused
         # ("bind source path does not exist"), never made a directory. Measured on Compose v2.38.2 (CI) and v5.5.1.
         # NOT asserted from the rendered config: v2.38.2 honors the setting but does not PRINT it, which turned
         # main red. The guard that does not depend on any Compose is tools/backend_preflight.py, and
         # test_backend_preflight.py asserts its behavior.
-        for target in ("/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem"):
+        for target in ("/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem",
+                       "/etc/ekka-backend/baseline-policy.json"):
             v = next(v for v in self.svc["volumes"] if v["target"] == target)
             self.assertEqual(v["type"], "bind", target)
             self.assertIs(v.get("read_only"), True, target)

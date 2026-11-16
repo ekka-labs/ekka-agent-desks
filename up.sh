@@ -269,6 +269,10 @@ step_backend_image() {  # the backend adapter's image: pulled by digest, and its
   [[ -n $want_arch && $got_arch == "$want_arch" ]] \
     || die "the pinned backend adapter image is built for '${got_arch:-unknown}', and this machine runs '${want_arch:-unknown}' images; deploy/pins.json must name an ekka-backend release published for ${want_arch:-this machine}"
   ok "backend adapter $image, signed by EKKA's release workflow"
+  # The reviewed baseline policy the adapter answers grant_facts from: before anything can start the adapter, which
+  # mounts it read-only and refuses a missing one by name. Root's, from / down (tools/desk_records.py).
+  python3 tools/desk_records.py baseline desk/policy.json "$DESKS_STATE/backend/baseline-policy.json" \
+    || die "the baseline policy record could not be confirmed; see the line above"
 }
 
 step_images() {
@@ -609,7 +613,7 @@ admin_setup() {
   sync_profiles
 }
 
-# The backend adapter's one configuration file (@ekka-ai/contracts backend/adapter-config.v1). Only the
+# The backend adapter's one configuration file (the vendored backend/adapter-config.v1). Only the
 # Enclave's organization, node and Govern URL lines leave its container; enclave.env holds a secret too, and that
 # line never does. The file holds no credential, and compose mounts it read-only into the adapter.
 write_adapter_config() {

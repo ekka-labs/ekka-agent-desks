@@ -35,7 +35,7 @@
   },
   "ekka_backend": {
     "registry": "ghcr.io/ekka-labs",
-    "digest": "sha256:f76fabf7785894680a7ab77313f98b69b0384e39560c37031cd1e62dc4858816",
+    "digest": "sha256:6b602a6ff6a4ef33d7d90e6ea6da15fddd606e4ed6bae3d6d9862c13298eb840",
     "release_workflow": ".github/workflows/release.yml",
     "cosign_image": "gcr.io/projectsigstore/cosign:v2.6.5@sha256:ad281047f85c5e1fc6ffbc30c2b55be3b07b4032bef715a12122ce5829619aca"
   }
