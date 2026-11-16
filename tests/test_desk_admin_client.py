@@ -215,5 +215,76 @@ connect_desk_admin
         self.assertIn("did not reach the Enclave's vault", r.stderr)
 
 
+REFUSED = ("ekka api connect: 'desks' is already connected to a different configuration, and replacing it would leave "
+           "every grant that names it pointing somewhere nobody approved.\n  what differs: {what}\n"
+           "  Nothing was changed. The credential was not asked for, and the existing connection is untouched.\n")
+
+
+class ReconnectOnWiderPaths(unittest.TestCase):
+    """EKKA's desks catalog entry widened its paths (1.1.0). The Enclave refuses to replace a connection whose paths
+    changed; when the paths are the ONLY difference the installer disconnects and connects again, on purpose. Any
+    other difference still stops the install, and nothing is disconnected."""
+
+    def run_it(self, what, disconnect_rc=0, second_rc=0):
+        state, seen = tempfile.mkdtemp(), tempfile.mkdtemp()
+        os.makedirs(os.path.join(state, "deploy"))
+        refusal = REFUSED.format(what=what)
+        script = f"""
+set -euo pipefail
+DESKS_STATE={state}
+ok() {{ echo "ok: $*"; }}
+die() {{ echo "die: $*" >&2; exit 1; }}
+kc() {{ printf '%s' "$KC_SECRET"; }}
+ekka_in() {{
+  local n; n=$(( $(cat {seen}/n 2>/dev/null || echo 0) + 1 )); echo $n > {seen}/n
+  printf '%s\\n' "$*" >> {seen}/calls; cat > {seen}/stdin.$n
+  case "$1 $2" in
+    "api disconnect") [[ {disconnect_rc} == 0 ]] || echo "planted: the documentation could not be removed" >&2; return {disconnect_rc} ;;
+    "api connect") if [[ $n == 1 ]]; then printf '%s' "$REFUSAL" >&2; return 1; fi; return {second_rc} ;;
+  esac
+}}
+cd {state}
+{up_function("connect_desk_admin")}
+connect_desk_admin
+"""
+        r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL, env=dict(os.environ, KC_SECRET=SECRET, REFUSAL=refusal))
+        path = os.path.join(seen, "calls")
+        calls = open(path).read().splitlines() if os.path.exists(path) else []
+        stdins = [open(os.path.join(seen, f)).read() for f in sorted(os.listdir(seen)) if f.startswith("stdin.")]
+        return r, calls, stdins
+
+    def test_only_wider_paths_reconnects_on_purpose_and_keeps_the_secret_off_the_command_line(self):
+        r, calls, stdins = self.run_it("the paths it may reach")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c.split()[:3] for c in calls],
+                         [["api", "connect", "desks"], ["api", "disconnect", "desks"], ["api", "connect", "desks"]])
+        self.assertIn("--yes", calls[1])
+        self.assertEqual([s for s in stdins if s], [SECRET, SECRET], "the secret through stdin, both connects")
+        self.assertNotIn(SECRET, "".join(calls) + r.stdout + r.stderr)
+        self.assertIn("reconnected with the paths", r.stdout)
+
+    def test_any_other_difference_stops_the_install_and_disconnects_nothing(self):
+        for what in ("the destination (unix:/a -> unix:/b)", "how it authenticates",
+                     "the paths it may reach, how it authenticates", "the setup value 'socket'"):
+            with self.subTest(what=what):
+                r, calls, _ = self.run_it(what)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(len(calls), 1, "no disconnect, no second connect")
+                self.assertIn("did not reach the Enclave's vault", r.stderr)
+                self.assertIn("what differs", r.stderr, "the Enclave's reason is shown")
+
+    def test_a_failed_disconnect_or_reconnect_stops_the_install_by_name(self):
+        r, calls, _ = self.run_it("the paths it may reach", disconnect_rc=1)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("did not disconnect cleanly", r.stderr)
+        self.assertIn("may already be removed", r.stderr)
+        self.assertIn("planted: the documentation could not be removed", r.stderr, "the Enclave's reason is shown")
+        r, calls, _ = self.run_it("the paths it may reach", second_rc=1)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("did not connect again", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
