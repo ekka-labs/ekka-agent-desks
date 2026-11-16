@@ -133,6 +133,7 @@ DEFAULT_MINUTES = 60
 MAX_MINUTES = 240
 MAX_WINDOW_IMAGES = 4          # contracts desks.v1 `discovery.image_digests`: 1 to 4
 MAX_WINDOW_PROVIDERS = 8       # contracts desks.v1 `discovery.providers`: 0 to 8
+MAX_GRANT_PROVIDERS = 16       # contracts desks.v1 FULL `providers` and `provider_config_digests`: at most 16
 DISCOVERY_KEYS = ("image_digests", "providers", "name_prefix", "expires_at")
 
 
@@ -229,6 +230,8 @@ def limits(image_ids, policy_digests, provider_digests, ceiling, policy, discove
     for name in provider_digests:
         if not NAME.match(name):
             raise Refused(f"{name!r} is not a provider name")
+    if len(provider_digests) > MAX_GRANT_PROVIDERS:
+        raise Refused(f"a grant holds at most {MAX_GRANT_PROVIDERS} providers; this gateway holds {len(provider_digests)}")
     base = baseline_hosts(policy)
     outside = [h for h in base if h not in ceiling]
     if outside:
