@@ -289,6 +289,13 @@ step_images() {
       || die "the desk image did not build: docker build -t ekka-desk:local desk/image"
     ok "built the desk image on this machine (ekka-desk:local, $src); a desk made before keeps its image until it is made again"
   else ok "desk image ekka-desk:local ($src)"; fi
+  # The desk image EKKA's desk commands grant, by its content id: root's, from / down (tools/desk_records.py). Written
+  # after a build and when unchanged, so an installed box gets one on its next run. Only with an adapter pinned.
+  if python3 tools/backend_image.py pinned; then
+    local id; id=$(docker image inspect --format '{{.Id}}' ekka-desk:local) || die "the desk image is not built; run again"
+    python3 tools/desk_records.py image "$id" "$DESKS_STATE/backend/desk-image.json" \
+      || die "the desk image record could not be confirmed; see the line above"
+  fi
 }
 
 step_enclave_install() {  # the signed EKKA release on this machine, through EKKA's own installer, cosign REQUIRED
