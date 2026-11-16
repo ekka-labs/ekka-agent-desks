@@ -90,18 +90,26 @@ def full_limits(value):
     return value
 
 
+def profile_file_hosts(path):
+    """The endpoint hosts ONE profile file names, sorted, each checked. The one parser of a profile's hosts: the
+    grant's ceiling and the installer's ceiling record (tools/desk_records.py) both read hosts through it."""
+    hosts = set()
+    with open(path, encoding="utf-8") as f:
+        for m in re.finditer(r"^\s*-?\s*host:\s*([^\s#]+)\s*$", f.read(), re.M):
+            host = m.group(1).strip("'\"")
+            if not HOST.match(host):
+                raise Refused(f"{os.path.basename(path)} names a host the limits cannot hold: {host!r}")
+            hosts.add(host)
+    return sorted(hosts)
+
+
 def profile_hosts(providers_dir=os.path.join(ROOT, "providers"), files=None):
     """Every endpoint host the profiles name, sorted, each checked: `files`, the very profiles this install puts in
     the gateway (up.sh passes them, an install's own providers.local file in place of a shipped one), or else every
     shipped profile. One source: a profile the gateway holds can never sit outside the ceiling."""
     hosts = set()
     for path in (files if files else sorted(glob.glob(os.path.join(providers_dir, "*.yaml")))):
-        with open(path, encoding="utf-8") as f:
-            for m in re.finditer(r"^\s*-?\s*host:\s*([^\s#]+)\s*$", f.read(), re.M):
-                host = m.group(1).strip("'\"")
-                if not HOST.match(host):
-                    raise Refused(f"{os.path.basename(path)} names a host the limits cannot hold: {host!r}")
-                hosts.add(host)
+        hosts.update(profile_file_hosts(path))
     if not hosts:
         raise Refused("no provider profile names a host; the ceiling would be empty")
     return sorted(hosts)

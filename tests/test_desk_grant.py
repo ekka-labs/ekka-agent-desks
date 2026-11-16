@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import unittest
 
@@ -465,12 +466,34 @@ SECRET = "test-only-desk-admin-secret"
 GH = "sha256:" + "6" * 64
 CC = "sha256:" + "7" * 64
 
+RECORD_STUB = r'''import json, os, sys
+with open(os.environ["CALLS"], "a") as f:
+    f.write(json.dumps({"kind": "record", "argv": sys.argv}) + "\n")
+sys.exit(int(os.environ["RECORD_RC"]))
+'''
+
+GRANT_WRAPPER = r'''import json, os, runpy, sys
+if sys.argv[1:2] == ["limits"]:
+    with open(os.environ["CALLS"], "a") as f:
+        f.write(json.dumps({"kind": "limits", "argv": sys.argv}) + "\n")
+runpy.run_path(os.environ["GRANT_TOOL"], run_name="__main__")
+'''
+
 
 def run_step(grants="[]", image=True, digest_fails=False, providers=f"github={GH},claude-code={CC}", provider_fails="",
              adapter_files=True, plan_fails="", up=None, dev_id="", pre_limits=None, own_profiles=None, kc_fails=False,
-             window=None, projects=None, linked_project=None, adapter_health="healthy", ekka_holds=""):
+             window=None, projects=None, linked_project=None, adapter_health="healthy", ekka_holds="", record_rc=0):
     import subprocess, tempfile
     d = tempfile.mkdtemp()
+    root = os.path.join(d, "repo")
+    for name in ("tools", "deploy", "desk", "providers", "vendor"):
+        shutil.copytree(os.path.join(ROOT, name), os.path.join(root, name), ignore=shutil.ignore_patterns("__pycache__"))
+    # The real writer refuses temporary state under untrusted parents. Stub only this copied command;
+    # test_desk_records exercises its ownership, path and atomic-write checks.
+    with open(os.path.join(root, "tools", "desk_records.py"), "w") as f:
+        f.write(RECORD_STUB)
+    with open(os.path.join(root, "tools", "desk_grant.py"), "w") as f:
+        f.write(GRANT_WRAPPER)
     os.makedirs(os.path.join(d, "bin"))
     # By this step step_backend_image wrote the baseline, step_desk_admin the configuration, and init the CA
     # (tools/backend_preflight.py); the adapter is run by name below, so its files are checked again.
@@ -512,18 +535,18 @@ set -euo pipefail
 export DESKS_STATE={d}; DESKS_AGENT=desks   # exported, as up.sh:38 does: setup.sh reads it
 say() {{ :; }}; ok() {{ echo "ok: $*"; }}; die() {{ echo "die: $*" >&2; exit 1; }}; sleep() {{ :; }}
 kc() {{ [ -z "${{KC_FAILS:-}}" ] || {{ echo "urllib.error.HTTPError: HTTP Error 503: Service Unavailable" >&2; return 1; }}; [ "$1 $2" = "admin-client on" ] && printf %s "{SECRET}"; }}
-profile_names() {{ printf '%s\\n' bitbucket claude-code codex github {" ".join(own_profiles or {})}; }}
 ENCLAVE_HOME=$DESKS_STATE/enclave-home
 ekka_in() {{ docker compose exec -T ekka-enclave ekka "$@"; }}   # the test's docker stub reads the ekka words after the marker
 enclave_home_file() {{ mkdir -p "$(dirname "$ENCLAVE_HOME/$1")"; cat > "$ENCLAVE_HOME/$1"; }}
-{up_functions("install_plans", "create_desk_admin_plans", "desk_provider_args", "profile_source", "step_desk_grant", up=up)}
+{up_functions("install_plans", "create_desk_admin_plans", "desk_provider_args", "profile_names", "profile_source", "step_desk_grant", up=up)}
 step_desk_grant
 """
     env = dict(os.environ, PATH=f"{d}/bin:{os.environ['PATH']}", CALLS=calls, DESK_ID=IMAGE, POLICY_DIGEST=POLICY_DIGEST,
                NODE="b0000001-0000-4000-8000-000000000001", AGENT=AGENT, GATE=GATE, GRANTS=grants,
+               RECORD_RC=str(record_rc), GRANT_TOOL=os.path.abspath(os.path.join(ROOT, "tools", "desk_grant.py")),
                PROVIDER_DIGESTS=providers, PROVIDER_FAILS=provider_fails, PLAN_FAILS=plan_fails, ADAPTER_HEALTH=adapter_health, EKKA_HOLDS=ekka_holds,
                **({"DIGEST_FAILS": "1"} if digest_fails else {}), **({"KC_FAILS": "1"} if kc_fails else {}), **({"DEV_ID": dev_id} if dev_id else {}))
-    r = subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, env=env, timeout=60,
+    r = subprocess.run(["bash", "-c", script], cwd=root, capture_output=True, text=True, env=env, timeout=60,
                        stdin=subprocess.DEVNULL)
     seen = []
     if os.path.exists(calls):
@@ -533,6 +556,33 @@ step_desk_grant
 
 
 class UpShStep(unittest.TestCase):
+    def test_the_ceiling_record_uses_exactly_the_grants_profiles_with_a_local_override(self):
+        own = "id: claude-code\nendpoints:\n  - host: model.example.com\n    port: 443\n"
+        r, calls, d = run_step(own_profiles={"claude-code": own})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        [record] = [c for c in calls if c["kind"] == "record"]
+        [limits] = [c for c in calls if c["kind"] == "limits"]
+        files = ["providers/bitbucket.yaml", os.path.join(d, "providers.local", "claude-code.yaml"),
+                 "providers/codex.yaml", "providers/github.yaml"]
+        self.assertEqual(record["argv"], ["tools/desk_records.py", "ceiling",
+                         os.path.join(d, "backend", "provider-ceiling.json"), *files])
+        args = limits["argv"]
+        self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == "--profile"], files)
+        self.assertLess(calls.index(record), calls.index(limits))
+        [add] = [c for c in calls if c["kind"] == "add"]
+        self.assertIn("model.example.com", add["limits"]["allowed_hosts"])
+        self.assertNotIn("api.anthropic.com", add["limits"]["allowed_hosts"])
+
+    def test_a_failed_or_unconfirmed_ceiling_record_stops_before_limits_or_grant_changes(self):
+        for rc in (1, 3):
+            with self.subTest(rc=rc):
+                r, calls, d = run_step(record_rc=rc)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("the provider ceiling record could not be confirmed", r.stderr)
+                self.assertEqual(calls[-1]["kind"], "record")
+                self.assertFalse(any(c["kind"] in ("limits", "add", "revoke") for c in calls))
+                self.assertFalse(os.path.exists(os.path.join(d, "backend", "desks-grant.json.new")))
+
     def test_planted_without_its_configuration_the_adapter_is_never_run(self):
         r, seen, _ = run_step(adapter_files=False)
         self.assertNotEqual(r.returncode, 0)

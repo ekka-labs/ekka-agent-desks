@@ -1,10 +1,11 @@
-"""Two records the installer writes for EKKA's desk commands, root-owned: readable by every user, writable by root only.
+"""Records the installer writes for EKKA's desk commands, root-owned: readable by every user, writable by root only.
 
     python3 tools/desk_records.py baseline <policy.json> <dest>   the reviewed baseline policy, byte for byte
     python3 tools/desk_records.py image <image id> <dest>         the desk image the installer built: {"image", "id"}
+    python3 tools/desk_records.py ceiling <dest> <profile.yaml>...  the provider ceiling: each profile's hosts, and all
 
 The backend adapter reads the baseline (read-only, at /etc/ekka-backend/baseline-policy.json in its container) and
-answers its digest; EKKA's desk commands read the image record. Both are what a desks grant's limits are built from,
+answers its digest; EKKA's desk commands read the image and provider ceiling records. These build a desks grant's limits,
 so the Enclave's user, who runs those commands, must be able to read them and must never be able to change them.
 
 So every folder from / down to the record is checked: a real folder (never a link), owned by root, writable by
@@ -149,14 +150,44 @@ def image_bytes(image_id):
     return (json.dumps({"image": IMAGE, "id": image_id}, indent=2) + "\n").encode()
 
 
-def main(argv):
-    if len(argv) != 3 or argv[0] not in ("baseline", "image"):
-        print("usage: python3 tools/desk_records.py baseline <policy.json> <dest>\n"
-              "       python3 tools/desk_records.py image <image id> <dest>", file=sys.stderr)
-        return 2
-    kind, source, dest = argv
+def ceiling_bytes(files):
+    """The provider ceiling: each profile the gateway holds (by its file's name) and the hosts it names, and every
+    host together. Read by the one parser the grant's ceiling uses (desk_grant.profile_file_hosts), and checked to
+    equal the grant's ceiling from these files at the time the record is built."""
+    import desk_grant
+    if not files:
+        raise Refused("no provider profile was given")
+    profiles = {}
     try:
-        data = baseline_bytes(source) if kind == "baseline" else image_bytes(source)
+        for path in files:
+            name = os.path.basename(path)
+            if not name.endswith(".yaml") or not desk_grant.NAME.fullmatch(name[:-5]):
+                raise Refused(f"{name!r} is not a provider profile file (<name>.yaml)")
+            if name[:-5] in profiles:
+                raise Refused(f"two profile files are named {name!r}")
+            profiles[name[:-5]] = desk_grant.profile_file_hosts(path)
+        hosts = desk_grant.profile_hosts(files=files)
+    except desk_grant.Refused as e:
+        raise Refused(str(e)) from None
+    if sorted({h for hs in profiles.values() for h in hs}) != hosts:
+        raise Refused("the profiles' hosts do not add up to the grant's ceiling")
+    doc = {"profiles": [{"name": n, "hosts": profiles[n]} for n in sorted(profiles)], "hosts": hosts}
+    return (json.dumps(doc, indent=2) + "\n").encode()
+
+
+def main(argv):
+    if argv[:1] == ["ceiling"] and len(argv) >= 3:
+        kind, dest, data_of = "ceiling", argv[1], lambda: ceiling_bytes(argv[2:])
+    elif len(argv) == 3 and argv[0] in ("baseline", "image"):
+        kind, source, dest = argv
+        data_of = (lambda: baseline_bytes(source)) if kind == "baseline" else (lambda: image_bytes(source))
+    else:
+        print("usage: python3 tools/desk_records.py baseline <policy.json> <dest>\n"
+              "       python3 tools/desk_records.py image <image id> <dest>\n"
+              "       python3 tools/desk_records.py ceiling <dest> <profile.yaml>...", file=sys.stderr)
+        return 2
+    try:
+        data = data_of()
         write(dest, data)
     except NotConfirmedSaved as e:
         print(f"the {kind} record was replaced ({dest}), but the disk did not confirm it is saved ({e}); "
