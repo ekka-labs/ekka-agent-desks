@@ -860,8 +860,9 @@ create_desk_plans() {
   install_plans "$made" "$sharing"
 }
 
-# The nine desk administration plans, owned by the desks agent: create_desk_admin_plans <api gate> <agent id>.
-# `ekka desk create`, `stop`, `status` and the rest each run one (ekka.desk.<op>.v1), and creating them is what
+# The eleven desk administration plans, owned by the desks agent: create_desk_admin_plans <api gate> <agent id>.
+# Nine per-operation plans stay for older runners; two general plans read or write any adapter route.
+# `ekka desk create`, `stop`, `status` and the rest run these plans (ekka.desk.<op>.v1), and creating them is what
 # declares api.write on the desks agent: before they exist, EKKA refuses the desks grant ("This agent does not
 # declare 'api.write'"). The desk is an input, so one set serves every desk. Created only when changed, as above.
 create_desk_admin_plans() {
