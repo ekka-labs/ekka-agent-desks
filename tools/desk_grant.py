@@ -4,7 +4,8 @@
         [--provider <name>=sha256:<hex> ...] [--window <window file>] > limits.json
     <`ekka gate grant list --json`> | python3 tools/desk_grant.py decide <agent id> <api gate> limits.json
 
-The limits are @ekka-ai/contracts governance/grant-constraints/desks.v1 for this machine:
+The limits are the FULL form of @ekka-ai/contracts governance/grant-constraints/desks.v1 for this machine.
+FOLLOW carries no limits and must be resolved by Govern, so it is refused here:
 
   image_digests            the content ID of the desk image this machine built (`docker image inspect .Id`). The
                            owner rules out a published desk image (Claude Code is installed by Anthropic's own
@@ -69,6 +70,24 @@ RENEW_BEFORE = dt.timedelta(days=30)
 
 class Refused(Exception):
     pass
+
+
+def full_limits(value):
+    """Read the installer's FULL limits, never an unresolved FOLLOW or a mixture of the two."""
+    if not isinstance(value, dict) or not value:
+        raise Refused("the desks grant carries no limits")
+    if "follow" in value:
+        raise Refused("the desks grant carries FOLLOW, not FULL limits")
+    with open(os.path.join(ROOT, "vendor", "ekka-contracts", "governance", "grant-constraints",
+                           "desks.v1.schema.json"), encoding="utf-8") as f:
+        full = json.load(f)["$defs"]["full"]
+    missing = [k for k in full["required"] if k not in value]
+    if missing:
+        raise Refused(f"the desks grant's limits lack {', '.join(missing)}")
+    extra = sorted(set(value) - set(full["properties"]))
+    if extra:
+        raise Refused(f"the desks grant's limits have unknown keys: {', '.join(extra)}")
+    return value
 
 
 def profile_hosts(providers_dir=os.path.join(ROOT, "providers"), files=None):
@@ -275,6 +294,7 @@ def show(lim, extras=None, profiles=(), now=None, projects=()):
     """`sudo ekka desk grant show`: what a desk made through EKKA may use on this server, in words. Each image digest
     carries its name: the shipped one is what the install built (ekka-desk:local), and a discovery window's is named
     from its own record."""
+    lim = full_limits(lim)
     net = lim["policy_baseline"]["network"]
     extras = extras or {}
     disc = lim.get("discovery")
@@ -344,12 +364,16 @@ def decide(grants, agent_id, instance, wanted, now):
     """keep <id> | add | replace <id>..., for this agent's grants on this gate's apis/desks."""
     if not INSTANCE.match(instance):
         raise Refused(f"{instance!r} is not this Enclave's API gate")
+    wanted = full_limits(wanted)
     mine = [g for g in grants
             if g.get("agent_id") == agent_id and g.get("is_active", True)
             and (g.get("scope") or {}).get("capability") == CAPABILITY
             and (g.get("scope") or {}).get("instance_id") == instance
             and (g.get("scope") or {}).get("resource_name") == RESOURCE]
     for g in mine:
+        constraints = (g["scope"] or {}).get("constraints")
+        if isinstance(constraints, dict) and "follow" in constraints:
+            raise Refused("the desks grant carries FOLLOW, not FULL limits")
         expires = g.get("expires_at")
         # A grant with no expiry lasts; one with an expiry is renewed once it is within RENEW_BEFORE of it. So two
         # runs with the same limits change nothing (regression review). An empty expiry is no expiry.
@@ -425,7 +449,7 @@ def main(argv, stdin=sys.stdin, now=None):
             granted = None
             if a.limits:
                 with open(a.limits, encoding="utf-8") as f:
-                    granted = json.load(f).get("providers", [])
+                    granted = full_limits(json.load(f))["providers"]
             names = [n.strip() for n in a.providers.split(",") if n.strip()]
             print(json.dumps(window(a.image_ref, names, a.minutes, when, granted), indent=2))
         elif a.cmd == "show":

@@ -709,7 +709,7 @@ render() {  # render <template> <dest> <mode> KEY=VALUE...: @@KEY@@ replaced; ro
 snapshot_stack() {  # a ROOT-OWNED copy of deploy/, tools/, providers/ and this script: the supervisor unit and the
   # wrapper's `ekka desk connect|invite|revoke|plans` run from it, never from a person's checkout
   rm -rf "$SNAPSHOT.new"; install -d -m 0755 "$SNAPSHOT.new"
-  cp -a deploy tools providers desk ekka up.sh "$SNAPSHOT.new/"   # every folder a routed verb reads (test_server_cli)
+  cp -a deploy tools providers desk ekka vendor up.sh "$SNAPSHOT.new/"   # every folder a routed verb reads (test_server_cli)
   chown -R root:root "$SNAPSHOT.new"; chmod -R u+rwX,go+rX,go-w "$SNAPSHOT.new"
   rm -rf "$SNAPSHOT.old"; [[ -d $SNAPSHOT ]] && mv "$SNAPSHOT" "$SNAPSHOT.old"; mv "$SNAPSHOT.new" "$SNAPSHOT"; rm -rf "$SNAPSHOT.old"
   install -D -m 0755 -o root -g root deploy/host/libexec/wait-interceptor /usr/local/libexec/ekka-desks/wait-interceptor
@@ -840,7 +840,7 @@ create_desk_plans() {
   install_plans "$made" "$sharing"
 }
 
-# The eight desk administration plans, owned by the desks agent: create_desk_admin_plans <api gate> <agent id>.
+# The nine desk administration plans, owned by the desks agent: create_desk_admin_plans <api gate> <agent id>.
 # `ekka desk create`, `stop`, `status` and the rest each run one (ekka.desk.<op>.v1), and creating them is what
 # declares api.write on the desks agent: before they exist, EKKA refuses the desks grant ("This agent does not
 # declare 'api.write'"). The desk is an input, so one set serves every desk. Created only when changed, as above.

@@ -32,7 +32,7 @@ ADAPTER_NETWORK_SUFFIX = "_backend"           # compose prefixes the project nam
 PEOPLE_SCOPES = {"sandbox:read", "provider:read", "workspace:read", "config:read"}
 # Keycloak's built-in identity scopes are not OpenShell permissions. Unknown scope names still fail.
 IDENTITY_SCOPES = {"openid", "offline_access", "acr", "basic", "email", "profile", "roles", "web-origins"}
-# The limits every desks grant carries: the vendored contract's own required list (grant-constraints desks.v1).
+# The installer writes FULL limits; FOLLOW grants must be resolved by Govern before use.
 DESKS_LIMITS_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vendor", "ekka-contracts",
                                    "governance", "grant-constraints", "desks.v1.schema.json")
 # The adapter contract's fixed words (the vendored backend/backend-v1.schema.json).
@@ -97,6 +97,8 @@ def grant(rows):
     limits = g["scope"].get("constraints")
     if not isinstance(limits, dict) or not limits:
         problems.append("the desks grant carries no limits")
+    elif "follow" in limits:
+        problems.append("the desks grant carries FOLLOW, not FULL limits")
     else:
         missing = [k for k in desks_limits_required() if k not in limits]
         if missing:
@@ -106,7 +108,7 @@ def grant(rows):
 
 def desks_limits_required():
     with open(DESKS_LIMITS_SCHEMA, encoding="utf-8") as f:
-        return json.load(f)["required"]
+        return json.load(f)["$defs"]["full"]["required"]
 
 
 def scopes(held):

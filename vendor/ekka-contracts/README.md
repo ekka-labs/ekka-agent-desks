@@ -1,6 +1,8 @@
 # Vendored from `@ekka-ai/contracts`
 
-Only what this repository's tests read, copied byte for byte from the published package. `MANIFEST.json` names the version and tag they came from, and the SHA-256 of each file. A test fails if a file here differs from its manifest entry, so a copy edited by hand is caught.
+Only what this repository's tools and tests read, copied byte for byte from the published package. `MANIFEST.json` names the version and tag they came from, and the SHA-256 of each file. A test fails if a file here differs from its manifest entry, so a copy edited by hand is caught.
+
+The installed snapshot includes this folder: the grant tools read the FULL form's limits from the schema. FOLLOW grants carry no limits here and are refused until Govern resolves them.
 
 | Files | What they are | Read by |
 |-------|---------------|---------|

@@ -131,6 +131,14 @@ class TheGrantLeg(unittest.TestCase):
         thin = planted(GRANTS[1], ("scope", "constraints", "image_digests"), KeyError)
         self.assertEqual(c.grant([GRANTS[0], thin]), ["the desks grant's limits lack image_digests"])
 
+    def test_follow_and_follow_mixed_with_limits_are_refused(self):
+        for limits in ({"follow": {"grant": "org_desks"}, "requires_role": "admin"},
+                       {**LIMITS, "follow": {"grant": "org_desks"}}):
+            with self.subTest(limits=limits):
+                rows = [planted(GRANTS[1], ("scope", "constraints"), limits)]
+                self.assertEqual(c.grant(rows), ["the desks grant carries FOLLOW, not FULL limits"])
+                self.assertIsNone(c.grant_id(rows)[0], "a FOLLOW grant is never selected to revoke")
+
     def test_an_unreadable_listing_is_never_no_grants(self):
         self.assertEqual(c.grant("not a list"), ["the grant listing could not be read"])
 

@@ -12,11 +12,13 @@ Writes <out-dir>/plan-setup-<desk>.json and <out-dir>/plan-ask-<desk>.json, and 
 
     python3 tools/desk_plans.py --admin <api gate> <out-dir> [<agent id>]
 
-The seven desk administration plans of an organization: `ekka desk create`, `delete`, `stop`, `start`,
-`allow`/`deny`/`policy set`, `disconnect` and `status` each run one of them, by name (ekka.desk.<op>.v1). Each is
-one call through the Enclave's API gate to the backend adapter on `apis/desks`, may be run only by an organization
+The nine desk administration plans of an organization: `ekka desk create`, `delete`, `stop`, `start`,
+`allow`/`deny`/`policy set`, `disconnect`, `status`, `policy show` and `grant show` each run one of them,
+by name (ekka.desk.<op>.v1). Each is one call through the Enclave's API gate to the backend adapter on `apis/desks`,
+may be run only by an organization
 admin, and reads two facts from the adapter's answer: `outcome` and `desk_ready`. Unlike the example plans the
-desk is an input, so one set serves every desk. Writes <out-dir>/plan-desk-<op>.json, and prints each plan code.
+desk is an input when needed; grantfacts has no inputs. One set serves every desk.
+Writes <out-dir>/plan-desk-<op>.json, and prints each plan code.
 Standard library only.
 """
 import json
@@ -115,6 +117,9 @@ ADMIN_PLANS = (
     # `ekka desk policy show` on the Enclave's own machine: the live policy, from contracts 0.75.0 `result.policy`,
     # read back from the Enclave's local record of the step. A person's laptop reads with its own desk sign-in.
     ("policyread", "Read a desk's live network policy", "read", "GET", "/v1/desks/@input.desk/policy", ("desk",)),
+    # `ekka desk grant show`: what a desks grant's limits are built from (contracts 0.83.0 `grant_facts`), read back
+    # from the Enclave's local record of the step, as policyread is. About no desk, so no input.
+    ("grantfacts", "Read what a desks grant is built from", "read", "GET", "/v1/grant-facts", ()),
 )
 ADMIN_INPUTS = {
     "desk": "The desk's name.",
