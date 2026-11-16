@@ -12,15 +12,12 @@ Writes <out-dir>/plan-setup-<desk>.json and <out-dir>/plan-ask-<desk>.json, and 
 
     python3 tools/desk_plans.py --admin <api gate> <out-dir> [<agent id>]
 
-The eleven desk administration plans of an organization: nine per-operation plans kept for older runners,
-plus two general plans, ekka.desk.read.v1 and ekka.desk.write.v1, for any adapter operation. The older runners
-call `create`, `delete`, `stop`, `start`, `policy`, `detach`, `status`, `policyread` and `grantfacts` by name
-(ekka.desk.<op>.v1). Each plan is one call through the Enclave's API gate to the backend adapter on `apis/desks`,
-may be run only by an organization admin, and reads two facts from the adapter's answer: `outcome` and
-`desk_ready`. The general plans take the route as a whole input; the write also takes the whole request and
-its body hash. The per-operation plans take the desk as an input when needed; grantfacts has no inputs.
-One set serves every desk.
-Writes <out-dir>/plan-desk-<op>.json, and prints each plan code.
+The two desk administration plans of an organization, ekka.desk.read.v1 and ekka.desk.write.v1,
+serve every adapter operation in runner 0.6.8 or newer. Each plan is one call through the Enclave's API gate
+to the backend adapter on `apis/desks`, may be run only by an organization admin, and reads two facts from
+the adapter's answer: `outcome` and `desk_ready`. Both take the route as a whole input; the write also takes
+the whole request and its body hash. One pair serves every desk.
+Writes <out-dir>/plan-desk-read.json and <out-dir>/plan-desk-write.json, and prints each plan code.
 Standard library only.
 """
 import json
@@ -103,30 +100,7 @@ def render(plan, desk, agent=None):
     return d
 
 
-# The desk administration plans: one table, the inputs exactly as `ekka desk <op>` sends them.
-# (op, name, gate access, method, route, inputs). A route names its desk and provider as path values, which
-# Govern fills at dispatch as ONE safe segment each: a value with '/', '..' or '?' refuses the run.
-ADMIN_PLANS = (
-    ("create", "Create a desk", "write", "POST", "/v1/desks", ("body", "body_sha256")),
-    ("delete", "Delete a desk", "write", "DELETE", "/v1/desks/@input.desk", ("desk", "body_sha256")),
-    ("stop", "Stop a desk", "write", "POST", "/v1/desks/@input.desk/stop", ("desk", "body_sha256")),
-    ("start", "Start a stopped desk", "write", "POST", "/v1/desks/@input.desk/start", ("desk", "body_sha256")),
-    ("policy", "Replace a desk's whole network policy", "write", "PUT", "/v1/desks/@input.desk/policy",
-     ("desk", "body", "body_sha256")),
-    ("detach", "Remove a provider from a desk", "write", "DELETE",
-     "/v1/desks/@input.desk/providers/@input.provider", ("desk", "provider", "body", "body_sha256")),
-    ("status", "Read a desk", "read", "GET", "/v1/desks/@input.desk", ("desk",)),
-    # `ekka desk policy show` on the Enclave's own machine: the live policy, from contracts 0.75.0 `result.policy`,
-    # read back from the Enclave's local record of the step. A person's laptop reads with its own desk sign-in.
-    ("policyread", "Read a desk's live network policy", "read", "GET", "/v1/desks/@input.desk/policy", ("desk",)),
-    # `ekka desk grant show`: what a desks grant's limits are built from (contracts 0.83.0 `grant_facts`), read back
-    # from the Enclave's local record of the step, as policyread is. About no desk, so no input.
-    ("grantfacts", "Read what a desks grant is built from", "read", "GET", "/v1/grant-facts", ()),
-)
 ADMIN_INPUTS = {
-    "desk": "The desk's name.",
-    "provider": "The provider's name.",
-    "body": "The exact request body, a JSON object, as the CLI built it.",
     "body_sha256": "The SHA-256 of the body as the API gate encodes it, lowercase hex. With no body, the SHA-256 of "
                    "zero bytes, so a body slipped in is refused.",
     "path": "The adapter route, starting with /v1/, for example /v1/grant-facts or /v1/desks/code-desk/stop.",
@@ -145,27 +119,6 @@ ADMIN_FACTS = {
 }
 API_GATE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")   # Govern's gate instance id
 ADMIN_USAGE = "python3 tools/desk_plans.py --admin <api gate> <out-dir> [<agent id>]"
-
-
-def admin_plan(op, api_gate, agent=None):
-    """One desk administration plan, ekka.desk.<op>.v1, calling the adapter through `api_gate`."""
-    rows = {r[0]: r for r in ADMIN_PLANS}
-    if op not in rows:
-        raise ValueError(f"'{op}' is not a desk administration plan; there are: {', '.join(rows)}")
-    _, name, access, method, route, inputs = rows[op]
-    call = {"resource": "apis/desks", "key": route}
-    # The API gate's own fields, as its action contract names them. `body_sha256` is an input Govern pins into the
-    # token, not a gate field, so it is bound but not listed here.
-    contract = {"resource": {"type": "string"}, "key": {"type": "string"}}
-    if access == "write":
-        call["value"] = {"method": method, **({"body": "@input.body"} if "body" in inputs else {})}
-        call["body_sha256"] = "@input.body_sha256"
-        contract["value"] = {"type": "object"}
-        contract["body_sha256"] = {"type": "string"}
-    else:
-        call["expect"] = {"status": 200}
-        contract["expect"] = {"type": "object"}
-    return _admin_plan(op, name, access, inputs, call, contract, api_gate, agent)
 
 
 def general_admin_plan(op, api_gate, agent=None):
@@ -192,11 +145,6 @@ def general_admin_plan(op, api_gate, agent=None):
         inputs = ("path",)
         call["expect"] = {"status": 200}
         contract["expect"] = {"type": "object"}
-    return _admin_plan(op, name, op, inputs, call, contract, api_gate, agent)
-
-
-def _admin_plan(op, name, access, inputs, call, contract, api_gate, agent):
-    """The shared envelope, facts and transitions for every organization-owned administration plan."""
     if not API_GATE.match(api_gate or ""):
         raise ValueError(f"'{api_gate}' is not an API gate instance id, for example enclaveb0000002Api")
     plan = {
@@ -214,8 +162,8 @@ def _admin_plan(op, name, access, inputs, call, contract, api_gate, agent):
                     "id": "call",
                     "action_ref": "ekka.gate.api.v1",
                     "target": api_gate,
-                    "op": access,
-                    "feature": f"api.{access}",
+                    "op": op,
+                    "feature": f"api.{op}",
                     "identity": {"requires_user_context": True},
                     "action_input": {},
                     "inputs": call,
@@ -238,8 +186,7 @@ def main_admin(argv):
     api_gate, out = argv[0], argv[1]
     agent = argv[2] if len(argv) == 3 else None
     try:
-        plans = [admin_plan(op, api_gate, agent) for op, *_ in ADMIN_PLANS]
-        plans.extend(general_admin_plan(op, api_gate, agent) for op in GENERAL_ADMIN_PLANS)
+        plans = [general_admin_plan(op, api_gate, agent) for op in GENERAL_ADMIN_PLANS]
         for d in plans:
             op = d["plan"]["code"].split(".")[1]
             path = os.path.join(out, f"plan-desk-{op}.json")

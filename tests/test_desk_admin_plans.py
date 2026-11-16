@@ -1,10 +1,7 @@
-"""The eleven desk administration plans of an organization.
+"""The two general desk administration plans for runner 0.6.8 or newer.
 
-Nine per-operation plans stay for older runners; two general plans read or write any adapter route.
-`ekka desk <op>` runs a plan by name: one call through the Enclave's API gate to the backend adapter on
-`apis/desks`, run only by an organization admin, reading `outcome` and `desk_ready` from the adapter's answer.
-The inputs are the one table the CLI sends. The routes and the answers are the adapter contract's own,
-read from vendor/ekka-contracts (published @ekka-ai/contracts 0.83.0), never restated here.
+Each reads or writes an adapter route through the Enclave's API gate, as an organization admin.
+The facts are checked against the answers in vendor/ekka-contracts (published @ekka-ai/contracts 0.83.0).
 """
 import hashlib
 import json
@@ -20,27 +17,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import desk_plans  # noqa: E402
 
 GATE = "enclaveb0000002Api"
-OPS = [op for op, *_ in desk_plans.ADMIN_PLANS]
 GENERAL_OPS = ["read", "write"]
-ALL_OPS = OPS + GENERAL_OPS
-EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-# The one table of plan inputs, as `ekka desk <op>` sends them, written here from the plan and not read
-# from the tool under test.
-INPUTS = {
-    "create": ["body", "body_sha256"],
-    "delete": ["desk", "body_sha256"],
-    "stop": ["desk", "body_sha256"],
-    "start": ["desk", "body_sha256"],
-    "policy": ["desk", "body", "body_sha256"],
-    "detach": ["desk", "provider", "body", "body_sha256"],
-    "status": ["desk"],
-    "policyread": ["desk"],
-    "grantfacts": [],
-}
-# Each plan's operation in the adapter contract.
-CONTRACT_OP = {"create": "create", "delete": "delete", "stop": "stop", "start": "start", "policy": "policy_set",
-               "detach": "provider_detach", "status": "status", "policyread": "policy_get", "grantfacts": "grant_facts"}
 
 
 def vendored(path):
@@ -50,11 +27,6 @@ def vendored(path):
 
 def step(plan):
     return plan["definition"]["operations"][0]["steps"][0]
-
-
-def admin_plan(op):
-    builder = desk_plans.general_admin_plan if op in GENERAL_OPS else desk_plans.admin_plan
-    return builder(op, GATE)
 
 
 def facts_accept(contract, answer):
@@ -84,74 +56,6 @@ class TheVendoredContract(unittest.TestCase):
         self.assertEqual(sorted(p for p in manifest["files"] if p.startswith("backend/samples/")), on_disk,
                          "a sample with no manifest entry, or an entry with no file")
         self.assertIn("backend/samples/result.grant-facts-ready.json", manifest["files"])
-
-
-class TheNinePlans(unittest.TestCase):
-    def setUp(self):
-        self.plans = {op: desk_plans.admin_plan(op, GATE, "agent-1") for op in OPS}
-
-    def test_are_named_as_the_cli_runs_them(self):
-        self.assertEqual(OPS, list(INPUTS))
-        for op, plan in self.plans.items():
-            self.assertEqual(plan["plan"]["code"], f"desk.{op}.v1", "the CLI runs ekka.desk.<op>.v1")
-            self.assertEqual(plan["plan"]["agent"], "agent-1")
-
-    def test_take_exactly_the_inputs_the_cli_sends(self):
-        for op, plan in self.plans.items():
-            self.assertEqual(sorted(plan["definition"]["inputs"]), sorted(INPUTS[op]), op)
-
-    def test_are_one_admin_call_on_apis_desks_through_the_api_gate(self):
-        for op, plan in self.plans.items():
-            d = plan["definition"]
-            self.assertEqual(d["requires_role"], "admin", op)
-            self.assertEqual(len(d["operations"]), 1, op)
-            self.assertEqual(len(d["operations"][0]["steps"]), 1, op)
-            s = step(plan)
-            self.assertEqual((s["action_ref"], s["target"], s["inputs"]["resource"]),
-                             ("ekka.gate.api.v1", GATE, "apis/desks"), op)
-            self.assertTrue(s["identity"]["requires_user_context"], f"{op}: a person starts every desk change")
-
-    def test_call_the_contracts_route_with_its_method(self):
-        routes = {o["operation"]: o for o in vendored("backend/operations.json")["operations"]}
-        for op, plan in self.plans.items():
-            route = routes[CONTRACT_OP[op]]
-            s = step(plan)
-            path = route["path"].replace("{name}", "@input.desk").replace("{provider}", "@input.provider")
-            self.assertEqual(s["inputs"]["key"], path, op)
-            if route["method"] == "GET":
-                self.assertEqual((s["op"], s["feature"]), ("read", "api.read"), op)
-                self.assertNotIn("value", s["inputs"], f"{op}: a read sends no method or body")
-            else:
-                self.assertEqual((s["op"], s["feature"]), ("write", "api.write"), op)
-                self.assertEqual(s["inputs"]["value"]["method"], route["method"], op)
-
-    def test_send_a_body_exactly_when_the_route_takes_one(self):
-        routes = {o["operation"]: o for o in vendored("backend/operations.json")["operations"]}
-        for op, plan in self.plans.items():
-            takes_body = routes[CONTRACT_OP[op]]["body"] is not None
-            sent = step(plan)["inputs"].get("value", {})
-            self.assertEqual("body" in sent, takes_body, op)
-            if takes_body:
-                self.assertEqual(sent["body"], "@input.body", f"{op}: the exact body the CLI built and hashed")
-
-    def test_pin_every_change_and_never_a_read(self):
-        for op, plan in self.plans.items():
-            s = step(plan)
-            if s["op"] == "write":
-                self.assertEqual(s["inputs"]["body_sha256"], "@input.body_sha256", op)
-                self.assertIn("body_sha256", s["step_input_contract"]["properties"],
-                              f"{op}: plan create refuses a binding its contract does not declare")
-            else:
-                self.assertNotIn("body_sha256", s["inputs"], op)
-        self.assertEqual(hashlib.sha256(b"").hexdigest(), EMPTY_SHA256, "the pin of a change with no body")
-
-    def test_declare_every_binding_and_bind_every_required_field(self):
-        for op, plan in self.plans.items():
-            s = step(plan)
-            contract = s["step_input_contract"]
-            self.assertEqual(sorted(s["inputs"]), sorted(contract["properties"]), op)
-            self.assertEqual(sorted(contract["required"]), sorted(set(contract["required"]) & set(s["inputs"])), op)
-            self.assertEqual(s["action_input"], {}, op)
 
 
 class TheGeneralPlans(unittest.TestCase):
@@ -235,8 +139,8 @@ class TheFacts(unittest.TestCase):
                         if n.startswith("result.")}   # the answers only: the config, marker and hold samples are not
 
     def test_are_outcome_and_desk_ready_and_nothing_else(self):
-        for op in ALL_OPS:
-            contract = step(admin_plan(op))["step_output_contract"]
+        for op in GENERAL_OPS:
+            contract = step(desk_plans.general_admin_plan(op, GATE))["step_output_contract"]
             self.assertEqual(contract["properties"], {
                 "outcome": {"type": "string", "enum": ["ready", "refused", "unknown"]},
                 "desk_ready": {"type": "boolean"},
@@ -244,8 +148,8 @@ class TheFacts(unittest.TestCase):
             self.assertNotIn("required", contract, f"{op}: Govern refuses a required field the gate does not promise")
 
     def test_take_every_answer_a_plan_reaches_and_refuse_running(self):
-        for op in ALL_OPS:
-            contract = step(admin_plan(op))["step_output_contract"]
+        for op in GENERAL_OPS:
+            contract = step(desk_plans.general_admin_plan(op, GATE))["step_output_contract"]
             for name, answer in self.samples.items():
                 with self.subTest(op=op, sample=name):
                     self.assertEqual(facts_accept(contract, answer), answer["outcome"] != "running",
@@ -253,69 +157,21 @@ class TheFacts(unittest.TestCase):
         self.assertIn("running", {a["outcome"] for a in self.samples.values()}, "the running answer is vendored")
 
     def test_only_ready_ends_the_run_well(self):
-        for op in ALL_OPS:
-            transitions = admin_plan(op)["definition"]["operations"][0]["transitions"]
+        for op in GENERAL_OPS:
+            transitions = desk_plans.general_admin_plan(op, GATE)["definition"]["operations"][0]["transitions"]
             self.assertEqual(transitions, {"output.outcome == 'ready'": "end", "default": "fail"}, op)
 
 
-class Refused(unittest.TestCase):
-    def test_a_gate_that_is_not_an_instance_id(self):
-        for bad in ["", "enclave 1", "-x", "../gate"]:
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                desk_plans.admin_plan("stop", bad)
-
-    def test_an_operation_that_is_not_a_plan(self):
-        with self.assertRaises(ValueError):
-            desk_plans.admin_plan("connect", GATE)
-
-
-class ThePolicyRead(unittest.TestCase):
-    """`ekka desk policy show` on the Enclave's machine runs ekka.desk.policyread.v1."""
-
-    def setUp(self):
-        self.plan = desk_plans.admin_plan("policyread", GATE, "agent-1")
-
-    def test_is_the_plan_the_runner_runs(self):
-        self.assertEqual(self.plan["plan"]["code"], "desk.policyread.v1")
-
-    def test_is_a_read_of_the_policy_route_with_no_body(self):
-        s = step(self.plan)
-        self.assertEqual((s["op"], s["feature"]), ("read", "api.read"))
-        self.assertEqual(s["inputs"]["key"], "/v1/desks/@input.desk/policy")
-        self.assertEqual(s["inputs"]["expect"], {"status": 200})
-        self.assertNotIn("body_sha256", s["inputs"])
-        self.assertNotIn("value", s["inputs"])
-
-    def test_reads_the_route_the_contract_names_for_the_policy(self):
-        routes = {o["operation"]: o for o in vendored("backend/operations.json")["operations"]}
-        get = routes["policy_get"]
-        self.assertEqual((get["method"], get["mutates"]), ("GET", False))
-        self.assertEqual(get["path"].replace("{name}", "@input.desk"), step(self.plan)["inputs"]["key"])
-
-
-class TheGrantFactsRead(unittest.TestCase):
-    def test_reads_the_contract_route_without_inputs_and_accepts_its_answer(self):
-        plan = desk_plans.admin_plan("grantfacts", GATE)
-        s = step(plan)
-        route = next(o for o in vendored("backend/operations.json")["operations"]
-                     if o["operation"] == "grant_facts")
-        self.assertEqual((route["method"], route["mutates"]), ("GET", False))
-        self.assertEqual((s["op"], s["feature"], s["inputs"]["key"]), ("read", "api.read", route["path"]))
-        self.assertEqual(plan["definition"]["inputs"], {})
-        self.assertEqual(s["inputs"]["expect"], {"status": 200})
-        self.assertTrue(facts_accept(s["step_output_contract"], vendored("backend/samples/result.grant-facts-ready.json")))
-
-
 class TheTool(unittest.TestCase):
-    def test_writes_the_eleven_plans_and_names_each(self):
+    def test_writes_only_the_two_general_plans_and_names_each(self):
         out = tempfile.mkdtemp()
         r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "desk_plans.py"), "--admin", GATE, out, "a-1"],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(ALL_OPS), 11)
-        self.assertEqual(sorted(os.listdir(out)), sorted(f"plan-desk-{op}.json" for op in ALL_OPS))
-        self.assertEqual([line.split()[1] for line in r.stdout.splitlines()], [f"ekka.desk.{op}.v1" for op in ALL_OPS])
-        for op in ALL_OPS:
+        self.assertEqual(len(GENERAL_OPS), 2)
+        self.assertEqual(sorted(os.listdir(out)), sorted(f"plan-desk-{op}.json" for op in GENERAL_OPS))
+        self.assertEqual([line.split()[1] for line in r.stdout.splitlines()], [f"ekka.desk.{op}.v1" for op in GENERAL_OPS])
+        for op in GENERAL_OPS:
             with open(os.path.join(out, f"plan-desk-{op}.json")) as f:
                 plan = json.load(f)
             self.assertEqual(plan["plan"]["agent"], "a-1")

@@ -40,7 +40,7 @@ cd "$(dirname "$0")"; ROOT=$PWD
 SNAPSHOT=/usr/local/lib/ekka-desks   # root-owned copy of deploy/ and tools/ the supervisor unit runs from
 export DESKS_STATE=${DESKS_STATE:-/var/lib/ekka-agent-desks}
 # A folder-mode rerun must keep this installation's environment and release, not reset them.
-EKKA_VERSION=${EKKA_VERSION:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_VERSION 0.1.130)}
+EKKA_VERSION=${EKKA_VERSION:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_VERSION 0.6.8)}
 EKKA_ENV=${EKKA_ENV:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_ENV prod)}
 export EKKA_ENV
 AGENT=${AGENT:-claude-code}
@@ -48,10 +48,11 @@ OPENSHELL_TELEMETRY=${OPENSHELL_TELEMETRY:-off}
 OPENSHELL_TAG=v0.1.4
 # EKKA desk administration requires the compatible Enclave release below.
 # Upgrade the integration and Enclave together. The release must support governed desk
-# changes, per-run output collection, verified requester identities, and conversation leases.
+# changes through the two general plans, per-run output collection, verified requester identities,
+# and conversation leases.
 # OpenShell addresses commands by desk name. Identity checks narrow the replacement race
 # before dispatch but do not eliminate it. See docs/SECURITY.md for the trust boundaries.
-DESK_ADMIN_MIN_EKKA=0.1.124
+DESK_ADMIN_MIN_EKKA=0.6.8
 COMPOSE_VER=v5.6.0
 BUILDX_VER=v0.38.0
 # Every download, by this machine's processor type: the publisher's own file name, and the sha256 the publisher
@@ -860,11 +861,11 @@ create_desk_plans() {
   install_plans "$made" "$sharing"
 }
 
-# The eleven desk administration plans, owned by the desks agent: create_desk_admin_plans <api gate> <agent id>.
-# Nine per-operation plans stay for older runners; two general plans read or write any adapter route.
-# `ekka desk create`, `stop`, `status` and the rest run these plans (ekka.desk.<op>.v1), and creating them is what
-# declares api.write on the desks agent: before they exist, EKKA refuses the desks grant ("This agent does not
-# declare 'api.write'"). The desk is an input, so one set serves every desk. Created only when changed, as above.
+# The two general desk administration plans, owned by the desks agent: create_desk_admin_plans <api gate> <agent id>.
+# Runner 0.6.8 or newer runs desk commands through ekka.desk.read.v1 and ekka.desk.write.v1.
+# Creating them declares api.read/api.write on the desks agent before the desks grant is asked for.
+# The route is an input, so one pair serves every desk. Created only when changed, as above.
+# The installer stops creating the nine per-operation plans; it never deletes or archives ones an organization holds.
 create_desk_admin_plans() {
   local gate=$1 agent=$2 dir=$DESKS_STATE/plans made
   install -d -m 0755 "$dir"
@@ -977,7 +978,7 @@ step_agent_open() {  # every member may RUN the desks agent's shared plans; writ
   # a member's run of a shared desk plan (create_desk_plans offers them to the organization) is refused. Use only:
   # a member still cannot RUN an unshared plan (the admin plans are never offered, and each requires the admin
   # role), and nobody writes a plan under this agent unless an owner appoints them (`--as author`).
-  # The floor (DESK_ADMIN_MIN_EKKA, 0.1.124) has `ekka agent allow`; the read-back below
+  # The floor (DESK_ADMIN_MIN_EKKA, 0.6.8) has `ekka agent allow`; the read-back below
   # stops the install on any EKKA where it did not take, whatever the reason.
   local out mode
   out=$(ekka_in agent allow "$DESKS_AGENT" --everyone --as use 2>&1 </dev/null) \

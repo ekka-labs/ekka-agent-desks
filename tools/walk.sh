@@ -649,7 +649,7 @@ PY
   admin_run "desk lifecycle: stop" stop "$PROBE"
   admin_run "desk lifecycle: start" start "$PROBE"
   skip_leg "desk lifecycle: a narrowing policy change" "the shipped grant gives a desk no rule it can lose (hosts come only from providers, and no new program is allowed): narrowing is walked with the approved test fixture, EKKA regression coverage"
-  # A governed read since the release this setup needs (DESK_ADMIN_MIN_EKKA): a plan run that answers the desk's outcome.
+  # Runner 0.6.8 or newer reads status through ekka.desk.read.v1 and changes desks through ekka.desk.write.v1.
   covers "ekka desk status"
   judged "status reads the desk through EKKA: ready, no change running" outcome ready E desk status "$PROBE"
   # With no grant, a desk change is refused at dispatch. The grant comes back as an install restores it:

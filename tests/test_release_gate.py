@@ -73,9 +73,9 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
         self.assertIn("upgrade together", r.stderr)
 
     def test_the_named_release_or_newer_installs(self):
-        for have in ("0.1.112", "0.1.124"):
+        for have in ("0.6.8", "0.6.9"):
             with self.subTest(have=have):
-                r = self.run_gate(have, "0.1.112")
+                r = self.run_gate(have, "0.6.8")
                 self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_no_named_release_refuses_every_install(self):
@@ -93,7 +93,8 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
             text = f.read()
         floor = re.search(r"^DESK_ADMIN_MIN_EKKA=(\S*)$", text, re.M).group(1)
         default = re.search(r"retained \"\$DESKS_STATE\" EKKA_VERSION (\S+?)\)\}$", text, re.M).group(1)
-        self.assertTrue(floor, "this setup names the release it needs")
+        self.assertEqual(floor, "0.6.8", "the first runner using only the two general desk plans")
+        self.assertEqual(default, "0.6.8")
         self.assertEqual(gate(default, floor), 0, f"the default {default} is older than the floor {floor}")
         self.assertEqual(self.run_gate(default, floor).returncode, 0)
 
@@ -117,7 +118,7 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
         self.assertLess(run.index("step_preflight"), run.index("step_start"), "refused before anything starts")
 
     def test_a_retained_older_release_is_refused_with_the_upgrade_line(self):
-        # A home installed at 0.1.123 saved EKKA_VERSION=0.1.123 in up.env. A plain rerun keeps it, so the
+        # A home installed at 0.6.7 saved EKKA_VERSION=0.6.7 in up.env. A plain rerun keeps it, so the
         # gate must refuse it by name and say how to upgrade; an explicit EKKA_VERSION at the floor passes.
         with open(os.path.join(ROOT, "up.sh"), encoding="utf-8") as f:
             text = f.read()
@@ -125,13 +126,13 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
         floor = re.search(r"^DESK_ADMIN_MIN_EKKA=\S*$", text, re.M).group(0)
         state = tempfile.mkdtemp()
         with open(os.path.join(state, "up.env"), "w") as f:
-            f.write("EKKA_VERSION=0.1.123\nEKKA_ENV=prod\n")
+            f.write("EKKA_VERSION=0.6.7\nEKKA_ENV=prod\n")
         script = f"{STUBS}DESKS_STATE={state}\n{floor}\n{up_function('release_gate')}\n"
         r = bash(f"{script}unset EKKA_VERSION; {pick}\nrelease_gate")
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("this machine runs 0.1.123", r.stderr)
-        self.assertIn("run again with EKKA_VERSION=0.1.124", r.stderr)
-        self.assertEqual(bash(f"{script}EKKA_VERSION=0.1.124; {pick}\nrelease_gate").returncode, 0)
+        self.assertIn("this machine runs 0.6.7", r.stderr)
+        self.assertIn("run again with EKKA_VERSION=0.6.8", r.stderr)
+        self.assertEqual(bash(f"{script}EKKA_VERSION=0.6.8; {pick}\nrelease_gate").returncode, 0)
         shutil.rmtree(state)
 
 
@@ -147,7 +148,7 @@ class TheAdapterIsOnAtItsPinnedImage(unittest.TestCase):
             os.makedirs(os.path.join(state, "backend"))
             open(os.path.join(state, "backend", "config.json"), "w").close()
         script = STUBS + f"""
-DESKS_STATE={state}; MODE=server; NAME=desks.example.test; EKKA_VERSION=0.1.124; EKKA_ENV=prod
+DESKS_STATE={state}; MODE=server; NAME=desks.example.test; EKKA_VERSION=0.6.8; EKKA_ENV=prod
 OPENSHELL_TELEMETRY=off
 ip() {{ echo "1.1.1.1 via 192.0.2.1 dev eth0 src 192.0.2.10"; }}
 stat() {{ echo 999; }}

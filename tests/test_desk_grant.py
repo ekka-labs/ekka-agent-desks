@@ -624,22 +624,22 @@ class UpShStep(unittest.TestCase):
         self.assertEqual([c["kind"] for c in calls if c["kind"] in ("provider", "add", "revoke")], [])
 
     def test_a_plan_ekka_already_holds_unchanged_makes_no_new_version(self):
-        # `ekka plan create` makes a new version on every call: eleven new versions per grant step, nothing changed.
+        # `ekka plan create` makes a new version on every call: two new versions per grant step, nothing changed.
         r, calls, _ = run_step(ekka_holds="same")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([c["name"] for c in calls if c["kind"] == "plan"], [], "no plan created again")
-        self.assertEqual(r.stdout.count("(unchanged, no new version)"), 11, r.stdout)
+        self.assertEqual(r.stdout.count("(unchanged, no new version)"), 2, r.stdout)
 
     def test_a_plan_that_changed_is_created(self):
         r, calls, _ = run_step(ekka_holds="older")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 11)
+        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 2)
 
     def test_an_ekka_that_cannot_list_its_plans_gets_every_plan_created(self):
         # The stub answers no plan list without EKKA_HOLDS: unreadable is never "the same".
         r, calls, _ = run_step()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 11)
+        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 2)
 
     def test_an_adapter_that_becomes_healthy_while_waited_for_is_asked(self):
         for name, health in (("after three asks", "starting,starting,healthy"),
@@ -814,23 +814,24 @@ class UpShStep(unittest.TestCase):
     # administration plans, so no plan declared api.write on the desks agent, and EKKA refused the grant:
     # "This agent does not declare 'api.write'".
     ADMIN_PLANS = {f"plan-desk-{op}.json": f"desk.{op}.v1"
-                   for op in ("create", "delete", "stop", "start", "policy", "detach", "status", "policyread", "grantfacts",
-                              "read", "write")}
+                   for op in ("read", "write")}
 
     def assert_admin_plans_made_before_any_add(self, calls):
         made = [c["name"] for c in calls if c["kind"] == "plan"]
-        self.assertEqual(sorted(made), sorted(self.ADMIN_PLANS), "all eleven, each once")
+        self.assertEqual(sorted(made), sorted(self.ADMIN_PLANS), "both, each once")
         copied = {c["name"]: c["plan"] for c in calls if c["kind"] == "cp"}
         for name, code in self.ADMIN_PLANS.items():
             plan = copied[name]
             self.assertEqual((plan["plan"]["code"], plan["plan"]["agent"]), (code, AGENT), "owned by the desks agent")
-            self.assertEqual(plan["definition"]["operations"][0]["steps"][0]["target"], GATE, "this Enclave's API gate")
+            step = plan["definition"]["operations"][0]["steps"][0]
+            self.assertEqual(step["target"], GATE, "this Enclave's API gate")
+            self.assertEqual(step["feature"], "api." + code.split(".")[1], "declared before the grant")
         kinds = [c["kind"] for c in calls]
         if "add" in kinds:
             self.assertLess(max(i for i, k in enumerate(kinds) if k == "plan"), kinds.index("add"),
                             "the plans exist before the grant is asked for")
 
-    def test_the_eleven_admin_plans_are_made_before_the_grant(self):
+    def test_the_two_admin_plans_are_made_before_the_grant(self):
         r, calls, _ = run_step()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assert_admin_plans_made_before_any_add(calls)
@@ -846,9 +847,9 @@ class UpShStep(unittest.TestCase):
         self.assertEqual([c["kind"] for c in calls if c["kind"] in ("add", "revoke")], [])
 
     def test_planted_a_refused_admin_plan_stops_before_any_grant(self):
-        r, calls, _ = run_step(plan_fails="plan-desk-stop.json")
+        r, calls, _ = run_step(plan_fails="plan-desk-write.json")
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("the plan ekka.desk.stop.v1 was not created", r.stderr)
+        self.assertIn("the plan ekka.desk.write.v1 was not created", r.stderr)
         self.assertEqual([c for c in calls if c["kind"] in ("add", "revoke")], [])
 
     def test_planted_without_the_call_no_admin_plan_is_made(self):

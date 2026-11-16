@@ -188,7 +188,7 @@ ekka desk stop code-desk
 
 - **Whose sign-in.** It runs under the Enclave's EKKA sign-in, the person who installed the server (an organization admin), whoever types the command. So who may change a desk comes down to who has root on this machine: `sudo -i`, then `ekka desk ...`; the `ekka` command there runs as the Enclave's own user.
 - **Not from your own computer.** A person's `ekka` on their own computer reads desks (`list`, `logs`, `policy show`, `connections`). A change from there is refused, because no Enclave runs there. Changing a desk from another computer is not in this release.
-- **Reading a desk's policy here needs no sign-in.** On this machine, `ekka desk policy show <desk>` runs the plan `ekka.desk.policyread.v1` through the Enclave, like `status`, and reads the live policy back from the Enclave's own record of the run. It needs an Enclave release with the policy-read plan and this setup's backend adapter at contracts 0.75.0 or later.
+- **Reading a desk's policy here needs no sign-in.** On this machine, `ekka desk policy show <desk>` runs the plan `ekka.desk.read.v1` through the Enclave, like `status`, and reads the live policy back from the Enclave's own record of the run. This setup requires EKKA 0.6.8 or newer and installs the general read plan.
 - **Policy changes read first.** `allow`, `deny` and `policy set` read the desk's current policy before they change it, so the Enclave needs its own desk sign-in, once: `ekka desk login`. It prints an address. Open it in a browser on a computer set up as in [step 6](SERVER.md#6-each-person-connects-to-the-server), and sign in as `desks-admin`. That sign-in has read permissions only. OpenShell 0.1.4 checks those permissions even for its admin role. The change itself is made by the backend adapter.
 
 ## Administer desks from the server itself
@@ -405,7 +405,7 @@ The installer installs the pinned EKKA release through EKKA's signed installer (
 
 Update one component at a time:
 
-- **EKKA Enclave:** use the release this setup configures. An explicit override, such as `sudo EKKA_VERSION=0.1.124 ./up.sh server <name>`, must be compatible with the integration's minimum release.
+- **EKKA Enclave:** use the release this setup configures. An explicit override, such as `sudo EKKA_VERSION=0.6.8 ./up.sh server <name>`, must be compatible with the integration's minimum release.
 - **Base image:** change `desk/image/` in a reviewed pull request; the next install or upgrade builds it. There is one Dockerfile, here.
 - **OpenShell:** update the release and image pins together. Verify checksums and run the integration checks before installing the change.
 - **Keycloak and Postgres:** back up their data before changing image pins. Startup may migrate the database; restoring an older image alone may not reverse a migration.
