@@ -38,7 +38,7 @@ NOW = dt.datetime(2026, 10, 16, tzinfo=dt.timezone.utc)
 
 
 def errors(value):
-    return schema_check.schema_errors(value, SCHEMA)
+    return schema_check.schema_errors(value, SCHEMA["$defs"]["full"], SCHEMA)
 
 
 def build(**over):
@@ -56,6 +56,22 @@ def row(grant_id, constraints, days=200, agent=AGENT, gate=GATE, active=True):
 
 
 class TheLimits(unittest.TestCase):
+    def test_the_top_level_is_exactly_the_two_closed_forms_full_and_follow(self):
+        self.assertEqual(SCHEMA["oneOf"], [{"$ref": "#/$defs/full"}, {"$ref": "#/$defs/follow"}])
+        for name in ("full", "follow"):
+            self.assertEqual(SCHEMA["$defs"][name]["type"], "object")
+            self.assertIs(SCHEMA["$defs"][name]["additionalProperties"], False)
+        follow = {"follow": {"grant": "org_desks"}, "requires_role": "admin"}
+        for value in (build(), follow):
+            self.assertEqual(schema_check.schema_errors(value, SCHEMA), [])
+        for value in ({}, {**build(), **follow}, {**follow, "discovery": {}},
+                      {**follow, "follow": {"grant": "other"}}, {"follow": {"grant": "org_desks"}}):
+            self.assertTrue(schema_check.schema_errors(value, SCHEMA), value)
+        self.assertTrue(errors(follow), "the installer accepts FULL only")
+
+    def test_one_of_requires_one_match_not_merely_at_least_one(self):
+        self.assertTrue(schema_check.schema_errors({}, {"oneOf": [{"type": "object"}, {"type": "object"}]}))
+
     def test_the_schema_check_is_real(self):
         with open(os.path.join(ROOT, "vendor", "ekka-contracts", "governance", "grant-constraints", "samples",
                                "desks.v1.json")) as f:
@@ -265,6 +281,14 @@ class TheDiscoveryWindow(unittest.TestCase):
 
 
 class TheDecision(unittest.TestCase):
+    def test_follow_is_refused_as_wanted_or_as_the_active_grant(self):
+        follow = {"follow": {"grant": "org_desks"}, "requires_role": "admin"}
+        for limits in (follow, {**build(), **follow}):
+            with self.subTest(limits=limits), self.assertRaisesRegex(dg.Refused, "FOLLOW, not FULL"):
+                dg.decide([], AGENT, GATE, limits, NOW)
+            with self.subTest(limits=limits), self.assertRaisesRegex(dg.Refused, "FOLLOW, not FULL"):
+                dg.decide([row("g1", limits)], AGENT, GATE, build(), NOW)
+
     def setUp(self):
         self.lim = build()
 
@@ -310,6 +334,23 @@ class TheDecision(unittest.TestCase):
 
 
 class CommandLine(unittest.TestCase):
+    def test_follow_is_refused_when_showing_limits_or_opening_a_window(self):
+        import contextlib
+        import tempfile
+        follow = {"follow": {"grant": "org_desks"}, "requires_role": "admin"}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "limits.json")
+            for limits in (follow, {**build(), **follow}):
+                with open(path, "w") as f:
+                    json.dump(limits, f)
+                for argv in (["show", path], ["window", "--image-ref", "ghcr.io/example/project@sha256:" + "a" * 64,
+                                              "--providers", "github", "--limits", path]):
+                    out, err = io.StringIO(), io.StringIO()
+                    with self.subTest(argv=argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = dg.main(argv, now=NOW)
+                    self.assertEqual((rc, out.getvalue()), (1, ""))
+                    self.assertIn("FOLLOW, not FULL", err.getvalue())
+
     def test_limits_then_decide_end_to_end(self):
         out = io.StringIO()
         sys_stdout, sys.stdout = sys.stdout, out
@@ -394,7 +435,7 @@ if a[:1] == ["compose"]:
         for name in sorted(os.listdir(d)):
             with open(os.path.join(d, name)) as f: whole = json.load(f)
             if whole["plan"]["code"] == code: break
-        definition = whole["definition"] if os.environ["EKKA_HOLDS"] == "same" else {**whole["definition"], "inputs": {}}
+        definition = whole["definition"] if os.environ["EKKA_HOLDS"] == "same" else {**whole["definition"], "requires_role": "member"}
         log(kind="shown", identity=cmd[2])
         print(json.dumps({"plan_code": code, "name": whole["plan"].get("name"), "plan_json": definition,
                           "owner_agent": {"agent_code": "desks"}}))
@@ -520,22 +561,22 @@ class UpShStep(unittest.TestCase):
         self.assertEqual([c["kind"] for c in calls if c["kind"] in ("provider", "add", "revoke")], [])
 
     def test_a_plan_ekka_already_holds_unchanged_makes_no_new_version(self):
-        # `ekka plan create` makes a new version on every call: eight new versions per grant step, nothing changed.
+        # `ekka plan create` makes a new version on every call: nine new versions per grant step, nothing changed.
         r, calls, _ = run_step(ekka_holds="same")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([c["name"] for c in calls if c["kind"] == "plan"], [], "no plan created again")
-        self.assertEqual(r.stdout.count("(unchanged, no new version)"), 8, r.stdout)
+        self.assertEqual(r.stdout.count("(unchanged, no new version)"), 9, r.stdout)
 
     def test_a_plan_that_changed_is_created(self):
         r, calls, _ = run_step(ekka_holds="older")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 8)
+        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 9)
 
     def test_an_ekka_that_cannot_list_its_plans_gets_every_plan_created(self):
         # The stub answers no plan list without EKKA_HOLDS: unreadable is never "the same".
         r, calls, _ = run_step()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 8)
+        self.assertEqual(len([c for c in calls if c["kind"] == "plan"]), 9)
 
     def test_an_adapter_that_becomes_healthy_while_waited_for_is_asked(self):
         for name, health in (("after three asks", "starting,starting,healthy"),
@@ -710,11 +751,11 @@ class UpShStep(unittest.TestCase):
     # administration plans, so no plan declared api.write on the desks agent, and EKKA refused the grant:
     # "This agent does not declare 'api.write'".
     ADMIN_PLANS = {f"plan-desk-{op}.json": f"desk.{op}.v1"
-                   for op in ("create", "delete", "stop", "start", "policy", "detach", "status", "policyread")}
+                   for op in ("create", "delete", "stop", "start", "policy", "detach", "status", "policyread", "grantfacts")}
 
     def assert_admin_plans_made_before_any_add(self, calls):
         made = [c["name"] for c in calls if c["kind"] == "plan"]
-        self.assertEqual(sorted(made), sorted(self.ADMIN_PLANS), "all eight, each once")
+        self.assertEqual(sorted(made), sorted(self.ADMIN_PLANS), "all nine, each once")
         copied = {c["name"]: c["plan"] for c in calls if c["kind"] == "cp"}
         for name, code in self.ADMIN_PLANS.items():
             plan = copied[name]
@@ -725,7 +766,7 @@ class UpShStep(unittest.TestCase):
             self.assertLess(max(i for i, k in enumerate(kinds) if k == "plan"), kinds.index("add"),
                             "the plans exist before the grant is asked for")
 
-    def test_the_eight_admin_plans_are_made_before_the_grant(self):
+    def test_the_nine_admin_plans_are_made_before_the_grant(self):
         r, calls, _ = run_step()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assert_admin_plans_made_before_any_add(calls)

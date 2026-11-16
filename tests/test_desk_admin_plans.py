@@ -1,9 +1,9 @@
-"""The eight desk administration plans of an organization.
+"""The nine desk administration plans of an organization.
 
 `ekka desk <op>` runs one of them by name: one call through the Enclave's API gate to the backend adapter on
 `apis/desks`, run only by an organization admin, reading `outcome` and `desk_ready` from the adapter's answer.
 The inputs are the one table the CLI sends. The routes and the answers are the adapter contract's own,
-read from vendor/ekka-contracts (published @ekka-ai/contracts 0.76.0), never restated here.
+read from vendor/ekka-contracts (published @ekka-ai/contracts 0.83.0), never restated here.
 """
 import hashlib
 import json
@@ -33,10 +33,11 @@ INPUTS = {
     "detach": ["desk", "provider", "body", "body_sha256"],
     "status": ["desk"],
     "policyread": ["desk"],
+    "grantfacts": [],
 }
 # Each plan's operation in the adapter contract.
 CONTRACT_OP = {"create": "create", "delete": "delete", "stop": "stop", "start": "start", "policy": "policy_set",
-               "detach": "provider_detach", "status": "status", "policyread": "policy_get"}
+               "detach": "provider_detach", "status": "status", "policyread": "policy_get", "grantfacts": "grant_facts"}
 
 
 def vendored(path):
@@ -66,16 +67,18 @@ def facts_accept(contract, answer):
 class TheVendoredContract(unittest.TestCase):
     def test_is_the_published_files_byte_for_byte(self):
         manifest = vendored("MANIFEST.json")
-        self.assertEqual(manifest["version"], "0.76.0")
+        self.assertEqual(manifest["version"], "0.83.0")
+        self.assertEqual(manifest["tag"], "v0.83.0")
         for path, digest in manifest["files"].items():
             with open(os.path.join(VENDOR, path), "rb") as f:
                 self.assertEqual(hashlib.sha256(f.read()).hexdigest(), digest, path)
         on_disk = sorted(f"backend/samples/{n}" for n in os.listdir(os.path.join(VENDOR, "backend", "samples")))
         self.assertEqual(sorted(p for p in manifest["files"] if p.startswith("backend/samples/")), on_disk,
                          "a sample with no manifest entry, or an entry with no file")
+        self.assertIn("backend/samples/result.grant-facts-ready.json", manifest["files"])
 
 
-class TheSevenPlans(unittest.TestCase):
+class TheNinePlans(unittest.TestCase):
     def setUp(self):
         self.plans = {op: desk_plans.admin_plan(op, GATE, "agent-1") for op in OPS}
 
@@ -210,8 +213,21 @@ class ThePolicyRead(unittest.TestCase):
         self.assertEqual(get["path"].replace("{name}", "@input.desk"), step(self.plan)["inputs"]["key"])
 
 
+class TheGrantFactsRead(unittest.TestCase):
+    def test_reads_the_contract_route_without_inputs_and_accepts_its_answer(self):
+        plan = desk_plans.admin_plan("grantfacts", GATE)
+        s = step(plan)
+        route = next(o for o in vendored("backend/operations.json")["operations"]
+                     if o["operation"] == "grant_facts")
+        self.assertEqual((route["method"], route["mutates"]), ("GET", False))
+        self.assertEqual((s["op"], s["feature"], s["inputs"]["key"]), ("read", "api.read", route["path"]))
+        self.assertEqual(plan["definition"]["inputs"], {})
+        self.assertEqual(s["inputs"]["expect"], {"status": 200})
+        self.assertTrue(facts_accept(s["step_output_contract"], vendored("backend/samples/result.grant-facts-ready.json")))
+
+
 class TheTool(unittest.TestCase):
-    def test_writes_the_seven_plans_and_names_each(self):
+    def test_writes_the_nine_plans_and_names_each(self):
         out = tempfile.mkdtemp()
         r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "desk_plans.py"), "--admin", GATE, out, "a-1"],
                            capture_output=True, text=True)

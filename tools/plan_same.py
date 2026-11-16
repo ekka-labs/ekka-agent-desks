@@ -1,7 +1,7 @@
 """Whether a plan the installer just wrote is already EKKA's newest version of it.
 
 `ekka plan create` makes a new version on every call, by design, so a grant step that ran it for every plan
-created eight new versions each time, with nothing changed. The installer now asks first:
+created nine new versions each time, with nothing changed. The installer now asks first:
 
     python3 tools/plan_same.py latest <plan file> <agent> < `ekka plan list --all --json`
         prints the identity and visibility of the newest active version of the file's plan owned by <agent>, or

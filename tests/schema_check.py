@@ -1,7 +1,7 @@
 """A small JSON-schema checker for the vendored contracts: the rules those schemas use, applied to a value.
 
 type object and array, required, additionalProperties false, const, enum, pattern, minItems/maxItems,
-minimum/maximum, maxProperties, propertyNames and additionalProperties as a schema, $ref into $defs, and `not` with a
+minimum/maximum, maxProperties, propertyNames and additionalProperties as a schema, $ref into $defs, oneOf, and `not` with a
 pattern. Each schema's own rules are READ from it, never restated in a test.
 """
 import re
@@ -12,6 +12,10 @@ def schema_errors(value, schema, root=None, path=""):
     errs = []
     if "$ref" in schema:
         return schema_errors(value, root["$defs"][schema["$ref"].split("/")[-1]], root, path)
+    if "oneOf" in schema:
+        matches = sum(not schema_errors(value, branch, root, path) for branch in schema["oneOf"])
+        if matches != 1:
+            errs.append(f"{path}: matches {matches} oneOf forms, not exactly one")
     if "const" in schema and value != schema["const"]:
         errs.append(f"{path}: not {schema['const']!r}")
     if "enum" in schema and value not in schema["enum"]:
