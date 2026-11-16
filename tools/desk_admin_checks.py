@@ -20,12 +20,13 @@ import re
 import os
 import sys
 
-# What the adapter's container must be, as `docker inspect` reports it: compose.yml's five mounts (the socket
-# folder, the recovery store, the discovery permits, and two files read-only). tests/test_compose_backend.py holds
+# What the adapter's container must be, as `docker inspect` reports it: compose.yml's six mounts (the socket
+# folder, the recovery store, the discovery permits, and three files read-only). tests/test_compose_backend.py holds
 # this set to compose.yml's own, so the two cannot drift apart again.
 ADAPTER_MOUNTS = {"/run/ekka-backend", "/var/lib/ekka-backend", "/var/lib/ekka-backend/permits",
-                  "/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem"}
-ADAPTER_READ_ONLY = {"/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem"}
+                  "/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem", "/etc/ekka-backend/baseline-policy.json"}
+ADAPTER_READ_ONLY = {"/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem",
+                     "/etc/ekka-backend/baseline-policy.json"}
 ADAPTER_NETWORK_SUFFIX = "_backend"           # compose prefixes the project name: ekka-desks_backend
 # What a person's sign-in may hold: reading only.
 PEOPLE_SCOPES = {"sandbox:read", "provider:read", "workspace:read", "config:read"}
@@ -34,7 +35,7 @@ IDENTITY_SCOPES = {"openid", "offline_access", "acr", "basic", "email", "profile
 # The limits every desks grant carries: the vendored contract's own required list (grant-constraints desks.v1).
 DESKS_LIMITS_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vendor", "ekka-contracts",
                                    "governance", "grant-constraints", "desks.v1.schema.json")
-# The adapter contract's fixed words (@ekka-ai/contracts backend/backend-v1.schema.json).
+# The adapter contract's fixed words (the vendored backend/backend-v1.schema.json).
 OUTCOMES = {"ready", "refused", "unknown", "running"}
 
 

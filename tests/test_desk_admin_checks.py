@@ -21,8 +21,8 @@ ADAPTER = {
     "State": {"Status": "running", "Health": {"Status": "healthy"}},
     "HostConfig": {"ReadonlyRootfs": True, "CapDrop": ["ALL"], "CapAdd": None, "Privileged": False,
                    "SecurityOpt": ["no-new-privileges:true"], "PortBindings": {}},
-    # As `docker inspect` reports compose.yml's five mounts for the adapter: the socket folder and the discovery
-    # permits (host folders, writable), the recovery store (a volume), and two read-only files.
+    # As `docker inspect` reports compose.yml's six mounts for the adapter: the socket folder and the discovery
+    # permits (host folders, writable), the recovery store (a volume), and three read-only files.
     "Mounts": [{"Type": "bind", "Source": "/run/ekka-backend", "Destination": "/run/ekka-backend",
                 "Mode": "", "RW": True, "Propagation": "rprivate"},
                {"Type": "bind", "Source": "/var/lib/ekka-agent-desks/backend/permits",
@@ -33,7 +33,9 @@ ADAPTER = {
                {"Type": "bind", "Source": "/var/lib/ekka-agent-desks/backend/config.json",
                 "Destination": "/etc/ekka-backend/config.json", "Mode": "", "RW": False, "Propagation": "rprivate"},
                {"Type": "bind", "Source": "/var/lib/ekka-agent-desks/tls/ca.crt",
-                "Destination": "/etc/ekka-backend/ca.pem", "Mode": "", "RW": False, "Propagation": "rprivate"}],
+                "Destination": "/etc/ekka-backend/ca.pem", "Mode": "", "RW": False, "Propagation": "rprivate"},
+               {"Type": "bind", "Source": "/var/lib/ekka-agent-desks/backend/baseline-policy.json",
+                "Destination": "/etc/ekka-backend/baseline-policy.json", "Mode": "", "RW": False, "Propagation": "rprivate"}],
     "NetworkSettings": {"Networks": {"ekka-desks_backend": {}}},
 }
 with open(os.path.join(ROOT, "vendor", "ekka-contracts", "governance", "grant-constraints", "samples",
@@ -89,8 +91,9 @@ class TheAdapterLeg(unittest.TestCase):
         self.assertTrue(any("mounts" in p for p in c.adapter(home)))
 
     def test_planted_a_missing_or_writable_configuration_file_is_named(self):
-        # regression review: the two files are read-only. Each is found by its path, not its place in the list.
-        for path in ("/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem"):
+        # regression review: the three files are read-only. Each is found by its path, not its place in the list.
+        for path in ("/etc/ekka-backend/config.json", "/etc/ekka-backend/ca.pem",
+                     "/etc/ekka-backend/baseline-policy.json"):
             i = next(j for j, m in enumerate(ADAPTER["Mounts"]) if m["Destination"] == path)
             with self.subTest(path=path):
                 gone = planted(ADAPTER, ("Mounts",), [m for j, m in enumerate(ADAPTER["Mounts"]) if j != i])

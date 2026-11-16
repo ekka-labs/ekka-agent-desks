@@ -20,12 +20,17 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import backend_image as bi  # noqa: E402
 
-TOKEN = "ghp_" + "Qw7" * 12
 DIGEST = "sha256:" + "ab" * 32
 # The identity a real release would carry, written here from the release, not from the code under test.
 RELEASED = "https://github.com/ekka-labs/ekka-backend/.github/workflows/release.yml@refs/tags/v0.1.0"
 # The required public release identity regexp, written here, not read from the code under test.
 IDENTITY = r"^https://github\.com/ekka-labs/ekka-backend/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$"
+
+RECORD_STUB = r"""import json, os, sys
+with open(os.environ["CALLS"], "a") as f:
+    f.write(json.dumps({"argv": sys.argv}) + "\n")
+sys.exit(int(os.environ.get("RECORD_RC", "0")))
+"""
 
 STUB = r"""#!/usr/bin/env python3
 import hashlib, json, os, sys
@@ -64,7 +69,8 @@ die() {{ echo "die: $*" >&2; exit 1; }}
 {function(fn)}
 {fn} {' '.join(args)}
 """
-    env = dict(os.environ, CALLS=calls, PATH=f"{d}/bin:{os.environ['PATH']}", HOME=d, **(env_extra or {}))
+    env = dict(os.environ, CALLS=calls, PATH=f"{d}/bin:{os.environ['PATH']}", HOME=d, DESKS_STATE=os.path.join(d, "state"))
+    env.update(env_extra or {})
     if tty:
         master, slave = pty.openpty()
         r = subprocess.run(["bash", "-c", script], cwd=root, stdin=slave, capture_output=True, text=True, env=env,
@@ -86,6 +92,10 @@ def copy_with(backend):
     """A copy of this setup's tools and pins, with the backend pin replaced."""
     d = tempfile.mkdtemp()
     shutil.copytree(os.path.join(ROOT, "tools"), os.path.join(d, "tools"))
+    # The real writer refuses temporary state under untrusted parents. Only this copied command is stubbed;
+    # test_desk_records exercises its ownership, path and atomic-write checks.
+    with open(os.path.join(d, "tools", "desk_records.py"), "w") as f:
+        f.write(RECORD_STUB)
     os.makedirs(os.path.join(d, "deploy"))
     with open(os.path.join(ROOT, "deploy", "pins.json")) as f:
         pins = json.load(f)
@@ -104,9 +114,7 @@ class ThePin(unittest.TestCase):
         self.assertEqual(self.b["registry"], "ghcr.io/ekka-labs")
 
     def test_the_shipped_setup_pins_a_released_image(self):
-        # ekka-labs/ekka-backend v0.1.7 (tag 8d03c7c, signed by release.yml@refs/tags/v0.1.7): one index for
-        # linux/amd64 and linux/arm64; the adapter's code and its contract (ekka.backend.v1) as in 0.1.6. Without a
-        # digest this setup cannot install the adapter at all, so a pin set back to null fails here, not on a server.
+        # A digest is required: without one the setup cannot install the adapter at all.
         self.assertIsNotNone(self.b["digest"], "no ekka-backend release is pinned")
         self.assertRegex(bi.image(self.b), r"^ghcr\.io/ekka-labs/ekka-backend@sha256:[0-9a-f]{64}$")
 
@@ -169,6 +177,26 @@ class PullAndVerify(unittest.TestCase):
         self.assertFalse(any("docker-config" in a or "DOCKER_CONFIG" in a or ".docker" in a for a in verify),
                          "a public image: cosign is given none of this machine's Docker logins")
 
+    def test_the_verified_image_writes_the_shipped_baseline_to_the_state_folder(self):
+        root = copy_with(dict(bi.load(), digest=DIGEST))
+        state = os.path.join(tempfile.mkdtemp(), "state")
+        r, calls = run("step_backend_image", [], root=root, env_extra={"DESKS_STATE": state})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(calls), 5)
+        args = calls[-1]["argv"]
+        self.assertEqual(args[:3], ["tools/desk_records.py", "baseline", "desk/policy.json"])
+        self.assertEqual(args[3], os.path.join(state, "backend", "baseline-policy.json"))
+        self.assertEqual(calls[-2]["argv"][:2], ["image", "inspect"])
+
+    def test_a_failed_or_unconfirmed_baseline_write_stops_the_step(self):
+        for rc in ("1", "3"):
+            with self.subTest(rc=rc):
+                r, calls = run("step_backend_image", [], root=copy_with(dict(bi.load(), digest=DIGEST)),
+                               env_extra={"RECORD_RC": rc})
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("the baseline policy record could not be confirmed", r.stderr)
+                self.assertEqual(calls[-1]["argv"][0], "tools/desk_records.py")
+
     def test_the_pulled_image_is_checked_for_this_machines_processor_type(self):
         root = copy_with(dict(bi.load(), digest=DIGEST))
         image = f"ghcr.io/ekka-labs/ekka-backend@{DIGEST}"
@@ -181,16 +209,18 @@ class PullAndVerify(unittest.TestCase):
     def test_planted_an_image_built_for_another_processor_type_is_refused_by_name(self):
         # An ekka-backend release published for amd64 only, on an aarch64 machine: it would pull, then never start.
         root = copy_with(dict(bi.load(), digest=DIGEST))
-        r, _ = run("step_backend_image", [], root=root, env_extra={"DOCKER_ARCH": "arm64", "IMAGE_ARCH": "amd64"})
+        r, calls = run("step_backend_image", [], root=root, env_extra={"DOCKER_ARCH": "arm64", "IMAGE_ARCH": "amd64"})
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("built for 'amd64', and this machine runs 'arm64' images", r.stderr)
         self.assertNotIn("ok: backend adapter", r.stdout)
+        self.assertFalse(any(c["argv"][0] == "tools/desk_records.py" for c in calls))
 
     def test_planted_an_image_that_is_not_signed_by_the_release_workflow_never_runs(self):
         root = copy_with(dict(bi.load(), digest=DIGEST))
-        r, _ = run("step_backend_image", [], root=root, env_extra={"VERIFY_RC": "1"})
+        r, calls = run("step_backend_image", [], root=root, env_extra={"VERIFY_RC": "1"})
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not signed by EKKA's release workflow", r.stderr)
+        self.assertFalse(any(c["argv"][0] == "tools/desk_records.py" for c in calls))
 
 
 class UpSh(unittest.TestCase):
@@ -198,11 +228,13 @@ class UpSh(unittest.TestCase):
         with open(os.path.join(ROOT, "up.sh"), encoding="utf-8") as f:
             text = f.read()
         self.assertIn("step_images; step_backend_image; step_enclave_install; step_init;", text)
+        steps = text.split("step_preflight; step_host_accounts;", 1)[1]
+        self.assertLess(steps.index("step_backend_image;"), steps.index("step_start;"))
 
     def test_the_public_backend_image_is_pulled_with_no_registry_login(self):
         """The backend adapter's image is public (owner, 2026-10-17): its step signs in nowhere and uses no kept credential.
-        A registry credential exists on the server since 2026-10-31, but only for PROJECT images (`sudo ekka desk registry
-        login`, `sudo ekka desk image pull`); the backend step must never reach for it."""
+        Registry credentials are only for project images (`sudo ekka desk registry login`,
+        `sudo ekka desk image pull`); the backend step must never reach for them."""
         with open(os.path.join(ROOT, "up.sh"), encoding="utf-8") as f:
             text = f.read()
         step = re.search(r"^step_backend_image\(\) \{.*?^\}\n", text, re.S | re.M).group(0)

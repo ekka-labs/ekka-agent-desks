@@ -1,4 +1,4 @@
-"""The backend adapter never starts on a missing or fake configuration or CA, whatever the Compose version.
+"""The backend adapter never starts on a missing or fake configuration, CA or baseline, whatever the Compose version.
 
 Main went red on CI's Compose v2.38.2 because a test asserted that `docker compose config` PRINTS
 `create_host_path: false`. That Compose does not print it, and still honors it (measured on the runner: a missing
@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import backend_preflight as bp  # noqa: E402
 
 
-def state(profile="desk-admin", config="file", ca="file", permits="dir"):
+def state(profile="desk-admin", config="file", ca="file", permits="dir", baseline="file"):
     """A state folder: up.env with `profile`, and each file (and the permits folder) as `file`, `dir`, `link` or
     None (missing)."""
     d = tempfile.mkdtemp()
@@ -30,7 +30,8 @@ def state(profile="desk-admin", config="file", ca="file", permits="dir"):
     with open(real, "w") as f:
         f.write("{}")
     os.makedirs(os.path.join(d, "elsewhere-dir"))
-    for rel, kind in (("backend/config.json", config), ("tls/ca.crt", ca), ("backend/permits", permits)):
+    for rel, kind in (("backend/config.json", config), ("tls/ca.crt", ca), ("backend/permits", permits),
+                      ("backend/baseline-policy.json", baseline)):
         path = os.path.join(d, rel)
         if kind == "file":
             with open(path, "w") as f:
@@ -72,6 +73,14 @@ class TheCheck(unittest.TestCase):
     def test_planted_a_missing_ca_is_refused(self):
         self.assertEqual(bp.main([state(ca=None)]), 1)
 
+    def test_planted_a_missing_linked_or_directory_baseline_is_refused(self):
+        for kind, why in ((None, "does not exist"), ("link", "is a link"), ("dir", "is a directory")):
+            with self.subTest(kind=kind):
+                d = state(baseline=kind)
+                self.assertEqual(bp.main([d]), 1)
+                (reason,) = bp.reasons(d)
+                self.assertIn(f"backend/baseline-policy.json {why}", reason)
+
     def test_nothing_is_checked_while_the_adapter_is_off(self):
         # Before enrolment the profile is off and the files do not exist yet: nothing starts the adapter.
         self.assertEqual(bp.main([state(profile=None, config=None, ca=None)]), 0)
@@ -109,6 +118,14 @@ class TheComposeWrapper(unittest.TestCase):
         self.assertIn("the backend adapter was not started", r.stderr)
         self.assertEqual(calls, "", "no docker call at all: nothing was started")
 
+    def test_a_bad_baseline_stops_every_start_command_before_docker(self):
+        for verb in ("up", "start", "restart", "create", "run"):
+            for kind in (None, "link", "dir"):
+                with self.subTest(verb=verb, kind=kind):
+                    r, calls = self.run_wrapper(state(baseline=kind), (verb, "ekka-backend"))
+                    self.assert_refused(r, calls)
+                    self.assertIn("baseline-policy.json", r.stderr)
+
     def test_real_files_let_compose_up_through_to_docker(self):
         _, calls = self.run_wrapper(state())
         self.assertIn("compose", calls, "the adapter's check passed, so the wrapper went on to docker")
@@ -137,7 +154,6 @@ class TheComposeWrapper(unittest.TestCase):
     def test_another_service_with_the_adapter_off_is_not_refused(self):
         _, calls = self.run_wrapper(state(profile=None, config=None), ("up", "-d", "gateway"))
         self.assertIn("compose", calls)
-
 
 if __name__ == "__main__":
     unittest.main()
