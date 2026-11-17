@@ -29,7 +29,9 @@ case "${1:-} ${2:-}" in
   "desk invite")  admin invite "${@:3}" ;;
   "desk revoke")  admin revoke "${@:3}" ;;
   "desk plans")   admin desk-plans "${@:3}" ;;
-  "desk grant")   admin grant "${@:3}" ;;
+  "desk grant")   case "${3:-}" in
+                    discovery|restore|project) admin grant "${@:3}" ;;
+                  esac ;;   # show and update belong to the CLI
   "desk registry") admin registry "${@:3}" ;;
   "desk image")   admin image "${@:3}" ;;
 esac

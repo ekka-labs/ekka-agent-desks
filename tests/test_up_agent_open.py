@@ -61,7 +61,7 @@ class AgentOpen(unittest.TestCase):
         self.assertTrue(r.marked)
 
     def test_an_ekka_without_the_command_stops_the_install(self):
-        # 0.1.108 has no `agent allow` and its `agent show --json` has no access section (measured help; floor is 0.6.8)
+        # 0.1.108 has no `agent allow` and its `agent show --json` has no access section (measured help; floor is 0.6.10)
         r = run(reply="error: unrecognized subcommand 'allow'", rc=2)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("die: EKKA refused to let every member run the plans of desks: error: unrecognized subcommand", r.stderr)

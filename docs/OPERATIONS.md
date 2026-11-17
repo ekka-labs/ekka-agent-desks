@@ -188,7 +188,7 @@ ekka desk stop code-desk
 
 - **Whose sign-in.** It runs under the Enclave's EKKA sign-in, the person who installed the server (an organization admin), whoever types the command. So who may change a desk comes down to who has root on this machine: `sudo -i`, then `ekka desk ...`; the `ekka` command there runs as the Enclave's own user.
 - **Not from your own computer.** A person's `ekka` on their own computer reads desks (`list`, `logs`, `policy show`, `connections`). A change from there is refused, because no Enclave runs there. Changing a desk from another computer is not in this release.
-- **Reading a desk's policy here needs no sign-in.** On this machine, `ekka desk policy show <desk>` runs the plan `ekka.desk.read.v1` through the Enclave, like `status`, and reads the live policy back from the Enclave's own record of the run. This setup requires EKKA 0.6.8 or newer and installs the general read plan.
+- **Reading a desk's policy here needs no sign-in.** On this machine, `ekka desk policy show <desk>` runs the plan `ekka.desk.read.v1` through the Enclave, like `status`, and reads the live policy back from the Enclave's own record of the run. This setup requires EKKA 0.6.10 or newer and installs the general read plan.
 - **Policy changes read first.** `allow`, `deny` and `policy set` read the desk's current policy before they change it, so the Enclave needs its own desk sign-in, once: `ekka desk login`. It prints an address. Open it in a browser on a computer set up as in [step 6](SERVER.md#6-each-person-connects-to-the-server), and sign in as `desks-admin`. That sign-in has read permissions only. OpenShell 0.1.4 checks those permissions even for its admin role. The change itself is made by the backend adapter.
 
 ## Administer desks from the server itself
@@ -210,6 +210,31 @@ ekka desk login             # as desks-admin; one-time password: sudo cat /var/l
 ```
 
 Gateway reads such as `ekka desk logs` and `ekka desk connections` now work from the server. With no local desk records, `ekka desk list` also lists the gateway's desks. To see the Enclave's records and pins, use `ekka desk list` and `ekka desk show <desk>`. Changes and live status also go through the Enclave ([Change a desk](#change-a-desk)).
+
+## Updating the desks grant
+
+The CLI uses the organization's `desks` agent; a different `DESKS_AGENT` override is refused.
+EKKA 0.6.10 or newer builds and writes the grant through `ekka desk grant update --yes`.
+The installer creates the two desk administration plans with `ekka plan create` and writes the
+root-owned image, baseline policy, provider ceiling, discovery window and project records the CLI reads.
+It first checks `ekka gate grant list --json` for active `api.read` access on `apis/desks` for this
+agent and API gate. Only when missing, it adds a plain read grant with `ekka gate grant add`,
+`--capability api.read --ttl 31536000 --no-fingerprint`, without limits. That read access lets the
+CLI fetch the adapter's facts even before a write grant exists.
+
+The CLI keeps an unchanged grant, or adds a 365-day grant, reads it back, then removes the old ones.
+A refusal or failure stops the installer and preserves the CLI's reason. A failure during removal
+may leave the new grant and some old grants in place; inspect `sudo ekka desk grant show --json`
+before retrying. Project and discovery input records are kept for inspection after an uncertain
+update; no automatic rollback grant is attempted. A pending project removal keeps its record as
+`<name>.project.json.old`.
+
+After success, the installer calls `ekka desk grant show --json` and accepts only a `keep` decision
+for the expected agent and API gate, with valid FULL limits at `preview.proposed`. It saves those limits atomically in
+`/var/lib/ekka-agent-desks/backend/desks-grant.json`, root-owned and mode 0644, for its local display,
+discovery provider checks and before/after image display. A failed confirmation stops with the grant
+in place and the previous local record retained (unless the disk fails to confirm a completed rename).
+The installer never computes a second set of limits.
 
 ## Onboarding a project: the discovery window
 
@@ -276,8 +301,8 @@ What keeps a project inside the server's limits:
   policy the Enclave reads sits in its own home; a changed copy has another digest and is refused.
 - **Nothing else in the grant changes.** The shipped image and policy stay, and a project opens no auto approval.
 
-The records are root-owned files in `/var/lib/ekka-agent-desks/backend/projects/`, read on every run of the grant
-step, so `sudo ./up.sh server <name>` and an upgrade keep a project. After a rebuild the image has a new ID: run
+The records are root-owned files in `/var/lib/ekka-agent-desks/backend/projects/`, read by the CLI on every grant
+update, so `sudo ./up.sh server <name>` and an upgrade keep a project. After a rebuild the image has a new ID: run
 `project add` again with it, and the old ID leaves the grant. `sudo ekka desk grant project remove <name>` takes the
 project out; its desks are not deleted, and no new one can be created from it.
 
@@ -335,7 +360,7 @@ gh auth token | sudo ekka desk connect github
 sudo cat /root/anthropic.key | sudo ekka desk connect claude-code
 ```
 
-It creates the provider with that key, or replaces the key of one that exists, then updates the desks grant to name that provider, the same way the install does (the new grant is added before the old one is revoked). The key is handed only to NVIDIA's CLI, in the variable the provider's profile names (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`). The call is logged like the commands below, with the key's name, never its value. A provider that needs more than one key, such as `codex`, is refused here.
+It creates the provider with that key, or replaces the key of one that exists, then updates the desks grant to name that provider, through `ekka desk grant update --yes`, the same command the install uses (the new grant is read back before the old ones are revoked). The key is handed only to NVIDIA's CLI, in the variable the provider's profile names (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`). The call is logged like the commands below, with the key's name, never its value. A provider that needs more than one key, such as `codex`, is refused here.
 
 ## NVIDIA's own commands, as the gateway's administrator
 
@@ -445,7 +470,7 @@ The installer installs the pinned EKKA release through EKKA's signed installer (
 
 Update one component at a time:
 
-- **EKKA Enclave:** use the release this setup configures. An explicit override, such as `sudo EKKA_VERSION=0.6.8 ./up.sh server <name>`, must be compatible with the integration's minimum release.
+- **EKKA Enclave:** use the release this setup configures. An explicit override, such as `sudo EKKA_VERSION=0.6.10 ./up.sh server <name>`, must be compatible with the integration's minimum release.
 - **Base image:** change `desk/image/` in a reviewed pull request; the next install or upgrade builds it. There is one Dockerfile, here.
 - **OpenShell:** update the release and image pins together. Verify checksums and run the integration checks before installing the change.
 - **Keycloak and Postgres:** back up their data before changing image pins. Startup may migrate the database; restoring an older image alone may not reverse a migration.

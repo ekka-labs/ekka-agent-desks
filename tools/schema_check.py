@@ -16,6 +16,8 @@ def schema_errors(value, schema, root=None, path=""):
         matches = sum(not schema_errors(value, branch, root, path) for branch in schema["oneOf"])
         if matches != 1:
             errs.append(f"{path}: matches {matches} oneOf forms, not exactly one")
+    if schema.get("type") == "string" and not isinstance(value, str):
+        errs.append(f"{path}: not a string")
     if "const" in schema and value != schema["const"]:
         errs.append(f"{path}: not {schema['const']!r}")
     if "enum" in schema and value not in schema["enum"]:

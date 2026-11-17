@@ -152,8 +152,7 @@ def image_bytes(image_id):
 
 def ceiling_bytes(files):
     """The provider ceiling: each profile the gateway holds (by its file's name) and the hosts it names, and every
-    host together. Read by the one parser the grant's ceiling uses (desk_grant.profile_file_hosts), and checked to
-    equal the grant's ceiling from these files at the time the record is built."""
+    host together. Read through desk_grant.profile_file_hosts, also used by project policy checks."""
     import desk_grant
     if not files:
         raise Refused("no provider profile was given")

@@ -345,7 +345,9 @@ covers "ekka desk registry"
 t "the registries with a kept credential read back through ekka desk registry show" 'no registry credential kept|  as ' /usr/local/sbin/ekka desk registry show
 not_walked "ekka desk image" "pulls a project image from a private registry with a kept credential; a walk box has none (proved separately on a desks server)"
 covers "ekka desk grant"
-t "the desks grant's limits read back through ekka desk grant show" 'no discovery window|DISCOVERY WINDOW' /usr/local/sbin/ekka desk grant show
+t "the CLI confirms the desks grant" '"action":"keep"' /usr/local/sbin/ekka desk grant show --json
+covers "./up.sh grant"
+t "the confirmed local desks grant record reads back" 'no discovery window|DISCOVERY WINDOW' ./up.sh grant show
 covers "ekka desk plans"; covers "ekka plan create"
 t "walk-desk gets its own setup and ask plans, as ekka desk plans" 'example\.desk\.ask\.walkDesk\.v1' /usr/local/sbin/ekka desk plans "$DESK"
 # Every member may RUN the desks agent's plans; the install opened it (step_agent_open). Read from Govern
@@ -497,6 +499,7 @@ t "unschedule it" 'Removed|removed' E plan unschedule "$sid"
 covers "ekka gate grant list"
 t "the desks grant is listed" 'job\.run .*/desks/\*' E gate grant list
 gate=$(grep -o -E 'enclave[0-9a-f]{8}Job' <<<"$OUT" | head -1)
+covers "ekka gate grant add"
 tmp_grant=$(E gate grant add --agent "$DESKS_AGENT" --type job --instance "$gate" --resource desks/walk-temporary --capability job.run --no-fingerprint --ttl 600)
 covers "ekka gate grant revoke"
 t "a temporary grant is revoked" 'Revoked|revoked' E gate grant revoke "$(grep -o -E 'revoke [0-9a-f-]{36}' <<<"$tmp_grant" | cut -d' ' -f2)"
@@ -649,7 +652,7 @@ PY
   admin_run "desk lifecycle: stop" stop "$PROBE"
   admin_run "desk lifecycle: start" start "$PROBE"
   skip_leg "desk lifecycle: a narrowing policy change" "the shipped grant gives a desk no rule it can lose (hosts come only from providers, and no new program is allowed): narrowing is walked with the approved test fixture, EKKA regression coverage"
-  # Runner 0.6.8 or newer reads status through ekka.desk.read.v1 and changes desks through ekka.desk.write.v1.
+  # Runner 0.6.10 or newer reads status through ekka.desk.read.v1 and changes desks through ekka.desk.write.v1.
   covers "ekka desk status"
   judged "status reads the desk through EKKA: ready, no change running" outcome ready E desk status "$PROBE"
   # With no grant, a desk change is refused at dispatch. The grant comes back as an install restores it:

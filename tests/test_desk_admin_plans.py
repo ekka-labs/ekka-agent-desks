@@ -1,4 +1,4 @@
-"""The two general desk administration plans for runner 0.6.8 or newer.
+"""The two general desk administration plans for runner 0.6.10 or newer.
 
 Each reads or writes an adapter route through the Enclave's API gate, as an organization admin.
 The facts are checked against the answers in vendor/ekka-contracts (published @ekka-ai/contracts 0.83.0).

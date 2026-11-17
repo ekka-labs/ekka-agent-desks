@@ -124,8 +124,8 @@ class TheEkkaVerbEnds(unittest.TestCase):
 
 class TheGrantVerb(unittest.TestCase):
     """`sudo ekka desk grant show|discovery|restore`, run as the real up.sh verb with `id` stubbed and a state folder
-    holding the limits the tool writes. `discovery` is driven to its refusals and to the grant step, which fails here
-    (it needs the adapter image): a window whose grant was not written must not be left open."""
+    holding limits confirmed by the CLI. `discovery` is driven to its refusals and to the grant step, which fails here
+    (it needs the adapter image): an uncertain result must preserve the input for inspection."""
 
     REF = "ghcr.io/example/project@sha256:" + "a" * 64
 
@@ -138,10 +138,11 @@ class TheGrantVerb(unittest.TestCase):
         Path(d, "id").write_text("#!/bin/bash\necho 0\n"); os.chmod(Path(d, "id"), 0o755)
         state = Path(d, "state"); (state/"backend").mkdir(parents=True)
         (state/"up.env").write_text("DESKS_NAME=desks.example.test\nEKKA_BACKEND_IMAGE=ghcr.io/example/backend@sha256:" + "f" * 64 + "\n")
-        lim = subprocess.run([sys.executable, str(ROOT/"tools"/"desk_grant.py"), "limits", "--image-id", "sha256:" + "d" * 64,
-                              "--policy-digest", "sha256:" + "e" * 64, *provider_args], capture_output=True, text=True,
-                             check=True, cwd=ROOT).stdout
-        (state/"backend"/"desks-grant.json").write_text(lim)
+        lim = json.loads((ROOT/"tests/fixtures/desks-grant.json").read_text())
+        if not provider_args:
+            lim["providers"] = []
+            lim["provider_config_digests"] = {}
+        (state/"backend"/"desks-grant.json").write_text(json.dumps(lim))
         return state
 
     def test_show_restore_and_the_refusals(self):
@@ -173,7 +174,7 @@ class TheGrantVerb(unittest.TestCase):
 
     def project_box(self, d, docker):
         """A box with a docker that knows one image and digests any policy; the grant step then fails (no Enclave
-        here), which is the path that must leave nothing behind."""
+        here), which must keep the input records without claiming the grant is unchanged."""
         state = self.box(d, "--provider", "github=sha256:" + "c" * 64)
         Path(d, "docker").write_text("#!/bin/bash\n" + docker); os.chmod(Path(d, "docker"), 0o755)
         shipped = json.loads((ROOT/"desk"/"policy.json").read_text())
@@ -226,13 +227,13 @@ class TheGrantVerb(unittest.TestCase):
             self.assertEqual(r.returncode, 1); self.assertIn("does not read", r.stderr)
             self.assertEqual(self.left_behind(state), [])
 
-    def test_a_project_whose_grant_was_not_written_is_not_left_in_the_folder(self):
+    def test_a_failed_project_add_leaves_no_record_behind(self):
         with tempfile.TemporaryDirectory() as d:
             state = self.project_box(d, self.KNOWS_THE_IMAGE)
             r = self.run_verb(d, "project", "add", "acme", "--image", self.P_IMAGE, "--policy", str(Path(d, "own.json")))
             self.assertEqual(r.returncode, 1, r.stdout)
             self.assertIn("project acme was not added", r.stderr)
-            self.assertEqual(self.left_behind(state), [], "no record, no policy copy, no .new or .old file")
+            self.assertEqual(self.left_behind(state), [], "a record nobody confirmed must not apply on a later run")
 
     def test_remove_of_a_project_that_is_not_there_changes_nothing(self):
         with tempfile.TemporaryDirectory() as d:
@@ -240,14 +241,14 @@ class TheGrantVerb(unittest.TestCase):
             r = self.run_verb(d, "project", "remove", "acme")
             self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("no project acme is in the grant", r.stdout)
 
-    def test_a_remove_whose_grant_was_not_written_keeps_the_project(self):
+    def test_a_failed_project_removal_puts_the_record_back(self):
         with tempfile.TemporaryDirectory() as d:
             state = self.project_box(d, self.KNOWS_THE_IMAGE)
             folder = state/"backend"/"projects"; folder.mkdir()
             rec = {"name": "acme", "image_id": self.P_IMAGE, "policy_digest": "sha256:" + "2" * 64, "since": "2026-11-14T12:00:00Z"}
             (folder/"acme.project.json").write_text(json.dumps(rec)); (folder/"acme.policy.json").write_text("{}")
             r = self.run_verb(d, "project", "remove", "acme")
-            self.assertEqual(r.returncode, 1); self.assertIn("project acme is still in it", r.stderr)
+            self.assertEqual(r.returncode, 1); self.assertIn("project acme was not removed", r.stderr)
             self.assertEqual(self.left_behind(state), ["acme.policy.json", "acme.project.json"])
             self.assertEqual(json.loads((folder/"acme.project.json").read_text()), rec)
 
@@ -260,14 +261,15 @@ class TheGrantVerb(unittest.TestCase):
             r = self.run_verb(d, "show"); self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("PROJECT acme (added 2026-11-14T12:00:00Z)", r.stdout)
 
-    def test_a_window_whose_grant_was_not_written_is_not_left_open(self):
+    def test_a_failed_discovery_window_leaves_no_window_record(self):
         with tempfile.TemporaryDirectory() as d:
             state = self.box(d, "--provider", "github=sha256:" + "c" * 64)
             Path(d, "docker").write_text("#!/bin/bash\nexit 1\n"); os.chmod(Path(d, "docker"), 0o755)   # no desk image here
             r = self.run_verb(d, "discovery", "--image", self.REF, "--providers", "github")
             self.assertEqual(r.returncode, 1, r.stdout)
             self.assertIn("the window is not open", r.stderr)
-            self.assertFalse((state/"backend"/"desks-grant.extras.json").exists())
+            self.assertFalse((state/"backend"/"desks-grant.extras.json").exists(),
+                             "a window that did not open now must never open on a later run")
 
     def test_restore_ends_a_window_the_grant_holds_even_without_its_file(self):
         with tempfile.TemporaryDirectory() as d:

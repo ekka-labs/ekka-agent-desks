@@ -41,7 +41,7 @@ SNAPSHOT=/usr/local/lib/ekka-desks   # root-owned copy of deploy/ and tools/ the
 export DESKS_STATE=${DESKS_STATE:-/var/lib/ekka-agent-desks}
 EKKA_VERSION_EXPLICIT=${EKKA_VERSION:+yes}
 # A folder-mode rerun must keep this installation's environment and release, not reset them.
-EKKA_VERSION=${EKKA_VERSION:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_VERSION 0.6.9)}
+EKKA_VERSION=${EKKA_VERSION:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_VERSION 0.6.10)}
 EKKA_ENV=${EKKA_ENV:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_ENV prod)}
 export EKKA_ENV
 AGENT=${AGENT:-claude-code}
@@ -50,10 +50,10 @@ OPENSHELL_TAG=v0.1.4
 # EKKA desk administration requires the compatible Enclave release below.
 # Upgrade the integration and Enclave together. The release must support governed desk
 # changes through the two general plans, per-run output collection, verified requester identities,
-# and conversation leases.
+# conversation leases, and `ekka desk grant update --yes`.
 # OpenShell addresses commands by desk name. Identity checks narrow the replacement race
 # before dispatch but do not eliminate it. See docs/SECURITY.md for the trust boundaries.
-DESK_ADMIN_MIN_EKKA=0.6.8
+DESK_ADMIN_MIN_EKKA=0.6.10
 COMPOSE_VER=v5.6.0
 BUILDX_VER=v0.38.0
 # Every download, by this machine's processor type: the publisher's own file name, and the sha256 the publisher
@@ -153,11 +153,11 @@ step_preflight() {
 
 release_gate() {  # the Enclave release must run desk changes through EKKA; this setup works with nothing older
   [[ -n $DESK_ADMIN_MIN_EKKA ]] \
-    || die "this setup needs the EKKA release that runs desk changes through EKKA, and up.sh names none yet"
+    || die "this setup needs the EKKA release that supports desk grant update, and up.sh names none yet"
   local rc=0; python3 tools/release_gate.py "$EKKA_VERSION" "$DESK_ADMIN_MIN_EKKA" || rc=$?
   (( rc == 2 )) && die "the Enclave release '$EKKA_VERSION' is not a release number"
   (( rc == 1 )) && die "this setup needs EKKA $DESK_ADMIN_MIN_EKKA or newer, and this machine runs $EKKA_VERSION. This setup and the Enclave upgrade together: run again with EKKA_VERSION=$DESK_ADMIN_MIN_EKKA"
-  ok "EKKA $EKKA_VERSION runs desk changes through EKKA (needs $DESK_ADMIN_MIN_EKKA or newer)"
+  ok "EKKA $EKKA_VERSION supports desk grant update (needs $DESK_ADMIN_MIN_EKKA or newer)"
 }
 
 step_host_accounts() {  # the Enclave's user and the shared group, made by systemd from deploy/host; refused by name when unsafe
@@ -618,7 +618,7 @@ connect_cmd() {  # connect_cmd <provider>: a provider's one key, read from stdin
     || { secret=; die "the key for $p was not set; nothing else was changed"; }
   secret=
   ok "$p is connected: its key is in the gateway"
-  # The desks grant names each provider this gateway holds, by its digest (desk_provider_args). Refreshed now, add
+  # The desks grant names each provider this gateway holds, by its digest (read by the EKKA CLI). Refreshed now, add
   # first and revoke after, or a desk naming $p is refused CONSTRAINT_PROVIDERS until the next `up.sh server`.
   # A refusal there must not read as "connect failed": the key IS set by then (regression review).
   ( step_desk_grant ) || die "the key for $p IS set; the desks grant was not refreshed, so a desk naming $p is refused until it is: sudo ./up.sh server $NAME"
@@ -889,7 +889,7 @@ create_desk_plans() {
 }
 
 # The two general desk administration plans, owned by the desks agent: create_desk_admin_plans <api gate> <agent id>.
-# Runner 0.6.8 or newer runs desk commands through ekka.desk.read.v1 and ekka.desk.write.v1.
+# Runner 0.6.10 or newer runs desk commands through ekka.desk.read.v1 and ekka.desk.write.v1.
 # Creating them declares api.read/api.write on the desks agent before the desks grant is asked for.
 # The route is an input, so one pair serves every desk. Created only when changed, as above.
 # The installer stops creating the nine per-operation plans; it never deletes or archives ones an organization holds.
@@ -1005,7 +1005,7 @@ step_agent_open() {  # every member may RUN the desks agent's shared plans; writ
   # a member's run of a shared desk plan (create_desk_plans offers them to the organization) is refused. Use only:
   # a member still cannot RUN an unshared plan (the admin plans are never offered, and each requires the admin
   # role), and nobody writes a plan under this agent unless an owner appoints them (`--as author`).
-  # The floor (DESK_ADMIN_MIN_EKKA, 0.6.8) has `ekka agent allow`; the read-back below
+  # The floor (DESK_ADMIN_MIN_EKKA, 0.6.10) has `ekka agent allow`; the read-back below
   # stops the install on any EKKA where it did not take, whatever the reason.
   local out mode
   out=$(ekka_in agent allow "$DESKS_AGENT" --everyone --as use 2>&1 </dev/null) \
@@ -1023,58 +1023,12 @@ print((d.get("access") or {}).get("use", ""))' 2>/dev/null) || true
   done_ agent_open
 }
 
-# The provider digests the desks grant holds: `--provider <name>=<digest>` for each provider this gateway holds,
-# computed by the adapter from the gateway's own records (ekka-backend `digest provider`). None yet: a
-# grant with no provider lets a desk attach none, which is the closed side.
-desk_provider_args() {  # --provider <name>=<digest>, one per provider this gateway holds
-  # The adapter reads each provider from the gateway itself, `digest provider --from-gateway`, with the same calls
-  # and the same function it enforces with, so the grant and the check share one source. It runs as the adapter's
-  # own service (its image, mounts, user and network) and signs in as the desk-admin client, whose secret goes from
-  # Keycloak to its stdin and nowhere else. It runs INSIDE the adapter that is already running (`compose exec`), never
-  # as a throwaway container (`compose run`): the stack's unit runs `compose up --abort-on-container-exit` in the
-  # foreground, which attached to each throwaway container and stopped the whole stack when it exited. A shipped provider is named after its profile (`ekka desk connect`), so each
-  # profile name is asked: PROVIDER_NOT_FOUND means it is not connected here and is left out (a create naming it is
-  # then refused CONSTRAINT_PROVIDERS, closed). Any other refusal stops the grant.
-  local p out err why
-  err=$(mktemp)
-  (cd deploy && bash setup.sh backend-preflight --always) || return 1   # the adapter runs by name below
-  # The running adapter, healthy: the digest is asked of it. Not running means no digest and no grant change.
-  local i healthy=""; for i in $(seq 1 30); do
-    [[ $(docker inspect -f '{{.State.Health.Status}}' ekka-desks-ekka-backend-1 2>/dev/null) == healthy ]] && { healthy=1; break; }
-    sleep 2; done
-  [[ -n $healthy ]] || { rm -f "$err"; echo "the backend adapter is not running and healthy, so no provider could be read; see: sudo ./deploy/setup.sh compose logs ekka-backend" >&2; return 1; }
-  # Keycloak first, on its own: inside the pipe below its failure reaches the adapter as an empty stdin, which the
-  # adapter can only report as SECRET_INVALID against whichever provider came first.
-  kc admin-client on >/dev/null 2>"$err" || {
-    why=$(tail -n1 "$err" | cut -c1-200); rm -f "$err"
-    echo "the sign-in service (Keycloak) did not give the adapter its secret (${why:-no reason given}); see: journalctl -u ekka-desks" >&2
-    return 1; }
-  for p in $(profile_names); do
-    if out=$( { kc admin-client on | (cd deploy && docker compose -f compose.yml --env-file "$DESKS_STATE/up.env" \
-          exec -T ekka-backend /usr/local/bin/ekka-backend digest provider --from-gateway "$p" --config /etc/ekka-backend/config.json); } 2>"$err"); then
-      [[ $out =~ ^sha256:[0-9a-f]{64}$ ]] || { rm -f "$err"; echo "provider $p's digest is not sha256:<64 hex>" >&2; return 1; }
-      printf -- '--provider %s=%s\n' "$p" "$out"
-    elif grep -q '^PROVIDER_NOT_FOUND' "$err"; then
-      continue
-    else
-      why=$(grep -m1 -E '^[A-Z][A-Z_]+' "$err" | cut -c1-200); rm -f "$err"
-      echo "the adapter could not read provider $p (${why:-no reason given})" >&2; return 1
-    fi
-  done
-  rm -f "$err"
-}
-
 step_desk_grant() {  # the desks grant with its limits: only once up.env runs the backend adapter
   grep -q '^EKKA_BACKEND_IMAGE=.' "$DESKS_STATE/up.env" 2>/dev/null || return 0
+  [[ $DESKS_AGENT == desks ]] || die "desk grant update requires DESKS_AGENT=desks; no grant was changed"
   say "the desks grant, with its limits"
-  local image desk_id pdig ids id gate limits=$DESKS_STATE/backend/desks-grant.json decision g
-  image=$(sed -n 's/^EKKA_BACKEND_IMAGE=//p' "$DESKS_STATE/up.env")
-  # The content ID of the image built from the pinned EKKA image repository.
-  desk_id=$(docker image inspect --format '{{.Id}}' ekka-desk:local 2>/dev/null) || die "the desk image is not built; run again"
-  # The reviewed baseline's digest, by the adapter's own code from its pinned image, with no network.
-  pdig=$(docker run --rm -i --network none "$image" digest policy - < desk/policy.json) \
-    || die "the backend adapter could not digest desk/policy.json; no grant was changed"
-  ids=$( { ekka_in enclave status --json; echo; ekka_in agent list --json; echo; ekka_in gate list --json; } 2>/dev/null | DESKS_AGENT=$DESKS_AGENT python3 -c '
+  local ids id gate desk_id limits=$DESKS_STATE/backend/desks-grant.json read_grant shown
+  ids=$( { ekka_in enclave status --json && echo && ekka_in agent list --json && echo && ekka_in gate list --json; } 2>/dev/null | DESKS_AGENT=$DESKS_AGENT python3 -c '
 import json, os, sys
 docs, buf = [], ""
 for line in sys.stdin.read().splitlines():
@@ -1086,58 +1040,45 @@ status, agents, gates = (d for d in docs[:3])
 node = status["node_id"]
 agent = [a["agent_id"] for a in agents["agents"] if a["agent_code"] == os.environ["DESKS_AGENT"]]
 api = [g["instance_id"] for g in gates if g.get("connector_type") == "api" and g.get("node_id") == node]
-print(agent[0] if agent else "", api[0] if api else "")') || true
+print(agent[0] if len(agent) == 1 else "", api[0] if len(api) == 1 else "")') \
+    || die "could not read the desks agent or API gate; no grant was changed"
   read -r id gate <<<"$ids"
   [[ -n $id && -n $gate ]] || die "could not find agent $DESKS_AGENT or this Enclave's API gate; no grant was changed"
   # The plans first, every run: EKKA refuses the grant to an agent no plan declares api.write on, and a box whose
-  # grant is already in place still gets an upgrade's plans (the "kept" return below would otherwise skip them).
+  # grant is already in place still gets an upgrade's plans before the CLI checks it.
   create_desk_admin_plans "$gate" "$id"
-  install -d -m 0755 "$(dirname "$limits")"
-  # Collected FIRST, so a refusal stops here: inside $(...) on the limits line a failure would be lost.
-  local providers; providers=$(desk_provider_args) || die "the providers' digests could not be read; no grant was changed"
-  # A discovery window (sudo ekka desk grant discovery …) adds its image and the grant's `discovery` block, from the
-  # window file it wrote; `restore` removes that file, and this step writes the shipped limits again.
-  local extras_file=$DESKS_STATE/backend/desks-grant.extras.json extra_args=()
-  [[ -f $extras_file ]] && extra_args=(--window "$extras_file")
+  # Refresh the image record for standalone desk-grant runs after a local rebuild too.
+  desk_id=$(docker image inspect --format '{{.Id}}' ekka-desk:local 2>/dev/null) \
+    || die "the desk image is not built; no grant was changed"
+  python3 tools/desk_records.py image "$desk_id" "$DESKS_STATE/backend/desk-image.json" \
+    || die "the desk image record could not be confirmed; no grant was changed"
   # The ceiling comes from the very profile files the gateway holds (sync_profiles imports the same ones), so a
   # profile can never sit outside it: an install's own providers.local file in place of the shipped one.
-  local profile_args=() profile_files=() pname psrc
+  local profile_files=() pname psrc
   for pname in $(profile_names); do
     psrc=$(profile_source "$pname") || die "profile $pname could not be read; no grant was changed"
-    profile_args+=(--profile "$psrc"); profile_files+=("$psrc")
+    profile_files+=("$psrc")
   done
   # The same ceiling as a record EKKA's desk commands read (each profile's hosts): root's, from / down.
   python3 tools/desk_records.py ceiling "$DESKS_STATE/backend/provider-ceiling.json" "${profile_files[@]}" \
     || die "the provider ceiling record could not be confirmed; no grant was changed"
-  # A project (sudo ekka desk grant project add …) adds its own image and its own policy, from the record it wrote;
-  # `project remove` deletes that record. Unlike a window it has no end, so every run of this step keeps it.
-  local project_args=() pfile
-  for pfile in "$DESKS_STATE"/backend/projects/*.project.json; do
-    [[ -f $pfile && ! -L $pfile ]] && project_args+=(--project "$pfile")
-  done
-  # shellcheck disable=SC2086  # one --provider word and one name=digest word per provider; the window and the projects expand to nothing when absent
-  python3 tools/desk_grant.py limits --image-id "$desk_id" --policy-digest "$pdig" $providers "${profile_args[@]}" ${extra_args[@]+"${extra_args[@]}"} ${project_args[@]+"${project_args[@]}"} > "$limits.new" \
-    || die "the desks grant's limits could not be written; no grant was changed"
-  mv "$limits.new" "$limits"
-  decision=$(ekka_in gate grant list --json | python3 tools/desk_grant.py decide "$id" "$gate" "$limits") \
-    || die "could not read this organization's grants; no grant was changed"
-  if [[ $decision == keep* ]]; then ok "the desks grant already holds these limits (kept)"; return; fi
-  # ADD FIRST, revoke after: desks are never left without a grant. The limits reach the CLI in the Enclave's
-  # container on stdin, as a file only inside it, removed after.
-  local grant_out
-  # Drain the command before checking its words: grep -q can close stdout early,
-  # making a successful CLI write fail with SIGPIPE under pipefail.
-  enclave_home_file desks-grant.json 0600 < "$limits"   # the limits, as a file the Enclave's user may read
-  grant_out=$(ekka_in gate grant add --agent "$DESKS_AGENT" --type api --instance "$gate" --resource apis/desks \
-      --capability api.write --ttl 31536000 --constraint "$ENCLAVE_HOME/desks-grant.json") \
-    || { rm -f "$ENCLAVE_HOME/desks-grant.json"; die "the desks grant outcome could not be confirmed; the previous grant, if any, is kept"; }
-  rm -f "$ENCLAVE_HOME/desks-grant.json"
-  grep -q "Granted" <<<"$grant_out" \
-    || die "the desks grant outcome could not be confirmed; the previous grant, if any, is kept"
-  for g in ${decision#replace}; do
-    [[ $decision == replace* ]] || break
-    ekka_in gate grant revoke "$g" >/dev/null || die "the new desks grant is in place, but $g was not revoked"
-  done
+  # The baseline record was written by step_backend_image before the adapter started. Discovery and project
+  # commands write their records before this step; the CLI reads and validates all of them itself.
+  # Reading adapter facts uses the API gate too. Bootstrap only read access, without any limits to build.
+  read_grant=$(ekka_in gate grant list --json | python3 tools/desk_grant_cli.py read-grant "$id" "$gate") \
+    || die "could not confirm the desks read grant; no grant was removed by the installer"
+  if [[ $read_grant == missing ]]; then
+    ekka_in gate grant add --agent "$DESKS_AGENT" --type api --instance "$gate" --resource apis/desks \
+      --capability api.read --ttl 31536000 --no-fingerprint \
+      || die "the desks read grant could not be added; no grant was removed by the installer"
+  fi
+  ekka_in desk grant update --yes \
+    || die "the desks grant update failed (see the CLI reason above); no grant was removed by the installer"
+  # Capture first: a CLI that prints JSON and then fails must never replace the local record.
+  shown=$(ekka_in desk grant show --json) \
+    || die "the grant is in place but its record could not be confirmed; see the CLI reason above"
+  python3 tools/desk_grant_cli.py record "$limits" "$id" "$gate" <<<"$shown" \
+    || die "the grant is in place but its record could not be confirmed; see the reason above"
   ok "the $DESKS_AGENT agent may administer desks within the limits in $limits"
 }
 
@@ -1416,9 +1357,11 @@ case "${1:-}" in
           (( $# == 4 )) || die "$project_usage"
           [[ -f $rec ]] || { echo "no project $pname is in the grant; nothing was changed"; exit 0; }
           mv "$rec" "$rec.old"
+          # A failed update puts the record back and updates once more, so the records and the grant agree again:
+          # the update is the same decision every time, from the records as they now are.
           if ! ( step_desk_grant ); then
             mv "$rec.old" "$rec"; ( step_desk_grant ) >/dev/null 2>&1 || true
-            die "the desks grant was not changed; project $pname is still in it. Check: sudo ekka desk grant show"
+            die "project $pname was not removed; its record is back in place. Check: sudo ekka desk grant show"
           fi
           rm -f "$rec.old" "$kept"
           ok "project $pname is out of the grant: no new desk may be created from its image or with its policy. Its desks are not deleted"; exit 0
@@ -1451,10 +1394,12 @@ case "${1:-}" in
           || { rm -f "$rec.new" "$kept.new"; die "project $pname was not added; nothing was changed"; }
         had=""; [[ -f $rec ]] && { had=1; cp -p "$rec" "$rec.old"; [[ -f $kept ]] && cp -p "$kept" "$kept.old"; }
         mv "$rec.new" "$rec"; mv "$kept.new" "$kept"
+        # A failed update never leaves a record nobody approved: the previous records go back (or the new ones go),
+        # and one more update makes the grant agree with them.
         if ! ( step_desk_grant ); then
           if [[ -n $had ]]; then mv "$rec.old" "$rec"; [[ -f $kept.old ]] && mv "$kept.old" "$kept"; else rm -f "$rec" "$kept"; fi
           ( step_desk_grant ) >/dev/null 2>&1 || true
-          die "the desks grant was not changed; project $pname was not added. Check: sudo ekka desk grant show"
+          die "project $pname was not added; its records are as they were. Check: sudo ekka desk grant show"
         fi
         rm -f "$rec.old" "$kept.old"
         # The copy `ekka desk create --policy` reads, where the Enclave's user may read it. The grant holds the
@@ -1481,7 +1426,10 @@ case "${1:-}" in
         python3 tools/desk_grant.py window --image-ref "$ref" --providers "$providers" --minutes "$minutes" --limits "$limits" > "$extras.new" \
           || { rm -f "$extras.new"; die "the window could not be written; nothing was changed"; }
         mv "$extras.new" "$extras"
-        ( step_desk_grant ) || { rm -f "$extras"; die "the desks grant was not changed; the window is not open"; }
+        # A failed update removes the window's record and updates once more: a window that did not open now must
+        # never open on a later run.
+        ( step_desk_grant ) || { rm -f "$extras"; ( step_desk_grant ) >/dev/null 2>&1 || true
+          die "the window is not open; its record was removed. Check: sudo ekka desk grant show"; }
         python3 tools/desk_grant.py show "$limits" "$extras" ${grant_projects[@]+"${grant_projects[@]}"}
         echo
         echo "The window is open. One desk, named discover-<anything>, created from exactly this image with only these"
@@ -1500,11 +1448,11 @@ case "${1:-}" in
       *) die "usage: sudo ekka desk grant show | discovery --image <ref@sha256:…> --providers <a,b> [--minutes 60] | restore | project add <name> --image sha256:<64 hex> --policy <file> | project remove <name>" ;;
     esac ;;
   desk-grant)  # the desks grant again, for the installed base image: sudo ./up.sh desk-grant
-    # Recomputes the installed image and policy limits and installs the admin plans; this is not a preview.
+    # Installs the admin plans, then asks the CLI to update the grant from its records and live facts.
     [[ $(id -u) == 0 ]] || die "run with sudo"; [[ -f $DESKS_STATE/up.env ]] || die "not installed yet"
     old=$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1])).get("image_digests", [])))' \
       "$DESKS_STATE/backend/desks-grant.json" 2>/dev/null || true)
-    ( step_desk_grant ) || die "the desks grant was not changed"
+    ( step_desk_grant ) || die "the desks grant could not be confirmed; inspect: sudo ekka desk grant show"
     echo "   image_digests before: ${old:-none}"
     echo "   image_digests after:  $(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["image_digests"]))' "$DESKS_STATE/backend/desks-grant.json")"
     exit 0 ;;

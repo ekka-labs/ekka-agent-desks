@@ -124,12 +124,12 @@ What it sets up, in order:
 
 1. NVIDIA OpenShell's gateway (NVIDIA's image, pinned by digest), the team sign-in service (Keycloak) and the HTTPS front.
 2. A private certificate authority that may only vouch for this server's own names (checked: a certificate it signs for any other site is rejected).
-3. The EKKA Enclave (fresh-install default 0.6.9; existing newer runners are kept), as a systemd service (`ekka.service`) running as its own user, enrolled into `EKKA_ORG`, with desks registered automatically, and the `ekka` command for administrators: `sudo -i`, then `ekka <command>`.
+3. The EKKA Enclave (fresh-install default 0.6.10; existing newer runners are kept), as a systemd service (`ekka.service`) running as its own user, enrolled into `EKKA_ORG`, with desks registered automatically, and the `ekka` command for administrators: `sudo -i`, then `ekka <command>`.
 4. NVIDIA's provider profiles from `providers/`.
 5. People's sign-ins to the desks, set to read only.
 6. Desk administration through EKKA: the backend adapter (its image pulled by digest and its signature checked), its configuration, and its credential in the Enclave's vault.
-7. A desks agent, the two example plans for `code-desk` and the two general desk administration plans (`ekka.desk.read.v1` and `ekka.desk.write.v1`), used by EKKA 0.6.8 or newer.
-8. Two grants for the desks agent: it may run jobs on every desk on this server, and it may administer desks within limits (the desk image, the desk policy and the connected keys). Take the first back with the command it prints.
+7. A desks agent, the two example plans for `code-desk` and the two general desk administration plans (`ekka.desk.read.v1` and `ekka.desk.write.v1`), used by EKKA 0.6.10 or newer.
+8. Grants for the desks agent: jobs on every desk on this server, plain read access to `apis/desks`, and desk administration within limits. The installer ensures read access, then calls `ekka desk grant update --yes`; only the CLI builds and writes the administration limits. Its confirmed `keep` answer supplies the local limits record. See [Updating the desks grant](OPERATIONS.md#updating-the-desks-grant). Take the job grant back with the command it prints.
 
 The Developer and Enterprise editions include desk jobs. If setup refuses a job permission, keep the exact error and check your active organization and edition with `ekka org edition` before contacting EKKA.
 
