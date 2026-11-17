@@ -44,6 +44,33 @@ def bundle(inspect_answer, server=False):
 
 
 class TheDeskImage(unittest.TestCase):
+    def test_documented_and_printed_bundle_matches_installer_inputs(self):
+        from pathlib import Path
+        result, installer = bundle(CONTENT_ID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Derive the adjacent files from the actual generated installer, including its own entry point.
+        needed = set(re.findall(r'\$\(dirname "\$0"\)/([^"\s]+)', installer)) | {'install.sh'}
+        self.assertEqual(needed, {'desks-ca.pem', 'desk-policy.json', 'install.sh', 'trust-ca.sh'})
+        printed = re.search(r'people bundle: .*? \(([^)]+)\)', result.stdout).group(1)
+        self.assertEqual(set(printed.split(', ')), needed)
+        doc = Path(ROOT, 'docs/SERVER.md').read_text()
+        for line in doc.splitlines():
+            if 'four small files:' in line or 'Copy all four files (' in line:
+                self.assertEqual(set(re.findall(r'`([^`]+\.(?:pem|json|sh))`', line)), needed)
+        self.assertIn('four small files:', doc)
+        self.assertIn('Copy all four files (', doc)
+        self.assertNotIn('three files', doc)
+
+    def test_server_guide_returns_to_checkout_before_maintenance(self):
+        from pathlib import Path
+        doc = Path(ROOT, 'docs/SERVER.md').read_text()
+        root_shell = doc.index('\nsudo -i\n')
+        exit_shell = doc.index('\nexit\n', root_shell)
+        maintenance = doc.index('## 9. Keep it running')
+        self.assertLess(root_shell, exit_shell)
+        self.assertLess(exit_shell, maintenance)
+        self.assertIn('`(cd deploy && sudo ./setup.sh compose ps)`', doc)
+
     def test_server_defaults_are_public_and_use_the_read_only_person_client(self):
         r, text = bundle(CONTENT_ID, server=True)
         self.assertEqual(r.returncode, 0, r.stderr)

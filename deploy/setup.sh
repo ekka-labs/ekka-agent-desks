@@ -320,8 +320,8 @@ stage_people() {
   chmod 0600 "$DESKS_STATE/enclave-cli/backend.json"
   cat > "$out/install.sh" <<EOF
 #!/usr/bin/env bash
-# Run once on each person's computer, beside desks-ca.pem. It saves the desks CA under the person's EKKA home and
-# points ekka's desk backend at this setup. The sign-in trusts that CA beside the public ones (needs ekka 0.1.104
+# Run once on each person's computer, beside desks-ca.pem, desk-policy.json and trust-ca.sh.
+# It saves the desks CA under the person's EKKA home and points ekka's desk backend at this setup. The sign-in trusts that CA beside the public ones (needs ekka 0.1.104
 # or later). The browser needs the same CA trusted too: the last lines print the one command for that, and run nothing.
 set -euo pipefail
 # The server has no public DNS name (it is reached over your VPN): map its name to its address once.
@@ -377,7 +377,7 @@ esac
 TRUST
   } > "$out/trust-ca.sh"
   chmod 0755 "$out/trust-ca.sh"
-  say "people bundle: $out (desks-ca.pem, install.sh, trust-ca.sh). Each person runs install.sh once, then ekka desk login"
+  say "people bundle: $out (desks-ca.pem, desk-policy.json, install.sh, trust-ca.sh). Each person runs install.sh once, then ekka desk login"
 }
 
 

@@ -94,7 +94,7 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
         floor = re.search(r"^DESK_ADMIN_MIN_EKKA=(\S*)$", text, re.M).group(1)
         default = re.search(r"retained \"\$DESKS_STATE\" EKKA_VERSION (\S+?)\)\}$", text, re.M).group(1)
         self.assertEqual(floor, "0.6.8", "the first runner using only the two general desk plans")
-        self.assertEqual(default, "0.6.8")
+        self.assertEqual(default, "0.6.9")
         self.assertEqual(gate(default, floor), 0, f"the default {default} is older than the floor {floor}")
         self.assertEqual(self.run_gate(default, floor).returncode, 0)
 
@@ -134,6 +134,63 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
         self.assertIn("run again with EKKA_VERSION=0.6.8", r.stderr)
         self.assertEqual(bash(f"{script}EKKA_VERSION=0.6.8; {pick}\nrelease_gate").returncode, 0)
         shutil.rmtree(state)
+
+
+class KeepInstalledNewerRelease(unittest.TestCase):
+    def select(self, installed, retained=None, explicit=None, allow_downgrade=False):
+        with tempfile.TemporaryDirectory() as state:
+            if retained:
+                with open(os.path.join(state, 'up.env'), 'w') as stream:
+                    stream.write('EKKA_VERSION=' + retained + '\n')
+            with open(os.path.join(ROOT, 'up.sh')) as stream:
+                text = stream.read()
+            pick = re.search(r'^EKKA_VERSION=\$\{EKKA_VERSION:-.*\}$', text, re.M).group(0)
+            script = STUBS + f'DESKS_STATE={state}\n'
+            script += 'unset EKKA_VERSION\n' if explicit is None else f'EKKA_VERSION={explicit}\n'
+            script += 'EKKA_VERSION_EXPLICIT=${EKKA_VERSION:+yes}\n' + pick + '\n'
+            script += 'EKKA_ALLOW_DOWNGRADE=' + ('1' if allow_downgrade else '0') + '\n'
+            script += f'installed_enclave_version() {{ echo "{installed}"; }}\n'
+            script += up_function('keep_newer_enclave') + 'keep_newer_enclave\necho "$EKKA_VERSION"'
+            result = bash(script)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+    def test_fresh_default_and_retained_versions(self):
+        self.assertEqual(self.select(''), '0.6.9')
+        self.assertEqual(self.select('', retained='0.6.8'), '0.6.8')
+        self.assertEqual(self.select('0.6.9', retained='0.6.10'), '0.6.10')
+
+    def test_existing_runner_never_downgrades_for_implicit_version(self):
+        for have in ('0.6.9', '0.6.10', '0.7.0', '1.0.0'):
+            for retained in (None, '0.6.8', '0.6.9'):
+                with self.subTest(have=have, retained=retained):
+                    self.assertEqual(self.select(have, retained), have)
+        self.assertEqual(self.select('0.7.0', allow_downgrade=True), '0.7.0')
+
+    def test_preserved_newer_runner_never_downloads_the_default(self):
+        script = STUBS + """
+EKKA_VERSION=0.6.9; EKKA_VERSION_EXPLICIT=; SNAPSHOT=/unused
+installed_enclave_version() { echo 0.7.0; }
+curl() { echo UNEXPECTED_DOWNLOAD; return 1; }
+render() { :; }
+""" + up_function('keep_newer_enclave') + up_function('step_enclave_install')
+        result = bash(script + 'keep_newer_enclave\nstep_enclave_install')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('UNEXPECTED_DOWNLOAD', result.stdout)
+        self.assertIn('ekka 0.7.0 at /usr/local/bin/ekka', result.stdout)
+
+    def test_explicit_older_request_is_left_for_installers_downgrade_gate(self):
+        self.assertEqual(self.select('0.7.0', explicit='0.6.9'), '0.6.9')
+        self.assertEqual(self.select('0.7.0', explicit='0.6.9', allow_downgrade=True), '0.6.9')
+        fn = up_function('step_enclave_install')
+        self.assertIn('[[ ${EKKA_ALLOW_DOWNGRADE:-} == 1 ]] && downgrade=(--allow-downgrade)', fn)
+
+    def test_selection_precedes_writing_retained_settings(self):
+        preflight = up_function('step_preflight')
+        self.assertLess(preflight.index('keep_newer_enclave'), preflight.index('  release_gate'))
+        with open(os.path.join(ROOT, 'up.sh')) as stream:
+            chain = re.search(r'^step_preflight; .*$', stream.read(), re.M).group(0)
+        self.assertLess(chain.index('step_preflight'), chain.index('step_settings'))
 
 
 class TheAdapterIsOnAtItsPinnedImage(unittest.TestCase):

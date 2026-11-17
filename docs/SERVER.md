@@ -55,7 +55,19 @@ sudo curl -fsSLo /usr/local/bin/cosign https://github.com/sigstore/cosign/releas
 
 The last line installs cosign for this server's processor type (`amd64` or `arm64`): the installer checks EKKA's release signature with it and refuses without it.
 
-Replace every `<...>` value before running a command. Keep this terminal in the repository folder for the rest of the guide.
+Replace every `<...>` value before running a command. Keep this server terminal in the repository folder. Step 8 temporarily enters a root login shell; exit it as shown before using repository commands again.
+
+`ALLOW_FROM` must contain valid IPv4/IPv6 addresses or CIDR networks, with no host bits in a network.
+An empty list and everyone networks (`0.0.0.0/0`, `::/0`) are refused before any changes.
+A temporary nftables guard protects inbound traffic while UFW is replaced, preserving established connections
+and IPv6 neighbour discovery. A failure or signal during the firewall step cancels the rollback timer and
+restores the saved firewall state immediately. Recovery retries failed steps and checks UFW status and the
+saved Docker rules before reporting success. If recovery fails, inspect `/var/lib/desks-harden/restore-failed`
+and `journalctl -t desks-harden`; hardening refuses another run until recovery is resolved and the marker is
+removed. After the firewall step finishes (guard removed and lock released), a later failure or signal,
+including Docker refusing to restart while desks exist or a package installation failing, leaves the new
+firewall rules in place and the five-minute timer scheduled. Confirmation from a new SSH session alone
+decides whether those rules stay; without confirmation, the timer restores the saved state.
 
 It does this:
 
@@ -112,7 +124,7 @@ What it sets up, in order:
 
 1. NVIDIA OpenShell's gateway (NVIDIA's image, pinned by digest), the team sign-in service (Keycloak) and the HTTPS front.
 2. A private certificate authority that may only vouch for this server's own names (checked: a certificate it signs for any other site is rejected).
-3. The EKKA Enclave, as a systemd service (`ekka.service`) running as its own user, enrolled into `EKKA_ORG`, with desks registered automatically, and the `ekka` command for administrators: `sudo -i`, then `ekka <command>`.
+3. The EKKA Enclave (fresh-install default 0.6.9; existing newer runners are kept), as a systemd service (`ekka.service`) running as its own user, enrolled into `EKKA_ORG`, with desks registered automatically, and the `ekka` command for administrators: `sudo -i`, then `ekka <command>`.
 4. NVIDIA's provider profiles from `providers/`.
 5. People's sign-ins to the desks, set to read only.
 6. Desk administration through EKKA: the backend adapter (its image pulled by digest and its signature checked), its configuration, and its credential in the Enclave's vault.
@@ -151,7 +163,7 @@ sudo ekka desk invite member member@example.com
      sudo cat /var/lib/ekka-agent-desks/secrets/people/member-password
 ```
 
-Send them the bundle (three small files) and, separately, their one-time password. You are already in: you sign in as `desks-admin`.
+Send them the bundle (four small files: `desks-ca.pem`, `desk-policy.json`, `install.sh`, `trust-ca.sh`) and, separately, their one-time password. You are already in: you sign in as `desks-admin`.
 
 To take a person off later, on the server: `sudo ekka desk revoke member`. Their sign-in is disabled, every session they have ends, and they leave the desk workspace. Running it twice changes nothing. It never removes an administrator; that is done in the Keycloak admin console, once another administrator exists. `sudo ekka desk invite member member@example.com` brings them back, with a new one-time password.
 
@@ -161,7 +173,7 @@ To take a person off later, on the server: `sudo ekka desk revoke member`. Their
 
 On **your computer**, connected to an allowed network, set up the server's first administrator too. For that account, use username `desks-admin`; read its one-time password on the server with `sudo cat /var/lib/ekka-agent-desks/secrets/first-admin-password`. Keep the password out of messages and screenshots.
 
-Copy the three files from `/var/lib/ekka-agent-desks/people/` on the server to a folder on your computer using your normal secure file-transfer method. Teammates use the same bundle and their own username and password from step 5.
+Copy all four files (`desks-ca.pem`, `desk-policy.json`, `install.sh`, `trust-ca.sh`) from `/var/lib/ekka-agent-desks/people/` on the server to a folder on your computer using your normal secure file-transfer method. Teammates use the same bundle and their own username and password from step 5.
 
 First install the `ekka` command line on your computer, if needed. Run only the cosign line for your operating system:
 
@@ -247,6 +259,13 @@ Wait for it to say **Pinned**. Poll that read if necessary; do not repeat creati
 
 Now follow [Your first answer](../README.md#try-the-example), using the public sample, then [set up your own repositories](SET-UP-YOUR-DESK.md).
 
+Leave the root login shell opened in step 8. This returns the server terminal to the repository folder:
+
+```sh
+exit
+pwd   # should show your ekka-agent-desks checkout
+```
+
 ## 9. Keep it running
 
 **Why:** a few checks keep your team's agents running and your server patched.
@@ -257,7 +276,7 @@ Some walk checks read the desks as you, with your own sign-in on the server. Set
 
 | What | How |
 |---|---|
-| Is everything up? | `sudo ./up.sh status`, `systemctl status ekka ekka-desks`, and `cd deploy && sudo ./setup.sh compose ps` |
+| Is everything up? | `sudo ./up.sh status`, `systemctl status ekka ekka-desks`, and `(cd deploy && sudo ./setup.sh compose ps)` |
 | After updating this repository | `sudo ./up.sh profiles` puts the provider profiles into the gateway again |
 | Certificates, upgrades, backup and restore | [Running a server](OPERATIONS.md) |
 | Security updates | install daily by themselves; reboot in a quiet hour when `/var/run/reboot-required` exists |
