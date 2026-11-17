@@ -426,7 +426,7 @@ class FirewallRecovery(unittest.TestCase):
             'etc/ufw/user6.rules': 'old IPv6 rules\n',
             'etc/ufw/before.rules': 'old before rules\n',
             'etc/ufw/ufw.conf': 'ENABLED=yes\n',
-            'etc/default/ufw': 'DEFAULT_INPUT_POLICY="DROP"\n',
+            'etc/default/ufw': 'DEFAULT_INPUT_POLICY="DROP"\nIPV6=yes\n',
             'usr/local/sbin/desks-docker-user': '#!/bin/sh\n# original writer\n',
             'etc/systemd/system/desks-docker-user.service': '# original unit\n',
         }
@@ -439,20 +439,39 @@ class FirewallRecovery(unittest.TestCase):
             '-A DOCKER-USER -j DROP\nCOMMIT\n')
         source = Path(ROOT, 'deploy/firewall-state.sh').read_text()
         # Every filesystem write is redirected before execution; firewall commands are all stubs.
-        for path in ('/etc/', '/usr/local/'):
+        for path in ('/etc/', '/usr/local/', '/restore-failed'):
             source = source.replace(path, str(self.root) + path)
         self.helper = self.root / 'helper.sh'
         self.helper.write_text(source)
         stubs = {
             'ufw': '''if [[ $1 == status ]]; then cat "$TEST_ROOT/status"; exit; fi
+[[ "$*" != "${UFW_FAIL:-never}" ]] || exit 1
+if [[ ${STATUS_STUCK:-0} != 1 ]]; then
+  case "$*" in
+    '--force enable') echo 'Status: active' > "$TEST_ROOT/status" ;;
+    '--force disable'|'--force reset') echo 'Status: inactive' > "$TEST_ROOT/status" ;;
+  esac
+fi
 exit 0''',
             'iptables-save': '''[[ ${SAVE_FAILS:-0} == 0 ]] || exit 1
 cat "$TEST_ROOT/filter"''',
-            'iptables-restore': 'cat > "$TEST_ROOT/restored-rules"',
+            'iptables-restore': '''cat > "$TEST_ROOT/restored-rules"
+[[ ${RESTORE_FAILS:-0} == 0 ]] || exit 1
+if [[ ${RESTORE_ONCE:-0} == 1 && ! -e $TEST_ROOT/retried ]]; then touch "$TEST_ROOT/retried"; exit 1; fi
+[[ ${READBACK_MISMATCH:-0} == 1 ]] || cp "$TEST_ROOT/restored-rules" "$TEST_ROOT/filter"''',
+            'nft': '''case "$*" in
+"list tables") [[ ! -e $TEST_ROOT/guard ]] || echo 'table inet desks_harden_guard' ;;
+"-f -") cat > "$TEST_ROOT/guard-rules"; [[ ${GUARD_FAILS:-0} == 0 ]] || exit 1; touch "$TEST_ROOT/guard" ;;
+"delete table inet desks_harden_guard")
+  [[ ${CLEANUP_FAILS:-0} == 0 ]] || exit 1
+  rm -f "$TEST_ROOT/guard" ;;
+*) exit 1 ;;
+esac
+exit 0''',
             'systemctl': '''case "$1" in
 is-active) [[ ${!#} != desks-harden-rollback.timer && ${SERVICE_ACTIVE:-1} == 1 ]] ;;
 is-enabled) [[ ${SERVICE_ENABLED:-1} == 1 ]] ;;
-*) exit 0 ;;
+*) [[ "$*" != "${SYSTEMCTL_FAIL:-never}" ]] ;;
 esac''',
             'systemd-run': '''[[ ${SCHEDULE_FAILS:-0} == 0 ]] || exit 1
 printf '%s\\n' "$@" > "$TEST_ROOT/scheduled"''',
@@ -500,7 +519,7 @@ printf '%s\\n' "$@" > "$TEST_ROOT/scheduled"''',
                                  '*filter\n:DOCKER-USER - [0:0]\n'
                                  '-A DOCKER-USER -s 198.51.100.7/32 -j RETURN\n'
                                  '-A DOCKER-USER -j DROP\nCOMMIT\n')
-                self.assertIn('iptables-restore --noflush', self.calls())
+                self.assertIn('iptables-restore --wait 10 --noflush', self.calls())
 
     def test_confirmed_leaves_new_rules_alone(self):
         self.assertEqual(self.call('prepare').returncode, 0)
@@ -545,3 +564,148 @@ printf '%s\\n' "$@" > "$TEST_ROOT/scheduled"''',
         self.assertEqual(r.returncode, 1)
         self.assertIn('no firewall rules were changed', r.stderr)
         self.assertNotIn('MUTATED', r.stdout)
+
+
+class FirewallApplyAndVerification(FirewallRecovery):
+    def snapshot(self):
+        result = self.call('prepare')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.saved = result.stdout.strip()
+
+    def guard(self, **env):
+        return subprocess.run(['bash', str(self.helper), 'guard', str(self.root / 'state'), self.saved,
+                               '198.51.100.7/32 2001:db8::/64'], env=dict(self.env, **env),
+                              capture_output=True, text=True, timeout=30)
+
+    def test_restore_failures_are_named_and_do_not_stop_other_steps(self):
+        self.snapshot()
+        self.assertEqual(self.guard().returncode, 0)
+        result = self.call('restore', RESTORE_FAILS='1', UFW_FAIL='reload',
+                           SYSTEMCTL_FAIL='daemon-reload')
+        self.assertNotEqual(result.returncode, 0)
+        marker = (self.root / 'restore-failed').read_text()
+        for label in ('docker-rules', 'ufw-reload', 'daemon-reload'):
+            self.assertIn(label, marker)
+            self.assertIn('failed step ' + label, result.stderr)
+        self.assertIn('firewall restore FAILED', result.stderr)
+        self.assertNotIn('firewall restored to its saved state', '\n'.join(self.calls()))
+        self.assertEqual(self.calls().count('iptables-restore --wait 10 --noflush'), 3)
+        self.assertFalse((self.root / 'guard').exists())
+
+    def test_readback_catches_successful_commands_that_did_not_restore_state(self):
+        for mismatch in ('READBACK_MISMATCH', 'STATUS_STUCK'):
+            with self.subTest(mismatch=mismatch):
+                (self.root / 'status').write_text('Status: active\n')
+                self.snapshot()
+                (self.root / 'status').write_text('Status: inactive\n')
+                (self.root / 'filter').write_text('*filter\n-A DOCKER-USER -j ACCEPT\nCOMMIT\n')
+                result = self.call('restore', **{mismatch: '1'})
+                self.assertNotEqual(result.returncode, 0)
+                expected = 'verify-docker-rules' if mismatch == 'READBACK_MISMATCH' else 'verify-ufw'
+                self.assertIn(expected, (self.root / 'restore-failed').read_text())
+
+    def test_transient_failure_is_logged_then_verified_successfully(self):
+        self.snapshot()
+        result = self.call('restore', RESTORE_ONCE='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('failed step docker-rules (attempt 1/3)', result.stderr)
+        self.assertIn('firewall restored to its saved state (read-back verified)', result.stdout)
+        self.assertFalse((self.root / 'restore-failed').exists())
+        self.assertEqual(self.calls().count('iptables-restore --wait 10 --noflush'), 2)
+
+    def test_guard_is_atomic_dual_stack_and_preserves_current_connections(self):
+        self.snapshot()
+        self.assertEqual(self.guard().returncode, 0)
+        rules = (self.root / 'guard-rules').read_text()
+        for rule in ('hook input priority -10; policy drop;', 'ct state established,related accept',
+                     'iifname "lo" accept', 'ip saddr 198.51.100.7/32', 'ip6 saddr 2001:db8::/64',
+                     'tcp dport { 22, 443, 8080 } accept', 'ip6 hoplimit 255 accept'):
+            self.assertIn(rule, rules)
+        self.assertEqual(self.calls().count('nft -f -'), 1)
+
+    def test_guard_cleanup_failure_is_reported_and_retry_can_clear_it(self):
+        self.snapshot()
+        self.assertEqual(self.guard().returncode, 0)
+        result = self.call('restore', CLEANUP_FAILS='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('remove-guard', (self.root / 'restore-failed').read_text())
+        self.assertEqual(self.calls().count('nft delete table inet desks_harden_guard'), 3)
+        result = self.call('restore')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / 'guard').exists())
+        self.assertFalse((self.root / 'restore-failed').exists())
+
+    def apply(self, suffix='', **env):
+        text = harden()
+        functions = '\n'.join(re.search(r'^' + name + r'\(\) \{.*?^\}\n', text, re.S | re.M).group(0)
+                              for name in ('firewall_exit', 'docker_user_script', 'start_docker_user'))
+        section = text.split('say "firewall: only $ALLOW_FROM"\n', 1)[1].split('say "Docker"', 1)[0]
+        section = re.sub(r'^FIREWALL_HELPER=.*$', 'FIREWALL_HELPER=' + shlex_quote(str(self.helper)), section, flags=re.M)
+        for path in ('/etc/', '/usr/local/'):
+            section = section.replace(path, str(self.root) + path)
+        # macOS sed needs a separate empty backup suffix; Ubuntu's shipped command remains unchanged.
+        if os.uname().sysname == 'Darwin':
+            section = section.replace("sed -i ", "sed -i '' ")
+        script = ('set -euo pipefail\nSTATE=' + shlex_quote(str(self.root / 'state')) + '\n'
+                  'ALLOW_FROM="198.51.100.7/32 2001:db8::/64"\n'
+                  'die() { echo "$*" >&2; exit 1; }; ok() { :; }; docker() { :; }\n' +
+                  functions + section + suffix)
+        return subprocess.run(['bash', '-c', script], env=dict(self.env, **env),
+                              capture_output=True, text=True, timeout=30)
+
+    def test_success_removes_guard_only_after_ufw_is_enabled(self):
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertLess(calls.index('nft -f -'), calls.index('ufw --force reset'))
+        self.assertLess(calls.index('ufw --force enable'), calls.index('nft delete table inet desks_harden_guard'))
+        self.assertFalse((self.root / 'guard').exists())
+        self.assertFalse((self.root / 'restored-rules').exists())
+
+    def test_every_apply_failure_restores_immediately_and_removes_guard(self):
+        cases = [{'UFW_FAIL': failure} for failure in ('--force reset', 'default deny incoming',
+                 'allow from 198.51.100.7/32 to any port 22 proto tcp', '--force enable')]
+        cases += [{'SYSTEMCTL_FAIL': 'restart desks-docker-user.service'}, {'GUARD_FAILS': '1'}]
+        for env in cases:
+            with self.subTest(env=env):
+                (self.root / 'calls').write_text('')
+                result = self.apply(**env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('restoring the saved firewall state immediately', result.stderr)
+                self.assertIn('iptables-restore --wait 10 --noflush', self.calls())
+                self.assertFalse((self.root / 'guard').exists())
+                self.assertTrue((self.root / 'state/rolled-back').exists())
+
+    def test_later_failure_and_termination_restore_even_after_confirmation(self):
+        for suffix in ('touch "$STATE/confirmed"; false', 'kill -TERM $$'):
+            with self.subTest(suffix=suffix):
+                result = self.apply(suffix=suffix)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('restoring the saved firewall state immediately', result.stderr)
+                self.assertFalse((self.root / 'guard').exists())
+
+    def preflight(self, allow):
+        # Execute the real initial validation before the first root/OS check. No host mutation is reachable.
+        prefix = harden().split('[[ $(id -u)', 1)[0]
+        prefix = prefix.replace('/restore-failed', str(self.root / 'restore-failed'))
+        return subprocess.run(['bash', '-c', prefix + '\necho READY_TO_CHANGE'],
+                              env=dict(self.env, ALLOW_FROM=allow), capture_output=True, text=True, timeout=30)
+
+    def test_invalid_allow_lists_stop_before_any_change(self):
+        for value in ('', '   ', '999.999.999.999', '1.2.3.4/99', '2001:db8::/129',
+                      '0.0.0.0/0', '::/0', '198.51.100.7/24', 'fe80::1%eth0',
+                      '198.51.100.7 nonsense', '198.51.100.7;true'):
+            with self.subTest(value=value):
+                result = self.preflight(value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('READY_TO_CHANGE', result.stdout)
+                self.assertFalse((self.root / 'calls').exists())
+        result = self.preflight('198.51.100.7 2001:db8::1 203.0.113.0/24 2001:db8::/64')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unresolved_restore_marker_blocks_hardening(self):
+        (self.root / 'restore-failed').write_text('docker-rules\n')
+        result = self.preflight('198.51.100.7')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('/restore-failed', result.stderr)
+        self.assertNotIn('READY_TO_CHANGE', result.stdout)

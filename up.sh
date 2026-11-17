@@ -39,8 +39,9 @@ cd "$(dirname "$0")"; ROOT=$PWD
 . deploy/lib.sh                      # enclave_ekka, ENCLAVE_HOME: the one way scripts reach the native Enclave
 SNAPSHOT=/usr/local/lib/ekka-desks   # root-owned copy of deploy/ and tools/ the supervisor unit runs from
 export DESKS_STATE=${DESKS_STATE:-/var/lib/ekka-agent-desks}
+EKKA_VERSION_EXPLICIT=${EKKA_VERSION:+yes}
 # A folder-mode rerun must keep this installation's environment and release, not reset them.
-EKKA_VERSION=${EKKA_VERSION:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_VERSION 0.6.8)}
+EKKA_VERSION=${EKKA_VERSION:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_VERSION 0.6.9)}
 EKKA_ENV=${EKKA_ENV:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE" EKKA_ENV prod)}
 export EKKA_ENV
 AGENT=${AGENT:-claude-code}
@@ -146,6 +147,7 @@ step_preflight() {
   [[ -f providers/$AGENT.json ]] || die "no provider profile for AGENT=$AGENT; see providers/README.md"
   python3 -m unittest tests.test_providers >/dev/null 2>&1 || die "providers/ does not match providers/PIN.json; nothing was changed"
   ok "agent profile: $AGENT (NVIDIA OpenShell $OPENSHELL_TAG, pinned)"
+  keep_newer_enclave
   release_gate
 }
 
@@ -299,10 +301,24 @@ step_images() {
   fi
 }
 
+installed_enclave_version() {
+  [[ -x /usr/local/bin/ekka ]] || return 0
+  /usr/local/bin/ekka --version 2>/dev/null | head -1 | awk '{print $2}'
+}
+keep_newer_enclave() {
+  # An implicit default or stale retained pin must never request a downgrade. Resolve before step_settings.
+  [[ ${EKKA_VERSION_EXPLICIT:-} != yes ]] || return 0
+  local have
+  have=$(installed_enclave_version) || die "could not read the installed EKKA version"
+  if [[ -n $have ]] && python3 tools/release_gate.py "$have" "$EKKA_VERSION"; then
+    EKKA_VERSION=$have
+  fi
+}
+
 step_enclave_install() {  # the signed EKKA release on this machine, through EKKA's own installer, cosign REQUIRED
   say "the EKKA release"
   local have="" want=$EKKA_VERSION
-  [[ -x /usr/local/bin/ekka ]] && have=$(/usr/local/bin/ekka --version 2>/dev/null | head -1 | awk '{print $2}' || true)   # `ekka 0.1.126` then commit and build lines
+  have=$(installed_enclave_version) || die "could not read the installed EKKA version"
   if [[ $have == "$want" ]]; then ok "ekka $want at /usr/local/bin/ekka"
   else
     local t; t=$(mktemp -d)

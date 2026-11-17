@@ -14,7 +14,7 @@
 # NEW SSH session:  sudo touch /var/lib/desks-harden/confirmed
 # restoring the previous firewall rules and UFW's previous active/inactive state if you do not confirm.
 set -euo pipefail
-ALLOW_FROM=${ALLOW_FROM:?set ALLOW_FROM to the addresses that may connect}
+ALLOW_FROM=${ALLOW_FROM:-}
 ADMIN_USER=${ADMIN_USER:-${SUDO_USER:-}}
 STATE=/var/lib/desks-harden
 say() { printf '\033[1m==\033[0m %s\n' "$*"; }
@@ -101,11 +101,52 @@ RULES
 EOF
 }
 
+validate_allow_from() {
+  python3 - "$ALLOW_FROM" <<'PYADDR'
+import ipaddress
+import sys
+entries = sys.argv[1].split()
+if not entries:
+    sys.exit("harden: ALLOW_FROM must not be empty")
+networks = []
+for entry in entries:
+    try:
+        # No interface zones, shorthand, host bits or nonnumeric prefix lengths.
+        if "%" in entry or ("/" in entry and not entry.split("/", 1)[1].isdigit()):
+            raise ValueError("use an address or a numeric CIDR prefix")
+        network = ipaddress.ip_network(entry, strict=True)
+        if network.prefixlen == 0:
+            raise ValueError("everyone networks are forbidden")
+    except ValueError as error:
+        sys.exit("harden: invalid ALLOW_FROM entry {!r}: {}".format(entry, error))
+    networks.append(str(network))
+print(" ".join(networks))
+PYADDR
+}
+firewall_exit() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  if (( rc != 0 )); then
+    echo 'harden: apply failed; restoring the saved firewall state immediately' >&2
+    # The recovery process takes this lock itself; never wait on our own descriptor.
+    # Closing also releases our lock if flock itself fails. Recovery gets a fresh descriptor.
+    flock -u 8 || true
+    exec 8>&-
+    if ! bash "$FIREWALL_HELPER" restore-now "$STATE" "$firewall_snapshot"; then
+      echo 'harden: immediate firewall restoration FAILED; inspect /restore-failed and journalctl -t desks-harden' >&2
+    fi
+  fi
+  exit "$rc"
+}
+
+# Refuse unresolved recovery and invalid inputs before even creating a directory or taking a lock.
+[[ ! -e /restore-failed ]] || die "previous firewall restoration failed: inspect /restore-failed before retrying"
+ALLOW_FROM=$(validate_allow_from) || exit 1
+
 [[ $(id -u) == 0 ]] || die "run with sudo"
 . /etc/os-release; [[ $ID == ubuntu && $VERSION_ID == 24.04 ]] || die "written for Ubuntu 24.04; this is $PRETTY_NAME"
 [[ -n $ADMIN_USER && $ADMIN_USER != root ]] || die "set ADMIN_USER to the account you SSH in with"
 [[ -s /home/$ADMIN_USER/.ssh/authorized_keys ]] || die "$ADMIN_USER has no SSH key; add one before passwords are turned off"
-for a in $ALLOW_FROM; do [[ $a =~ ^[0-9a-fA-F:.]+(/[0-9]+)?$ ]] || die "not an address: $a"; done
 install -d -m 0700 "$STATE"
 # One hardening run at a time: its confirmation marker belongs to one firewall snapshot.
 exec 9>"$STATE/lock"
@@ -123,7 +164,7 @@ say "packages and security updates"
 export DEBIAN_FRONTEND=noninteractive
 wait_for_apt
 apt_get update -qq
-apt_get install -y -qq ufw unattended-upgrades needrestart chrony auditd ca-certificates curl >/dev/null
+apt_get install -y -qq ufw nftables unattended-upgrades needrestart chrony auditd ca-certificates curl >/dev/null
 cat > /etc/apt/apt.conf.d/52desks-unattended <<'EOF'
 // Security updates install daily. No automatic reboot: agents may be mid-run. `needrestart` and
 // /var/run/reboot-required say when a reboot is due; reboot in a quiet hour.
@@ -212,9 +253,18 @@ ok "journal kept across reboots (2 GB); audit on SSH, sudo, docker and the desks
 say "firewall: only $ALLOW_FROM"
 exec 8>"$STATE/firewall.lock"
 flock 8
-bash "$(dirname "$0")/firewall-state.sh" prepare "$STATE" \
+FIREWALL_HELPER=$(dirname "$0")/firewall-state.sh
+firewall_snapshot=$(bash "$FIREWALL_HELPER" prepare "$STATE") \
   || die "firewall recovery could not be prepared; no firewall rules were changed"
+trap firewall_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 rm -f "$STATE/rolled-back"
+bash "$FIREWALL_HELPER" guard "$STATE" "$firewall_snapshot" "$ALLOW_FROM"
+# A previously IPv4-only UFW configuration must not expose IPv6 when the temporary guard is removed.
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+grep -qx 'IPV6=yes' /etc/default/ufw || die "could not enable UFW IPv6 filtering"
 ufw --force reset >/dev/null
 ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
 for a in $ALLOW_FROM; do for p in 22 443 8080; do ufw allow from "$a" to any port "$p" proto tcp >/dev/null; done; done
@@ -236,7 +286,10 @@ WantedBy=docker.service multi-user.target
 EOF
 systemctl daemon-reload
 ufw --force enable >/dev/null
-command -v docker >/dev/null && start_docker_user 2>/dev/null || true   # first install: Docker comes below
+if command -v docker >/dev/null; then
+  start_docker_user
+fi   # first install: Docker comes below
+bash "$FIREWALL_HELPER" unguard "$STATE" "$firewall_snapshot"
 flock -u 8
 ok "on. From a NEW SSH session within 5 minutes: sudo touch $STATE/confirmed   (else the saved firewall state is restored)"
 
