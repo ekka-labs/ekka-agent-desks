@@ -123,7 +123,7 @@ reason to keep 8080 on your private network.
 in through OIDC, so the gateway does not start if anything turns that on: a `client_ca_path` or
 `[openshell.gateway.mtls_auth]` `operator_enabled`/`enabled` in gateway.toml, `OPENSHELL_TLS_CLIENT_CA`,
 `OPENSHELL_ENABLE_OPERATOR_AUTH` or `OPENSHELL_ENABLE_MTLS_AUTH` in its environment, or any command-line flag
-(`tools/gateway_preflight.py`, run by `up.sh`, `setup.sh compose up|start|restart|create|run` and `backup.sh`).
+(`tools/gateway_preflight.py`, run by `up.sh`, `setup.sh compose up|start|restart|create|run|unpause|scale|watch` and `backup.sh`).
 Each reason is named, with its fix. The Enclave also checks the running gateway once a minute and refuses all
 desk work (`DESK_GATEWAY_TRUSTS_CLIENT_CERTS`) while it asks for a client certificate, so a gateway started
 some other way is caught too. There is no setting to allow either.
