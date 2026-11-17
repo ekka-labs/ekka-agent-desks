@@ -267,8 +267,9 @@ What keeps a project inside the server's limits:
 
 - **The image is named by its content ID and must already be on this machine.** A tag can be moved to another image;
   an ID cannot. OpenShell never pulls a desk image, so an ID that is not here could never make a desk.
-- **The policy keeps the shipped policy's file rules, user and landlock setting exactly.** It may differ only in what
-  it opens on the network, and may open no host outside the ceiling (the hosts this server's provider profiles name).
+- **The project owns its file and network rules within the server's limits.** File rules must meet the safety floors
+  below; the non-root user/group, Landlock setting and policy version stay exactly as shipped.
+  Network rules may open no host outside the ceiling (the hosts this server's provider profiles name).
   A project that needs a new host adds a provider profile, which is how a host reaches a desk.
 - **The backend adapter decides at create.** The grant lists the allowed images and policies by digest; a create with
   any other image or policy is refused (`CONSTRAINT_IMAGE_DIGESTS`, `CONSTRAINT_POLICY_DIGESTS`). The copy of the
@@ -279,6 +280,45 @@ The records are root-owned files in `/var/lib/ekka-agent-desks/backend/projects/
 step, so `sudo ./up.sh server <name>` and an upgrade keep a project. After a rebuild the image has a new ID: run
 `project add` again with it, and the old ID leaves the grant. `sudo ekka desk grant project remove <name>` takes the
 project out; its desks are not deleted, and no new one can be created from it.
+
+### Project file safety floors
+
+Start with `desk/policy.json`. For example, project `acme` can add `/opt/project-tools` to `filesystem.readOnly` and
+`/var/cache/acme` to `filesystem.readWrite`, then run `project add` with that file. Create the folders in its image
+and give the shipped user permission to use them; a policy grants access, it does not create folders or change ownership.
+
+- `filesystem` holds only `includeWorkdir`, `readOnly` and `readWrite`. Keep `includeWorkdir` exactly as shipped;
+  the two path lists contain strings, without duplicates or a path appearing in both lists. Unknown policy keys
+  are refused too. The process user/group and `landlock` objects, including their keys, must match the shipped ones.
+- Paths are absolute and already normalized: no `.` or `..` components, repeated slashes, trailing slash (except
+  `/` itself), glob characters (`* ? [ ] { }` or backslash), or control/invalid Unicode characters. The limit is
+  4095 UTF-8 bytes. Root passes the spelling check but is refused as a protected location.
+- Keep every shipped read-only entry. Additional reads may be under an already shipped readable or writable path,
+  `/opt/project-tools`, `/opt/projects/<name>`, `/var/cache/<name>`, `/sandbox/ekka-workspace` or
+  `/sandbox/.ekka-inputs`. Device and process paths are exceptions: keep the exact shipped entries, but add no
+  rules below `/dev` or `/proc`, where links such as `/proc/self/root` could resolve outside the named tree.
+- Writes may keep or remove shipped entries and add paths under `/tmp`, `/opt/projects/<name>` or
+  `/var/cache/<name>`. Here `<name>` is the exact project name passed to `project add`; a neighboring name does not
+  match. This permits project caches and tools without opening all of `/opt` or `/var/cache`.
+- No new write may equal, contain or sit below `/bin`, `/sbin`, `/usr`, `/lib`, `/lib32`, `/lib64`, `/libexec`,
+  `/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/root`, `/run`, `/var/run`, `/var/lib`, `/var/log`, `/home`,
+  `/.openshell`, `/sandbox/ekka-workspace` or `/sandbox/.ekka-inputs`. Thus `/var` and `/sandbox` are refused too.
+  The workspace already gets write access through `includeWorkdir`; staged inputs must not get a new write grant.
+  Only the exact shipped `/dev/shm` and `/dev/null` write entries are allowed under `/dev`, with no extra descendants.
+- New reads also refuse ancestors and descendants of `/root`, `/home`, `/run`, `/var/run`, `/var/lib`, `/proc`,
+  `/sys`, `/dev`, `/boot` and `/.openshell`, except the exact shipped read-only entries.
+  All home directories are excluded because the policy cannot prove their ownership. Unrecognized locations such
+  as `/host`, `/mnt` and `/data` are refused for both reads and writes, rather than guessing whether they hold secrets.
+
+These are checks of path spelling inside the desk, not checks of the custom image's symlinks or mounted contents.
+The administrator must ensure allowed folders resolve to the intended project data and contain no host or other
+tenant's secrets. A read-only rule grants reads; it cannot cancel writes granted by a parent or `includeWorkdir`.
+In particular, these checks do not prove staged inputs are read-only if the actual working directory covers them.
+The gateway disables host bind mounts and caller-supplied driver configuration; file rules do not enable either.
+
+The shipped `desk/policy.json`, including `/dev/shm`, stays unchanged. Existing desks are pinned to its current
+baseline digest; changing that entry requires a separate migration. These floors admit a new project's creation
+policy, not a live change to an existing desk's pinned filesystem baseline.
 
 ## The backend adapter's image
 

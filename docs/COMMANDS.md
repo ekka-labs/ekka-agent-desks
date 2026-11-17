@@ -150,8 +150,13 @@ disposable desk and ends; a project is for the desks the project works on and st
 
 | Command | What it does |
 |---|---|
-| `sudo ekka desk grant project add <name> --image sha256:<64 hex> --policy <file>` | Adds the project to the grant: its image, by the content ID of an image already on this machine (`docker image inspect --format '{{.Id}}' <tag>`), and its policy, by its digest. Refused, with nothing changed, when the image is not on this machine, when the policy changes the shipped policy's file rules, user or landlock setting, or when it opens a host outside the ceiling. Prints the line that creates the project's desk. Run it again after a rebuild of the image or a change to the policy. |
+| `sudo ekka desk grant project add <name> --image sha256:<64 hex> --policy <file>` | Adds the project to the grant: its image, by the content ID of an image already on this machine (`docker image inspect --format '{{.Id}}' <tag>`), and its policy, by its digest. Refused, with nothing changed, when the image is not on this machine, when the policy breaks the [file safety floors](OPERATIONS.md#project-file-safety-floors), changes the user or Landlock setting, or opens a host outside the server's ceiling. Prints the line that creates the project's desk. Run it again after a rebuild of the image or a change to the policy. |
 | `sudo ekka desk grant project remove <name>` | Takes the project out of the grant: no new desk may be created from its image or with its policy. Its desks are not deleted. |
+
+A project owns its network rules within the server's host ceiling and its file rules within the safety floors.
+For example, project `acme` can copy `desk/policy.json`, add `/opt/project-tools` to `filesystem.readOnly` and
+`/var/cache/acme` to `filesystem.readWrite`, then pass that file to `project add`; prepare those folders in its image.
+Keep every shipped read-only entry, `includeWorkdir`, the non-root user/group, Landlock and the policy version.
 
 ## Who may use the desks
 
