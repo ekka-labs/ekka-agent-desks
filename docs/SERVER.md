@@ -245,7 +245,7 @@ ekka desk login
 ekka desk create code-desk --provider claude-code
 ```
 
-Wait until `ekka desk list` shows the desk as pinned, about a minute or two, and run the setup plan again if the first clone fails with a certificate message.
+Wait until `ekka desk list` shows the desk as pinned, about a minute or two.
 
 **Who can change a desk.** In this release every desk change (create, delete, stop, start, policy, allow, deny, disconnect) runs here, through the Enclave, as `ekka desk <command>`. It runs under the EKKA sign-in of the person who installed the server, whoever types it, so only people with sudo on this server can change a desk. A person's `ekka` on their own computer reads desks and is refused for changes ([Change a desk](OPERATIONS.md#change-a-desk)).
 

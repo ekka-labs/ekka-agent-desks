@@ -127,6 +127,54 @@ class TheSetupJob(unittest.TestCase):
                                                         os.path.join(self.ws, "claims")]])
         self.assertEqual((m["result"], m["cloned"], m["reused"], m["failed"], m["run_id"]), ("ready", 1, 0, 0, "run-1"))
 
+    # Found on a real server: the script drops every GIT_* variable, GIT_SSL_CAINFO among them, so no clone trusted
+    # the desk's certificate. The bundle is now named by its fixed place.
+    CA_LINE = "CA=/run/openshell-supervisor-ca/material/ca-bundle.crt\n"
+
+    def with_bundle(self, kind):
+        ca = os.path.join(self.tmp, "ca-bundle.crt")
+        if kind == "file":
+            with open(ca, "w") as f:
+                f.write("x")
+        elif kind == "link":
+            real = os.path.join(self.tmp, "elsewhere.crt")
+            with open(real, "w") as f:
+                f.write("x")
+            os.symlink(real, ca)
+
+        def script(text):
+            self.assertEqual(text.count(self.CA_LINE), 1)
+            return text.replace(self.CA_LINE, f"CA={ca}\n")
+        return ca, script
+
+    def test_a_clone_names_the_desks_certificate_bundle_when_the_desk_has_one(self):
+        ca, script = self.with_bundle("file")
+        r = self.only(self.run_setup('["https://github.com/o/claims"]', script))
+        self.assertEqual(r["status"], "cloned")
+        got = self.clones()[0]
+        self.assertEqual(got, [CLONE_ENV] + CLONE_FLAGS[:-4] + ["-c", f"http.sslCAInfo={ca}"] + CLONE_FLAGS[-4:]
+                         + ["--", "https://github.com/o/claims", os.path.join(self.ws, "claims")])
+
+    def test_a_missing_or_linked_bundle_is_never_named(self):
+        for kind in (None, "link"):
+            with self.subTest(kind=kind):
+                _, script = self.with_bundle(kind)
+                self.run_setup('["https://github.com/o/claims"]', script)
+                self.assertFalse(any("sslCAInfo" in w for w in self.clones()[-1]))
+                shutil.rmtree(os.path.join(self.ws, "claims"), ignore_errors=True)
+                for n in ("ca-bundle.crt", "elsewhere.crt"):
+                    if os.path.lexists(os.path.join(self.tmp, n)):
+                        os.remove(os.path.join(self.tmp, n))
+
+    def test_a_bundle_named_in_the_environment_is_never_used(self):
+        r = subprocess.run(self.command('["https://github.com/o/claims"]'), capture_output=True, text=True, timeout=60,
+                           env={"PATH": self.path, "HOME": self.tmp, "GIT_DIR": "/nonexistent",
+                                "GIT_SSL_CAINFO": "/tmp/planted.crt", "GIT_SSL_NO_VERIFY": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = self.clones()[0]
+        self.assertEqual(got[0], CLONE_ENV, "no GIT_* variable from the caller reached git")
+        self.assertFalse(any("planted" in w for w in got))
+
     def test_without_a_branch_the_default_branch_is_cloned(self):
         r = self.only(self.run_setup('["https://github.com/octocat/Hello-World"]'))
         self.assertEqual((r["status"], r["branch"]), ("cloned", "main"))
