@@ -60,10 +60,14 @@ Replace every `<...>` value before running a command. Keep this server terminal 
 `ALLOW_FROM` must contain valid IPv4/IPv6 addresses or CIDR networks, with no host bits in a network.
 An empty list and everyone networks (`0.0.0.0/0`, `::/0`) are refused before any changes.
 A temporary nftables guard protects inbound traffic while UFW is replaced, preserving established connections
-and IPv6 neighbour discovery. Apply failures restore the saved firewall state immediately. Recovery retries
-failed steps and checks UFW status and the saved Docker rules before reporting success. If recovery fails,
-inspect `/restore-failed` and `journalctl -t desks-harden`; hardening refuses another run until recovery is
-resolved and the marker is removed. The five-minute timer still restores an unconfirmed successful apply.
+and IPv6 neighbour discovery. A failure or signal during the firewall step cancels the rollback timer and
+restores the saved firewall state immediately. Recovery retries failed steps and checks UFW status and the
+saved Docker rules before reporting success. If recovery fails, inspect `/var/lib/desks-harden/restore-failed`
+and `journalctl -t desks-harden`; hardening refuses another run until recovery is resolved and the marker is
+removed. After the firewall step finishes (guard removed and lock released), a later failure or signal,
+including Docker refusing to restart while desks exist or a package installation failing, leaves the new
+firewall rules in place and the five-minute timer scheduled. Confirmation from a new SSH session alone
+decides whether those rules stay; without confirmation, the timer restores the saved state.
 
 It does this:
 

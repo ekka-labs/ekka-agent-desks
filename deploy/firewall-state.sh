@@ -56,10 +56,10 @@ verify_docker_rules() {
 }
 report_failure() {
   local message="firewall restore FAILED; failed steps: ${failed[*]}"
-  echo "$message; see /restore-failed" >&2
+  echo "$message; see $state/restore-failed" >&2
   logger -t desks-harden "$message" || true
-  if ! printf '%s\n' "${failed[@]}" > /restore-failed; then
-    echo 'desks-harden: could not write /restore-failed' >&2
+  if ! printf '%s\n' "${failed[@]}" > "$state/restore-failed"; then
+    echo 'desks-harden: could not write the restore-failed marker' >&2
   fi
 }
 
@@ -159,7 +159,7 @@ RULES
     # Access recovery and guard cleanup are attempted even when another restore step failed.
     step remove-guard remove_guard
     if (( ${#failed[@]} )); then report_failure; exit 1; fi
-    step clear-failure-marker rm -f /restore-failed
+    step clear-failure-marker rm -f "$state/restore-failed"
     if (( ${#failed[@]} )); then report_failure; exit 1; fi
     message='firewall restored to its saved state (read-back verified)'
     echo "$message"

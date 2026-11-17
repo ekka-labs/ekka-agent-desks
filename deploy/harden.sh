@@ -132,15 +132,17 @@ firewall_exit() {
     # Closing also releases our lock if flock itself fails. Recovery gets a fresh descriptor.
     flock -u 8 || true
     exec 8>&-
+    # Cancel the timer before immediate recovery so it cannot block the next run after restoration.
+    systemctl stop desks-harden-rollback.timer 2>/dev/null || true
     if ! bash "$FIREWALL_HELPER" restore-now "$STATE" "$firewall_snapshot"; then
-      echo 'harden: immediate firewall restoration FAILED; inspect /restore-failed and journalctl -t desks-harden' >&2
+      echo "harden: immediate firewall restoration FAILED; inspect $STATE/restore-failed and journalctl -t desks-harden" >&2
     fi
   fi
   exit "$rc"
 }
 
 # Refuse unresolved recovery and invalid inputs before even creating a directory or taking a lock.
-[[ ! -e /restore-failed ]] || die "previous firewall restoration failed: inspect /restore-failed before retrying"
+[[ ! -e $STATE/restore-failed ]] || die "previous firewall restoration failed: inspect $STATE/restore-failed before retrying"
 ALLOW_FROM=$(validate_allow_from) || exit 1
 
 [[ $(id -u) == 0 ]] || die "run with sudo"
@@ -291,6 +293,9 @@ if command -v docker >/dev/null; then
 fi   # first install: Docker comes below
 bash "$FIREWALL_HELPER" unguard "$STATE" "$firewall_snapshot"
 flock -u 8
+# The firewall step is done. A later step that fails (Docker, packages) must not undo it: from here the
+# 5 minute confirmation alone decides whether the new rules stay.
+trap - EXIT HUP INT TERM
 ok "on. From a NEW SSH session within 5 minutes: sudo touch $STATE/confirmed   (else the saved firewall state is restored)"
 
 say "Docker"
