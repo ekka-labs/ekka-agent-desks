@@ -32,7 +32,7 @@ DIRS = (
 
 
 def profile_on(state):
-    """The `desk-admin` profile is on in up.env."""
+    """The `desk-admin` profile is on in up.env, by name or by `*` (every profile)."""
     try:
         with open(os.path.join(state, "up.env"), encoding="utf-8") as f:
             lines = f.read().splitlines()
@@ -40,7 +40,7 @@ def profile_on(state):
         return False
     for line in lines:
         if line.startswith("COMPOSE_PROFILES="):
-            if "desk-admin" in [p.strip() for p in line.split("=", 1)[1].split(",")]:
+            if {"desk-admin", "*"}.intersection(p.strip() for p in line.split("=", 1)[1].split(",")):
                 return True
     return False
 
