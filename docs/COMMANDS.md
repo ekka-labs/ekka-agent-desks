@@ -205,7 +205,7 @@ Rarely needed: desks register themselves. Run these on the machine you installed
 | Command | What it does |
 |---|---|
 | `ekka desk repin <name>` | Approve the desk now holding a name, after it was replaced. Until then, no work runs on it. |
-| `ekka desk add <file.json>` | Register an OpenShell sandbox that was not made with `ekka desk create`. |
+| `ekka desk add <file.json>` | Register a desk that was not made with `ekka desk create`. |
 
 ## Related workflow commands
 

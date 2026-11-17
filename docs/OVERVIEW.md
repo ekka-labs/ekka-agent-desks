@@ -36,7 +36,7 @@ Repository copies stay on your server. The model provider receives the code cont
 | Component | Source | License |
 |---|---|---|
 | This repository | Installation, configuration and examples | [Apache-2.0](../LICENSE) |
-| EKKA Enclave | EKKA's signed release; checksum and signature verified before building its local image | EKKA terms |
+| EKKA Enclave | EKKA's signed release; checksum and signature verified before installing it as a native systemd service | EKKA terms |
 | NVIDIA OpenShell gateway and supervisor | NVIDIA's v0.1.4 images, pulled by digest | [Apache-2.0 and notices](https://github.com/NVIDIA/OpenShell/blob/v0.1.4/THIRD-PARTY-NOTICES) |
 | Desk image | [Separate EKKA image source](https://github.com/ekka-labs/ekka-agent-desks/tree/main/desk/image): Node, git and Claude Code | Per component |
 | Keycloak, Postgres and nginx | Official images, pulled by digest | Apache-2.0, PostgreSQL and BSD-2 |

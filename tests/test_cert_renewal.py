@@ -2,7 +2,7 @@
 
 setup.sh gives the edge's key to uid 101 (nginx-unprivileged) and the gateway's to uid 1000, once, at init. Renewal
 runs as root under `umask 077` and replaced each key with a new root-owned one, so after the documented
-renew-then-restart neither service could read its key (review of ekka-labs/ekka-agent-desks#1). A renewed key now
+renew-then-restart neither service could read its key. A renewed key now
 takes the owner the key it replaces had.
 
 A test cannot make files owned by other users without root, so `stat` reports each service's real owner (the edge's

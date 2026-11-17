@@ -367,7 +367,6 @@ The browser half, once per computer, with `desks-ca.pem` from the people bundle:
 |---|---|---|
 | macOS | `security add-trusted-cert -r trustRoot -p ssl -s <server name> -k ~/Library/Keychains/login.keychain-db desks-ca.pem` | `security remove-trusted-cert desks-ca.pem` |
 | Linux, Chrome and Chromium | `certutil -d sql:$HOME/.pki/nssdb -A -t C,, -n "EKKA desks CA (<server name>)" -i desks-ca.pem` (`certutil` is in `libnss3-tools`) | `certutil -d sql:$HOME/.pki/nssdb -D -n "EKKA desks CA (<server name>)"` |
-| Windows (administrator) | `certutil -addstore -f Root desks-ca.pem` | `certutil -delstore Root "EKKA desks CA (<server name>)"` |
 
 `install.sh` prints the right one for the computer it runs on, with the CA's SHA-256 fingerprint, and runs
 nothing; `./trust-ca.sh --all` in the bundle prints both. Read people the fingerprint `ekka desk invite` shows, so they
@@ -377,8 +376,9 @@ The trust is as narrow as each system allows: websites only, the server's name o
 constraint names DNS names and IP addresses alone, so a CA trusted for every purpose (the old
 `sudo security add-trusted-cert -d ... System.keychain`) would also let anyone holding the server's CA key sign
 software or mail that computer trusts. On Linux, Chrome and Firefox do not read the system store, so
-`update-ca-certificates` needed root for the whole machine and still left the warning. The Windows command still
-trusts for every purpose; narrowing it is its own change.
+`update-ca-certificates` needed root for the whole machine and still left the warning.
+
+A restricted Windows trust procedure is not provided yet; meanwhile, use the documented setup on a macOS or Linux computer.
 
 Firefox keeps its own store: import `desks-ca.pem` under Settings, Certificates, Authorities, or turn on
 `security.enterprise_roots.enabled`.

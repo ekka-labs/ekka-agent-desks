@@ -462,7 +462,14 @@ kc() {  # the realm script against this machine's Keycloak admin listener
 # file, an argument or a terminal. The connection is the `desks` catalog row: the adapter's socket, this machine only.
 connect_desk_admin() {
   local err
-  if err=$(kc admin-client on | ekka_in api connect desks --input socket=/run/ekka-backend/backend.sock --reach loopback --stdin 2>&1 >/dev/null); then
+  # The CLI can refuse before reading its credential. Drain the pipe even then, so Python finishes writing
+  # without BrokenPipeError; pipefail still preserves a failure from either Keycloak or the CLI.
+  if err=$(kc admin-client on | {
+    rc=0
+    ekka_in api connect desks --input socket=/run/ekka-backend/backend.sock --reach loopback --stdin 2>&1 >/dev/null || rc=$?
+    cat >/dev/null
+    exit "$rc"
+  }); then
     ok "the backend adapter's credential is in the Enclave's vault (connection desks, this machine only)"; return 0
   fi
   # EKKA's desks catalog entry widened the paths the adapter's connection may reach (1.1.0: the adapter's whole /v1/
@@ -477,8 +484,12 @@ connect_desk_admin() {
       printf '%s\n' "$derr" >&2
       die "the desks API did not disconnect cleanly to take the paths EKKA's catalog now gives it (reason above); it may already be removed: run sudo ./up.sh again to connect it"
     }
-    kc admin-client on | ekka_in api connect desks --input socket=/run/ekka-backend/backend.sock --reach loopback --stdin >/dev/null \
-      || die "the desks API was disconnected and did not connect again with its new paths; run sudo ./up.sh again"
+    kc admin-client on | {
+      rc=0
+      ekka_in api connect desks --input socket=/run/ekka-backend/backend.sock --reach loopback --stdin >/dev/null || rc=$?
+      cat >/dev/null
+      exit "$rc"
+    } || die "the desks API was disconnected and did not connect again with its new paths; run sudo ./up.sh again"
     ok "the desks API reconnected with the paths EKKA's catalog now gives it (the adapter's whole route space)"
     ok "the backend adapter's credential is in the Enclave's vault (connection desks, this machine only)"; return 0
   fi
@@ -568,7 +579,7 @@ connect_cmd() {  # connect_cmd <provider>: a provider's one key, read from stdin
   local p key secret
   (( $# == 1 )) || die "usage: <key source> | sudo ekka desk connect <provider>   (the key comes on stdin, never as an argument)"
   p=$1
-  profile_names | grep -qxF -- "$p" || die "that is not a provider this install knows; they are: $(profile_names | tr '\n' ' ')"
+  profile_names | grep -xF -- "$p" >/dev/null || die "that is not a provider this install knows; they are: $(profile_names | tr '\n' ' ')"
   # A profile that declares no credential at all (`credentials: []`, for example public package registries) makes a
   # provider with no key, so none is read: a key piped in anyway is refused, as a mistake, and nothing is made. The
   # provider still exists only because a person ran this, and a desk still reaches its hosts only when the desks grant

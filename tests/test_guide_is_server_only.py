@@ -19,10 +19,12 @@ FORBIDDEN = re.compile(
     re.I)
 MAC = re.compile(r"\bmac(os|book)?\b", re.I)
 # The only places a Mac belongs in a server-only guide: a person's own computer connecting to the server.
+WINDOWS_TRUST_GAP = ("A restricted Windows trust procedure is not provided yet; meanwhile, use the documented setup "
+                     "on a macOS or Linux computer.")
 MAC_ALLOWED = {
     "docs/SERVER.md": ("A Mac or Windows computer cannot be the server", "# macOS",
-                       "| macOS | `security add-trusted-cert -r trustRoot -p ssl -s "),
-    "docs/OPERATIONS.md": ("| macOS | `security add-trusted-cert -r trustRoot -p ssl -s ",),
+                       "| macOS | `security add-trusted-cert -r trustRoot -p ssl -s ", WINDOWS_TRUST_GAP),
+    "docs/OPERATIONS.md": ("| macOS | `security add-trusted-cert -r trustRoot -p ssl -s ", WINDOWS_TRUST_GAP),
 }
 
 

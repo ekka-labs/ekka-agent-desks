@@ -39,6 +39,8 @@ Follow the **[server installation guide](docs/SERVER.md)** to configure access, 
 
 After installation, run these commands **on the server, as root** (`sudo -i` first). They work from any folder: `ekka` there is this server's Enclave.
 
+Wait until `ekka desk list` shows the desk as pinned, about a minute or two, and run the setup plan again if the first clone fails with a certificate message.
+
 ### 1. Prepare a public repository
 
 ```sh

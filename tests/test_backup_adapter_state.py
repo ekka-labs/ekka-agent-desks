@@ -2,7 +2,7 @@
 
 The adapter keeps open operations and settlement holds in the ekka-backend-state volume. backup.sh saved the
 gateway's volume and the Enclave's home but never this one, so a restore left the adapter's newer state beside older
-gateway and Enclave state (review of ekka-labs/ekka-agent-desks#1). The functions run here with docker stubbed:
+gateway and Enclave state. The functions run here with docker stubbed:
 the whole script needs root, and a real restore replaces /var/lib/ekka.
 """
 import os
