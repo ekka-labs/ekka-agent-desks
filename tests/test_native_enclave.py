@@ -178,16 +178,16 @@ class TheWrapper(unittest.TestCase):
             self.assertEqual(run(["desk", "revoke", "ann"]), "up.sh revoke ann")
             self.assertEqual(run(["desk", "plans", "ops-desk", "--private"]), "up.sh desk-plans ops-desk --private")
             for args in (["desk", "grant", "show"], ["desk", "grant", "show", "--json"],
-                         ["desk", "grant", "update", "--yes"]):
+                         ["desk", "grant", "update", "--yes"],
+                         ["desk", "grant", "restore"], ["desk", "grant", "restore", "--yes", "--json"],
+                         ["desk", "grant", "discovery", "--image", "ghcr.io/example/project@sha256:" + "a" * 64,
+                          "--providers", "github,bitbucket", "--minutes", "15", "--yes", "--json"]):
                 invoked = run(args)
                 self.assertTrue(invoked.startswith("runuser "))
                 self.assertTrue(invoked.endswith("/usr/local/bin/ekka " + " ".join(args)))
-            self.assertEqual(run(["desk", "grant", "restore"]), "up.sh grant restore")
             self.assertEqual(run(["desk", "grant", "project", "remove", "acme"]), "up.sh grant project remove acme")
             self.assertEqual(run(["desk", "registry", "show"]), "up.sh registry show")
             self.assertEqual(run(["desk", "image", "pull", "r/n@sha256:" + "a" * 64]), "up.sh image pull r/n@sha256:" + "a" * 64)
-            self.assertEqual(run(["desk", "grant", "discovery", "--image", "r@sha256:" + "a" * 64, "--providers", "github"]),
-                             "up.sh grant discovery --image r@sha256:" + "a" * 64 + " --providers github")
             self.assertEqual(run(["desk", "connect", "claude-code"], stdin="k-not-a-secret"), "up.sh connect claude-code")
             self.assertEqual(open(cap).read(), "k-not-a-secret", "the piped key reaches the installer's connect, and nothing else")
             self.assertTrue(run(["desk", "connect"]).startswith("runuser "), "no provider: the binary lists the kinds of connection")

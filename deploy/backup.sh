@@ -78,7 +78,9 @@ case "${1:-}" in
       preflight || say "the gateway preflight refused (above): the stack will not start the gateway; the backup itself is complete"
       systemctl start ekka >/dev/null 2>&1 || say "the Enclave did not start; see: journalctl -u ekka"
     fi
-    tar -C "$DESKS_STATE" --exclude=./backups -czf "$d/desks-state.tgz" .
+    tar -C "$DESKS_STATE" --exclude=./backups \
+      --exclude=./backend/desks-grant.extras.json --exclude=./backend/discovery-policy.json \
+      --exclude=./backend/discovery-composed.json -czf "$d/desks-state.tgz" .
     ( cd "$d" && sha256sum ./*.tgz ./*.pgdump > SHA256SUMS )
     chmod 0600 "$d"/*
     say "done: $d"; ls -l "$d" | tail -n +2
@@ -89,7 +91,14 @@ case "${1:-}" in
     say "stopping this setup (the Enclave's home and the data volumes are replaced, the images stay)"
     stop_writers   # refuses, touching nothing, if either unit or a stack container is still running
     P down >/dev/null 2>&1 || true
-    tar -C "$DESKS_STATE" -xzf "$d/desks-state.tgz"
+    tar -C "$DESKS_STATE" --exclude=./backend/desks-grant.extras.json \
+      --exclude=./backend/discovery-policy.json --exclude=./backend/discovery-composed.json -xzf "$d/desks-state.tgz"
+    # Old backups must not reintroduce window files. Remove any names already on this machine too.
+    if [[ -e $DESKS_STATE/backend || -L $DESKS_STATE/backend ]]; then
+      removed=$(python3 ../tools/desk_grant_cli.py remove-retired "$DESKS_STATE/backend") \
+        || die "the retired grant files could not be removed; the restored services remain stopped"
+      [[ -z $removed ]] || say "removed retired grant files: $removed"
+    fi
     docker volume rm -f ekka-desks_gateway-state >/dev/null; docker volume create ekka-desks_gateway-state >/dev/null
     vol gateway-state "$d" "tar -C /v -xzpf /b/gateway-state.tgz"
     restore_backend_state "$d"

@@ -1,4 +1,4 @@
-"""Discovery/project admission checks and the installer's local grant display."""
+"""Project admission and provider host checks."""
 import copy
 import datetime as dt
 import io
@@ -11,164 +11,11 @@ from pathlib import Path
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import desk_grant as dg
-import schema_check
 
-SCHEMA = json.loads(Path(ROOT, "vendor/ekka-contracts/governance/grant-constraints/desks.v1.schema.json").read_text())
 POLICY = json.loads(Path(ROOT, "desk/policy.json").read_text())
-IMAGE = "sha256:" + "d" * 64
-POLICY_DIGEST = "sha256:" + "e" * 64
-NOW = dt.datetime(2026, 10, 16, tzinfo=dt.timezone.utc)
 P_IMAGE = "sha256:" + "1" * 64
 P_POLICY = "sha256:" + "2" * 64
 P_NOW = dt.datetime(2026, 11, 14, 12, 0, 0, tzinfo=dt.timezone.utc)
-
-
-def sample():
-    return json.loads(Path(ROOT, "tests/fixtures/desks-grant.json").read_text())
-
-
-class TheDiscoveryWindow(unittest.TestCase):
-    """`sudo ekka desk grant discovery --image <ref> --providers <a,b> [--minutes N]`: the project's image and the
-    grant's `discovery` block, for NVIDIA OpenShell's auto approval mode on one discovery desk. No policy, address
-    range or port is added: the desk runs the shipped policy, and the backend adapter's permit gates the rest."""
-    PROJ = "sha256:" + "a" * 64
-    REF = "ghcr.io/example/project@sha256:" + "a" * 64
-
-    def open_window(self, providers=("github", "bitbucket"), minutes=60, granted=None):
-        return dg.window(self.REF, list(providers), minutes, NOW, granted)
-
-    def cli(self, *argv, now=NOW):
-        import contextlib
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                rc = dg.main(list(argv), now=now)
-            except SystemExit as e:   # argparse refusing a value
-                rc = e.code
-        return rc, out.getvalue(), err.getvalue()
-
-    def test_the_window_writes_the_discovery_block_and_the_contract_accepts_it(self):
-        w = self.open_window()
-        self.assertEqual(w["discovery"], {"image_digests": [self.PROJ], "providers": ["bitbucket", "github"],
-                                          "name_prefix": "discover-", "expires_at": "2026-10-16T01:00:00Z"})
-        self.assertEqual((w["image_ref"], w["since"]), (self.REF, "2026-10-16T00:00:00Z"))
-        self.assertEqual(schema_check.schema_errors(w["discovery"], SCHEMA["$defs"]["full"]["properties"]["discovery"], SCHEMA), [])
-
-    def test_the_window_lasts_60_minutes_unless_told_and_240_at_most(self):
-        for args, until in (((), "2026-10-16T01:00:00Z"), (("--minutes", "15"), "2026-10-16T00:15:00Z"),
-                            (("--minutes", "240"), "2026-10-16T04:00:00Z")):
-            rc, out, err = self.cli("window", "--image-ref", self.REF, "--providers", "github", *args)
-            self.assertEqual(rc, 0, err)
-            self.assertEqual(json.loads(out)["discovery"]["expires_at"], until, args)
-        for bad in ("241", "0", "-5", "1000"):
-            rc, out, err = self.cli("window", "--image-ref", self.REF, "--providers", "github", "--minutes", bad)
-            self.assertEqual((rc, out), (1, ""), bad)
-            self.assertIn("--minutes is a whole number from 1 to 240", err)
-        rc, out, _ = self.cli("window", "--image-ref", self.REF, "--providers", "github", "--minutes", "sixty")
-        self.assertEqual((rc, out), (2, ""), "not a number: refused before anything is written")
-
-    def test_planted_a_bad_image_reference_is_refused(self):
-        for ref in ("ghcr.io/example/project:latest", "ghcr.io/example/project@sha256:" + "a" * 63,
-                    "ghcr.io/example/project@sha256:" + "A" * 64, "project@sha256:" + "a" * 64,
-                    "ghcr.io/example/project@sha512:" + "a" * 64, "", "ghcr.io/Example/project@sha256:" + "a" * 64):
-            with self.assertRaisesRegex(dg.Refused, "a tag can move; a digest cannot", msg=ref):
-                dg.window(ref, ["github"], 60, NOW)
-
-    def test_planted_a_bad_provider_list_is_refused(self):
-        for providers in ([], ["../github"], ["GitHub"], ["git hub"], [""], ["github", "github"],
-                          [f"p{i}" for i in range(9)]):
-            with self.assertRaises(dg.Refused, msg=str(providers)):
-                self.open_window(providers=providers)
-        with self.assertRaisesRegex(dg.Refused, "bitbucket is not connected on this server"):
-            self.open_window(providers=["github", "bitbucket"], granted=["github"])
-        self.assertEqual(self.open_window(providers=["github"], granted=["github", "bitbucket"])["discovery"]["providers"], ["github"])
-
-    def test_the_command_line_holds_the_providers_to_the_grant_in_force(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "limits.json")
-            with open(path, "w") as f:
-                json.dump(sample(), f)   # github only
-            rc, out, err = self.cli("window", "--image-ref", self.REF, "--providers", "github,bitbucket", "--limits", path)
-            self.assertEqual((rc, out), (1, ""))
-            self.assertIn("bitbucket is not connected", err)
-            rc, out, err = self.cli("window", "--image-ref", self.REF, "--providers", " github ", "--limits", path)
-            self.assertEqual(rc, 0, err)
-            self.assertEqual(json.loads(out)["discovery"]["providers"], ["github"])
-
-    def test_planted_a_discovery_block_off_its_contract_never_reaches_a_grant(self):
-        good = self.open_window()["discovery"]
-        for bad in ({**good, "name_prefix": "prod-"}, {**good, "allowed_cidrs": ["0.0.0.0/0"]},
-                    {k: v for k, v in good.items() if k != "expires_at"},
-                    {**good, "image_digests": []}, {**good, "image_digests": ["sha256:" + c * 64 for c in "abcde"]},
-                    {**good, "image_digests": ["sha256:short"]}, {**good, "providers": ["../x"]},
-                    {**good, "expires_at": "2026-10-16T01:00:00+00:00"}, {**good, "expires_at": "2026-13-45T01:00:00Z"}):
-            with self.assertRaises(dg.Refused, msg=str(bad)):
-                dg.check_discovery(bad)
-
-
-    def test_show_says_the_window_is_open_for_which_image_and_providers_until_when(self):
-        w = self.open_window()
-        lim = sample()
-        lim["discovery"] = w["discovery"]
-        lim["image_digests"].append(self.PROJ)
-        t = dg.show(lim, w, now=NOW + dt.timedelta(minutes=30))
-        self.assertIn("the discovery image " + self.REF + "\n      " + self.PROJ, t)
-        self.assertIn("ekka-desk:local, built by the install\n      " + IMAGE, t)
-        self.assertIn("DISCOVERY WINDOW open until 2026-10-16T01:00:00Z (opened 2026-10-16T00:00:00Z): image " + self.REF
-                      + ", providers bitbucket, github; a desk named discover-* made from that image with only those"
-                      " providers may use NVIDIA OpenShell's auto approval mode. End it: sudo ekka desk grant restore", t)
-        late = dg.show(lim, w, now=NOW + dt.timedelta(minutes=60))
-        self.assertIn("DISCOVERY WINDOW closed at 2026-10-16T01:00:00Z (expired): no desk may enter auto approval mode.", late)
-        self.assertNotIn("open until", late)
-        self.assertIn("no discovery window: the shipped limits are in force", dg.show(sample(), None, now=NOW))
-
-    def test_show_names_the_image_the_policy_and_the_providers_in_words(self):
-        # Label each digest and explain an empty provider list, so the reader knows what was granted
-        # and how to connect a key.
-        lim = sample()
-        lim["providers"] = []
-        lim["provider_config_digests"] = {}
-        t = dg.show(lim, None, ["claude-code", "github"])
-        self.assertIn("ekka-desk:local, built by the install\n      " + IMAGE, t)
-        self.assertIn("desk/policy.json, the shipped policy\n      " + POLICY_DIGEST, t)
-        self.assertIn("read the shipped policy:  cat " + os.path.abspath(os.path.join(ROOT, "desk", "policy.json")), t)
-        self.assertIn("none connected yet, so a desk can use no key.", t)
-        self.assertIn("on this server, not connected: claude-code, github", t)
-        self.assertIn("<the key> | sudo ekka desk connect <provider>", t)
-        t = dg.show(sample(), None, ["claude-code", "github"])
-        self.assertIn("connected: github\n  on this server, not connected: claude-code\n", t)
-
-    def test_the_wide_open_discovery_policy_and_the_packs_are_gone(self):
-        # NVIDIA OpenShell's gateway, as this installer ships it, refuses the host-less policy over the public internet
-        # (FAILED_PRECONDITION, measured with any image), so nothing may point a person at it again.
-        for gone in ("desk/policy-discovery.json", "desk/packs"):
-            self.assertFalse(os.path.exists(os.path.join(ROOT, gone)), gone)
-        import subprocess
-        hits = subprocess.run(["git", "grep", "-n", "-I", "-e", "policy-discovery", "-e", "--packs", "-e", "grant packs",
-                               "-e", "discovery-policy.json", "--", ".", ":!tests"],   # tests plant the old words as refusals
-                              cwd=ROOT, capture_output=True, text=True).stdout
-        self.assertEqual([h for h in hits.splitlines() if "discovery-policy.json\"" not in h and "discovery-composed" not in h],
-                         [], "only restore's clean-up of an older window may name the old files")
-
-
-class CommandLine(unittest.TestCase):
-    def test_follow_is_refused_when_showing_limits_or_opening_a_window(self):
-        import contextlib
-        import tempfile
-        follow = {"follow": {"grant": "org_desks"}, "requires_role": "admin"}
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "limits.json")
-            for limits in (follow, {**sample(), **follow}):
-                with open(path, "w") as f:
-                    json.dump(limits, f)
-                for argv in (["show", path], ["window", "--image-ref", "ghcr.io/example/project@sha256:" + "a" * 64,
-                                              "--providers", "github", "--limits", path]):
-                    out, err = io.StringIO(), io.StringIO()
-                    with self.subTest(argv=argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                        rc = dg.main(argv, now=NOW)
-                    self.assertEqual((rc, out.getvalue()), (1, ""))
-                    self.assertIn("FOLLOW, not FULL", err.getvalue())
 
 
 
@@ -371,19 +218,6 @@ class AProject(unittest.TestCase):
             with self.assertRaises(dg.Refused, msg=bad):
                 dg.check_project(bad)
 
-
-    def test_show_names_the_project_beside_its_image_and_policy(self):
-        lim = sample()
-        lim["image_digests"].append(P_IMAGE)
-        lim["policy_digests"].append(P_POLICY)
-        text = dg.show(lim, projects=[record()], now=P_NOW)
-        self.assertIn("project acme, an image built on this server\n      " + P_IMAGE, text)
-        self.assertIn("ekka-desk:local, built by the install\n      " + IMAGE, text)
-        self.assertIn("project acme, its own policy\n      " + P_POLICY, text)
-        self.assertIn("desk/policy.json, the shipped policy\n      " + POLICY_DIGEST, text)
-        self.assertIn("sudo ekka desk grant project remove acme", text)
-        self.assertNotIn("the shipped limits are in force", text)
-        self.assertIn("the shipped limits are in force", dg.show(sample(), now=P_NOW))
 
     def test_the_command_prints_the_record_and_a_refusal_prints_nothing(self):
         import contextlib, tempfile

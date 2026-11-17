@@ -2,8 +2,10 @@
 
 read-grant <agent id> <api gate>: stdin is `ekka gate grant list --json`.
 record <dest> <agent id> <api gate>: stdin is a successful `ekka desk grant show --json`, after update.
+remove-retired <backend folder>: unlink retired installer files without reading their contents.
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -14,6 +16,27 @@ from schema_check import schema_errors
 
 class Refused(Exception):
     pass
+
+
+RETIRED_FILES = ("desks-grant.extras.json", "discovery-policy.json", "discovery-composed.json")
+
+
+def remove_retired(folder, top="/", owner=0):
+    """Unlink only these names in a trusted root-owned folder; links' targets are never opened."""
+    fd = desk_records.open_folder(folder, top=top, owner=owner)
+    removed = []
+    try:
+        for name in RETIRED_FILES:
+            try:
+                os.unlink(name, dir_fd=fd)
+            except FileNotFoundError:
+                continue
+            removed.append(name)
+        if removed:
+            os.fsync(fd)
+        return removed
+    finally:
+        os.close(fd)
 
 
 def read_json(stream):
@@ -85,8 +108,12 @@ def main(argv):
             print(read_grant(read_json(sys.stdin), argv[1], argv[2]))
         elif len(argv) == 4 and argv[0] == "record":
             desk_records.write(argv[1], confirmed_limits(read_json(sys.stdin), argv[2], argv[3]))
+        elif len(argv) == 2 and argv[0] == "remove-retired":
+            removed = remove_retired(argv[1])
+            if removed:
+                print(", ".join(removed))
         else:
-            raise Refused("usage: desk_grant_cli.py read-grant <agent> <gate> | record <dest> <agent> <gate>")
+            raise Refused("usage: desk_grant_cli.py read-grant <agent> <gate> | record <dest> <agent> <gate> | remove-retired <backend folder>")
     except desk_records.NotConfirmedSaved:
         print("REFUSED: grant record replaced, but the disk did not confirm it is saved", file=sys.stderr)
         return 1
@@ -94,7 +121,7 @@ def main(argv):
         print(f"REFUSED: {error}", file=sys.stderr)
         return 1
     except (OSError, ValueError, RecursionError):
-        print("REFUSED: grant record could not be read, validated or written", file=sys.stderr)
+        print("REFUSED: grant records could not be read, validated, written or cleaned up", file=sys.stderr)
         return 1
     return 0
 

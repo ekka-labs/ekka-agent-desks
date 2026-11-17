@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import tempfile
+from pathlib import Path
 import unittest
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -72,6 +73,35 @@ def asked_before_stop_and_saved_after(text):
 
 
 class TheAdapterStateTravelsWithTheBackup(unittest.TestCase):
+    def test_state_archives_exclude_retired_files_in_both_directions(self):
+        source = read()
+        backup, restore = (re.search(pattern, source, re.S).group(0).replace("\\\n", " ") for pattern in (
+            r'    tar -C "\$DESKS_STATE" --exclude=./backups .*? -czf "\$d/desks-state.tgz" \.',
+            r'    tar -C "\$DESKS_STATE" --exclude=./backend/.*? -xzf "\$d/desks-state.tgz"'))
+        names = ("desks-grant.extras.json", "discovery-policy.json", "discovery-composed.json")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state, saved, restored = (root / name for name in ("state", "saved", "restored"))
+            for folder in (state / "backend", saved, restored):
+                folder.mkdir(parents=True)
+            for name in (*names, "baseline-policy.json"):
+                (state / "backend" / name).write_text("{}")
+            env = dict(os.environ, DESKS_STATE=str(state), d=str(saved))
+            subprocess.run(["bash", "-c", backup], env=env, check=True, capture_output=True)
+            listing = subprocess.run(["tar", "-tzf", str(saved / "desks-state.tgz")],
+                                     check=True, capture_output=True, text=True).stdout
+            self.assertIn("baseline-policy.json", listing)
+            self.assertFalse(any(name in listing for name in names))
+            # An older archive contains all three; extracting it still cannot resurrect them.
+            subprocess.run(["tar", "-C", str(state), "-czf", str(saved / "desks-state.tgz"), "."], check=True)
+            env["DESKS_STATE"] = str(restored)
+            subprocess.run(["bash", "-c", restore], env=env, check=True, capture_output=True)
+            self.assertEqual(sorted(p.name for p in (restored / "backend").iterdir()), ["baseline-policy.json"])
+        restore_body = source[source.index("  restore)"):]
+        self.assertLess(restore_body.index(restore.splitlines()[0].strip().split(" --exclude")[0]),
+                        restore_body.index("remove-retired"))
+        self.assertLess(restore_body.index("remove-retired"), restore_body.index("systemctl start ekka"))
+
     def test_a_server_with_the_adapter_saves_its_volume(self):
         r, calls = run(BACKUP_STEP)
         self.assertEqual(r.returncode, 0, r.stderr)

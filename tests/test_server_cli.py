@@ -123,11 +123,7 @@ class TheEkkaVerbEnds(unittest.TestCase):
 
 
 class TheGrantVerb(unittest.TestCase):
-    """`sudo ekka desk grant show|discovery|restore`, run as the real up.sh verb with `id` stubbed and a state folder
-    holding limits confirmed by the CLI. `discovery` is driven to its refusals and to the grant step, which fails here
-    (it needs the adapter image): an uncertain result must preserve the input for inspection."""
-
-    REF = "ghcr.io/example/project@sha256:" + "a" * 64
+    """Project add/remove use the real installer verb with local stubs and test-owned records."""
 
     def run_verb(self, d, *args):
         env = dict(os.environ, PATH=d + ":" + os.environ["PATH"], DESKS_STATE=str(Path(d, "state")))
@@ -144,31 +140,6 @@ class TheGrantVerb(unittest.TestCase):
             lim["provider_config_digests"] = {}
         (state/"backend"/"desks-grant.json").write_text(json.dumps(lim))
         return state
-
-    def test_show_restore_and_the_refusals(self):
-        with tempfile.TemporaryDirectory() as d:
-            state = self.box(d, "--provider", "github=sha256:" + "c" * 64)
-            r = self.run_verb(d, "show"); self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("no discovery window: the shipped limits", r.stdout)
-            self.assertIn(", on port 443\n  address ranges: none", r.stdout)
-            self.assertIn("PROVIDERS (the keys a desk may use)", r.stdout)
-            r = self.run_verb(d, "restore"); self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("no discovery window is open", r.stdout)
-            for args, why in (
-                    (("--image", "ghcr.io/x/y:latest", "--providers", "github"), "a tag can move; a digest cannot"),
-                    (("--image", self.REF), "--providers must name the providers"),
-                    (("--image", self.REF, "--providers", "github", "--minutes", "241"), "--minutes is a whole number from 1 to 240"),
-                    (("--image", self.REF, "--providers", "github", "--minutes", "0"), "--minutes is a whole number from 1 to 240"),
-                    (("--image", self.REF, "--providers", "Git Hub"), "is not a provider name"),
-                    (("--image", self.REF, "--providers", "github,bitbucket"), "bitbucket is not connected on this server"),
-                    (("--image", self.REF, "--policy", "/p.json"), "usage: sudo ekka desk grant discovery --image"),
-                    (("--image", self.REF, "--packs", "github"), "usage: sudo ekka desk grant discovery --image")):
-                r = self.run_verb(d, "discovery", *args)
-                self.assertEqual(r.returncode, 1, args); self.assertIn(why, r.stderr, args)
-                self.assertFalse((state/"backend"/"desks-grant.extras.json").exists(), args)
-                self.assertFalse((state/"backend"/"desks-grant.extras.json.new").exists(), args)
-            r = self.run_verb(d, "packs"); self.assertEqual(r.returncode, 1); self.assertIn("usage: sudo ekka desk grant show", r.stderr)
-            r = self.run_verb(d, "nonsense"); self.assertEqual(r.returncode, 1); self.assertIn("usage: sudo ekka desk grant", r.stderr)
 
     P_IMAGE = "sha256:" + "1" * 64
 
@@ -194,6 +165,45 @@ class TheGrantVerb(unittest.TestCase):
     def left_behind(self, state):
         folder = state/"backend"/"projects"
         return sorted(p.name for p in folder.iterdir()) if folder.exists() else []
+
+    def test_project_add_and_remove_refresh_after_changing_the_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = self.project_box(d, self.KNOWS_THE_IMAGE)
+            source = (ROOT / "up.sh").read_text()
+            verb = source[source.index("  grant)"):source.index("  desk-grant)")]
+            script = '''set -euo pipefail
+die() { echo "$*" >&2; exit 1; }
+ok() { echo "$*"; }
+profile_names() { echo github; }
+profile_source() { echo "$PWD/providers/$1.yaml"; }
+step_desk_grant() {
+  if [[ -f $DESKS_STATE/backend/projects/acme.project.json ]]; then
+    cp "$DESKS_STATE/backend/projects/acme.project.json" "$DESKS_STATE/seen.json"
+  else
+    echo removed > "$DESKS_STATE/seen-removed"
+  fi
+  echo refresh >> "$DESKS_STATE/refreshes"
+}
+enclave_home_file() { mkdir -p "$ENCLAVE_HOME/projects"; cat > "$ENCLAVE_HOME/$1"; }
+case "$1" in
+''' + verb + '\nesac\n'
+            env = dict(os.environ, PATH=d + ":" + os.environ["PATH"], DESKS_STATE=str(state),
+                       ENCLAVE_HOME=str(state / "enclave"))
+            def run(*args):
+                return subprocess.run(["bash", "-c", script, "test", "grant", "project", *args],
+                                      cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+            result = run("add", "acme", "--image", self.P_IMAGE, "--policy", str(Path(d, "own.json")))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = json.loads((state / "backend/projects/acme.project.json").read_text())
+            self.assertEqual(record["image_id"], self.P_IMAGE)
+            self.assertEqual(json.loads((state / "seen.json").read_text()), record)
+            self.assertEqual((state / "enclave/projects/acme.policy.json").read_bytes(), Path(d, "own.json").read_bytes())
+            self.assertIn("ekka desk create", result.stdout)
+            result = run("remove", "acme")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((state / "seen-removed").exists())
+            self.assertEqual(self.left_behind(state), [])
+            self.assertEqual((state / "refreshes").read_text().splitlines(), ["refresh", "refresh"])
 
     def test_project_add_refuses_before_anything_is_written(self):
         with tempfile.TemporaryDirectory() as d:
@@ -251,37 +261,6 @@ class TheGrantVerb(unittest.TestCase):
             self.assertEqual(r.returncode, 1); self.assertIn("project acme was not removed", r.stderr)
             self.assertEqual(self.left_behind(state), ["acme.policy.json", "acme.project.json"])
             self.assertEqual(json.loads((folder/"acme.project.json").read_text()), rec)
-
-    def test_show_names_a_project_the_box_holds(self):
-        with tempfile.TemporaryDirectory() as d:
-            state = self.project_box(d, self.KNOWS_THE_IMAGE)
-            folder = state/"backend"/"projects"; folder.mkdir()
-            rec = {"name": "acme", "image_id": self.P_IMAGE, "policy_digest": "sha256:" + "2" * 64, "since": "2026-11-14T12:00:00Z"}
-            (folder/"acme.project.json").write_text(json.dumps(rec))
-            r = self.run_verb(d, "show"); self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("PROJECT acme (added 2026-11-14T12:00:00Z)", r.stdout)
-
-    def test_a_failed_discovery_window_leaves_no_window_record(self):
-        with tempfile.TemporaryDirectory() as d:
-            state = self.box(d, "--provider", "github=sha256:" + "c" * 64)
-            Path(d, "docker").write_text("#!/bin/bash\nexit 1\n"); os.chmod(Path(d, "docker"), 0o755)   # no desk image here
-            r = self.run_verb(d, "discovery", "--image", self.REF, "--providers", "github")
-            self.assertEqual(r.returncode, 1, r.stdout)
-            self.assertIn("the window is not open", r.stderr)
-            self.assertFalse((state/"backend"/"desks-grant.extras.json").exists(),
-                             "a window that did not open now must never open on a later run")
-
-    def test_restore_ends_a_window_the_grant_holds_even_without_its_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            state = self.box(d)
-            lim = json.loads((state/"backend"/"desks-grant.json").read_text())
-            lim["discovery"] = {"image_digests": ["sha256:" + "a" * 64], "providers": [], "name_prefix": "discover-",
-                                "expires_at": "2026-10-16T01:00:00Z"}
-            (state/"backend"/"desks-grant.json").write_text(json.dumps(lim))
-            Path(d, "docker").write_text("#!/bin/bash\nexit 1\n"); os.chmod(Path(d, "docker"), 0o755)
-            r = self.run_verb(d, "restore")
-            self.assertNotIn("no discovery window is open", r.stdout)
-            self.assertIn("the shipped limits could not be written back", r.stderr, "it tried: the grant step ran")
 
 
 class TheRegistryAndImageVerbs(unittest.TestCase):
