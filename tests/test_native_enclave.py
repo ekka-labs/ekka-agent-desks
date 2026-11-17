@@ -177,7 +177,13 @@ class TheWrapper(unittest.TestCase):
             self.assertEqual(run(["desk", "invite", "ann", "ann@example.com"]), "up.sh invite ann ann@example.com")
             self.assertEqual(run(["desk", "revoke", "ann"]), "up.sh revoke ann")
             self.assertEqual(run(["desk", "plans", "ops-desk", "--private"]), "up.sh desk-plans ops-desk --private")
-            self.assertEqual(run(["desk", "grant", "show"]), "up.sh grant show")
+            for args in (["desk", "grant", "show"], ["desk", "grant", "show", "--json"],
+                         ["desk", "grant", "update", "--yes"]):
+                invoked = run(args)
+                self.assertTrue(invoked.startswith("runuser "))
+                self.assertTrue(invoked.endswith("/usr/local/bin/ekka " + " ".join(args)))
+            self.assertEqual(run(["desk", "grant", "restore"]), "up.sh grant restore")
+            self.assertEqual(run(["desk", "grant", "project", "remove", "acme"]), "up.sh grant project remove acme")
             self.assertEqual(run(["desk", "registry", "show"]), "up.sh registry show")
             self.assertEqual(run(["desk", "image", "pull", "r/n@sha256:" + "a" * 64]), "up.sh image pull r/n@sha256:" + "a" * 64)
             self.assertEqual(run(["desk", "grant", "discovery", "--image", "r@sha256:" + "a" * 64, "--providers", "github"]),

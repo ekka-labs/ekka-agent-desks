@@ -73,9 +73,9 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
         self.assertIn("upgrade together", r.stderr)
 
     def test_the_named_release_or_newer_installs(self):
-        for have in ("0.6.8", "0.6.9"):
+        for have in ("0.6.10", "0.6.11"):
             with self.subTest(have=have):
-                r = self.run_gate(have, "0.6.8")
+                r = self.run_gate(have, "0.6.10")
                 self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_no_named_release_refuses_every_install(self):
@@ -93,8 +93,8 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
             text = f.read()
         floor = re.search(r"^DESK_ADMIN_MIN_EKKA=(\S*)$", text, re.M).group(1)
         default = re.search(r"retained \"\$DESKS_STATE\" EKKA_VERSION (\S+?)\)\}$", text, re.M).group(1)
-        self.assertEqual(floor, "0.6.8", "the first runner using only the two general desk plans")
-        self.assertEqual(default, "0.6.9")
+        self.assertEqual(floor, "0.6.10", "the first runner with desk grant update")
+        self.assertEqual(default, "0.6.10")
         self.assertEqual(gate(default, floor), 0, f"the default {default} is older than the floor {floor}")
         self.assertEqual(self.run_gate(default, floor).returncode, 0)
 
@@ -131,8 +131,8 @@ class UpShRefusesAnOlderEnclave(unittest.TestCase):
         r = bash(f"{script}unset EKKA_VERSION; {pick}\nrelease_gate")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("this machine runs 0.6.7", r.stderr)
-        self.assertIn("run again with EKKA_VERSION=0.6.8", r.stderr)
-        self.assertEqual(bash(f"{script}EKKA_VERSION=0.6.8; {pick}\nrelease_gate").returncode, 0)
+        self.assertIn("run again with EKKA_VERSION=0.6.10", r.stderr)
+        self.assertEqual(bash(f"{script}EKKA_VERSION=0.6.10; {pick}\nrelease_gate").returncode, 0)
         shutil.rmtree(state)
 
 
@@ -156,20 +156,20 @@ class KeepInstalledNewerRelease(unittest.TestCase):
             return result.stdout.strip()
 
     def test_fresh_default_and_retained_versions(self):
-        self.assertEqual(self.select(''), '0.6.9')
-        self.assertEqual(self.select('', retained='0.6.8'), '0.6.8')
+        self.assertEqual(self.select(''), '0.6.10')
+        self.assertEqual(self.select('', retained='0.6.10'), '0.6.10')
         self.assertEqual(self.select('0.6.9', retained='0.6.10'), '0.6.10')
 
     def test_existing_runner_never_downgrades_for_implicit_version(self):
-        for have in ('0.6.9', '0.6.10', '0.7.0', '1.0.0'):
-            for retained in (None, '0.6.8', '0.6.9'):
+        for have in ('0.6.11', '0.6.12', '0.7.0', '1.0.0'):
+            for retained in (None, '0.6.10', '0.6.11'):
                 with self.subTest(have=have, retained=retained):
                     self.assertEqual(self.select(have, retained), have)
         self.assertEqual(self.select('0.7.0', allow_downgrade=True), '0.7.0')
 
     def test_preserved_newer_runner_never_downloads_the_default(self):
         script = STUBS + """
-EKKA_VERSION=0.6.9; EKKA_VERSION_EXPLICIT=; SNAPSHOT=/unused
+EKKA_VERSION=0.6.11; EKKA_VERSION_EXPLICIT=; SNAPSHOT=/unused
 installed_enclave_version() { echo 0.7.0; }
 curl() { echo UNEXPECTED_DOWNLOAD; return 1; }
 render() { :; }
@@ -180,8 +180,8 @@ render() { :; }
         self.assertIn('ekka 0.7.0 at /usr/local/bin/ekka', result.stdout)
 
     def test_explicit_older_request_is_left_for_installers_downgrade_gate(self):
-        self.assertEqual(self.select('0.7.0', explicit='0.6.9'), '0.6.9')
-        self.assertEqual(self.select('0.7.0', explicit='0.6.9', allow_downgrade=True), '0.6.9')
+        self.assertEqual(self.select('0.7.0', explicit='0.6.11'), '0.6.11')
+        self.assertEqual(self.select('0.7.0', explicit='0.6.11', allow_downgrade=True), '0.6.11')
         fn = up_function('step_enclave_install')
         self.assertIn('[[ ${EKKA_ALLOW_DOWNGRADE:-} == 1 ]] && downgrade=(--allow-downgrade)', fn)
 
@@ -205,7 +205,7 @@ class TheAdapterIsOnAtItsPinnedImage(unittest.TestCase):
             os.makedirs(os.path.join(state, "backend"))
             open(os.path.join(state, "backend", "config.json"), "w").close()
         script = STUBS + f"""
-DESKS_STATE={state}; MODE=server; NAME=desks.example.test; EKKA_VERSION=0.6.8; EKKA_ENV=prod
+DESKS_STATE={state}; MODE=server; NAME=desks.example.test; EKKA_VERSION=0.6.10; EKKA_ENV=prod
 OPENSHELL_TELEMETRY=off
 ip() {{ echo "1.1.1.1 via 192.0.2.1 dev eth0 src 192.0.2.10"; }}
 stat() {{ echo 999; }}

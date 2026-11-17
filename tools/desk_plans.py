@@ -13,7 +13,7 @@ Writes <out-dir>/plan-setup-<desk>.json and <out-dir>/plan-ask-<desk>.json, and 
     python3 tools/desk_plans.py --admin <api gate> <out-dir> [<agent id>]
 
 The two desk administration plans of an organization, ekka.desk.read.v1 and ekka.desk.write.v1,
-serve every adapter operation in runner 0.6.8 or newer. Each plan is one call through the Enclave's API gate
+serve every adapter operation in runner 0.6.10 or newer. Each plan is one call through the Enclave's API gate
 to the backend adapter on `apis/desks`, may be run only by an organization admin, and reads two facts from
 the adapter's answer: `outcome` and `desk_ready`. Both take the route as a whole input; the write also takes
 the whole request and its body hash. One pair serves every desk.

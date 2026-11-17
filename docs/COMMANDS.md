@@ -124,7 +124,10 @@ Read the file before running this command; `--yes` confirms the change without a
 
 ### Onboarding a project: the discovery window
 
-The desks grant allows the install's one image and one policy, plus those of each project added to it (below). To learn what a new project's build needs, the server's administrator
+The desks grant allows the install's one image and one policy, plus those of each project added to it (below).
+The installer writes the input records, ensures plain API read access, and calls `ekka desk grant update --yes`
+(EKKA 0.6.10 or newer) to build and apply the limits. It confirms and saves the CLI's `keep` answer;
+see [Updating the desks grant](OPERATIONS.md#updating-the-desks-grant). To learn what a new project's build needs, the server's administrator
 opens a window for ONE disposable desk, created from the project's own image with the shipped policy. While the window
 is open, the backend adapter may switch that desk, and only that desk, to NVIDIA OpenShell's auto approval mode: the
 build's network requests are approved as they arrive, except those OpenShell holds as risky, and every one is recorded.
@@ -139,7 +142,7 @@ or port is added for the window.
 | `sudo ekka desk registry show`, `sudo ekka desk registry logout <host>` | The registries with a kept credential; forget one. |
 | `sudo ekka desk image pull <registry>/<name>@sha256:<64 hex> [--signed-by <identity> --issuer <url>]` | The project image onto this machine, by digest, through a throwaway Docker login that is deleted after; with `--signed-by`, cosign checks the signature first. |
 | `sudo ekka desk grant discovery --image <registry>/<name>@sha256:<64 hex> --providers <provider>,<provider> [--minutes 60]` | Opens the window: adds that image to the grant and writes the grant's `discovery` block (that image, those providers, desks named `discover-*`, the time it closes). Open for 60 minutes unless `--minutes` says otherwise, at most 240. Each provider must already be connected. |
-| `sudo ekka desk grant show` | The limits in force: images, policies, ports, address ranges, and whether a window is open, for which image and providers, and until when. |
+| `sudo ekka desk grant show` | The CLI reads live facts and previews the update. `sudo ./up.sh grant show` displays the last confirmed local limits: images, policies, ports, address ranges, and whether a window is open, for which image and providers, and until when. |
 | `sudo ekka desk grant restore` | Ends the window: the discovery block and the window's image leave the grant, and the shipped limits are written back. Run it when the discovery desk is deleted, or after the window has closed by itself. |
 
 ### A project's own desk: its image and its policy
