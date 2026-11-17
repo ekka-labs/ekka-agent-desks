@@ -517,11 +517,17 @@ This deletes your desks, the keys you connected, the sign-in accounts and the En
 ```sh
 sudo -i
 ekka enclave list                                   # note this machine's Enclave id
+ekka enclave revoke <id>                            # removes it from your EKKA organization; do this FIRST
 systemctl disable --now ekka-desks ekka             # the stack, then the Enclave
-cd /usr/local/lib/ekka-desks/deploy && ./setup.sh compose down -v   # every container and volume
+docker rm -f $(docker ps -aq --filter label=openshell.ai/managed-by=openshell)          # each desk's container
+docker volume rm $(docker volume ls -q --filter label=openshell.ai/managed-by=openshell)   # each desk's volumes
+cd /usr/local/lib/ekka-desks/deploy && ./setup.sh compose down -v   # the stack's containers and volumes
 rm -rf /var/lib/ekka-agent-desks /var/lib/ekka/.ekka
-ekka enclave revoke <id>                            # removes it from your EKKA organization
 ```
+
+The order matters. `ekka enclave revoke` needs the sign-in that the last line deletes, so it runs first. The desks'
+own containers and volumes do not belong to the stack, so `compose down -v` leaves them: remove them by their label.
+If the server has no desk, the two `docker` lines print a usage error and change nothing.
 
 ## Backup and restore
 
