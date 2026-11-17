@@ -12,7 +12,7 @@
 # Safe to run again: Docker is restarted only when its settings change, and never while desks exist unless
 # ALLOW_DOCKER_RESTART=yes. The firewall change rolls itself back after 5 minutes unless you confirm from a
 # NEW SSH session:  sudo touch /var/lib/desks-harden/confirmed
-# so a wrong ALLOW_FROM can never lock you out.
+# restoring the previous firewall rules and UFW's previous active/inactive state if you do not confirm.
 set -euo pipefail
 ALLOW_FROM=${ALLOW_FROM:?set ALLOW_FROM to the addresses that may connect}
 ADMIN_USER=${ADMIN_USER:-${SUDO_USER:-}}
@@ -81,7 +81,7 @@ start_docker_user() {  # (re)apply the Docker port firewall: RESTART, since `ena
 }
 docker_user_script() {  # the Docker port firewall for $ALLOW_FROM, as the script desks-docker-user.service runs
   # The chain is replaced in ONE step (iptables-restore), so no moment passes with it empty: flushing it and then
-  # appending left published ports open to anyone until the final DROP (review of ekka-labs/ekka-agent-desks#1).
+  # appending left published ports open to anyone until the final DROP.
   cat <<EOF
 #!/bin/sh
 # Only $ALLOW_FROM may reach a published container port from outside; replies and container-to-container pass.
@@ -107,6 +107,9 @@ EOF
 [[ -s /home/$ADMIN_USER/.ssh/authorized_keys ]] || die "$ADMIN_USER has no SSH key; add one before passwords are turned off"
 for a in $ALLOW_FROM; do [[ $a =~ ^[0-9a-fA-F:.]+(/[0-9]+)?$ ]] || die "not an address: $a"; done
 install -d -m 0700 "$STATE"
+# One hardening run at a time: its confirmation marker belongs to one firewall snapshot.
+exec 9>"$STATE/lock"
+flock -n 9 || die "another hardening run is still running"
 
 say "this machine"
 abi=$(python3 -c 'import ctypes; print(ctypes.CDLL(None, use_errno=True).syscall(444, None, 0, 1))')
@@ -207,6 +210,11 @@ augenrules --load >/dev/null || die "the audit rules did not load"
 ok "journal kept across reboots (2 GB); audit on SSH, sudo, docker and the desks secrets"
 
 say "firewall: only $ALLOW_FROM"
+exec 8>"$STATE/firewall.lock"
+flock 8
+bash "$(dirname "$0")/firewall-state.sh" prepare "$STATE" \
+  || die "firewall recovery could not be prepared; no firewall rules were changed"
+rm -f "$STATE/rolled-back"
 ufw --force reset >/dev/null
 ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
 for a in $ALLOW_FROM; do for p in 22 443 8080; do ufw allow from "$a" to any port "$p" proto tcp >/dev/null; done; done
@@ -227,13 +235,10 @@ RemainAfterExit=yes
 WantedBy=docker.service multi-user.target
 EOF
 systemctl daemon-reload
-rm -f "$STATE/confirmed"
-# The rollback: unless confirmed from a new session within 5 minutes, the firewall turns itself off.
-systemd-run --quiet --unit=desks-harden-rollback --on-active=300 /bin/sh -c \
-  "[ -f $STATE/confirmed ] || { ufw --force disable; iptables -F DOCKER-USER 2>/dev/null; logger -t desks-harden firewall rolled back, not confirmed; }" || true
 ufw --force enable >/dev/null
 command -v docker >/dev/null && start_docker_user 2>/dev/null || true   # first install: Docker comes below
-ok "on. From a NEW SSH session within 5 minutes: sudo touch $STATE/confirmed   (else it rolls back)"
+flock -u 8
+ok "on. From a NEW SSH session within 5 minutes: sudo touch $STATE/confirmed   (else the saved firewall state is restored)"
 
 say "Docker"
 if ! command -v docker >/dev/null; then
@@ -249,7 +254,10 @@ command -v docker >/dev/null || die "Docker is not installed after the install s
 install -d /etc/docker
 apply_docker_settings /etc/docker/daemon.json '{ "live-restore": true,
   "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "3" } }'
+flock 8
+[[ ! -f $STATE/rolled-back ]] || die "the firewall confirmation expired; check journalctl -u desks-harden-rollback before correcting ALLOW_FROM and running again"
 start_docker_user
+flock -u 8
 ok "$(docker --version | cut -d, -f1); containers keep running through a Docker restart; logs capped"
 ok "docker group is root-equivalent: only $ADMIN_USER belongs in it"
 

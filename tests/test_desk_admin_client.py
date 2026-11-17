@@ -209,6 +209,25 @@ connect_desk_admin
                 with open(os.path.join(root, f), errors="ignore") as fh:
                     self.assertNotIn(SECRET, fh.read(), f"the secret is on disk in {f}")
 
+    def test_python_writer_finishes_when_connect_returns_without_reading(self):
+        for result in (0, 1):
+            with self.subTest(result=result):
+                script = f"""
+set -euo pipefail
+ok() {{ :; }}
+die() {{ echo "$*" >&2; exit 1; }}
+kc() {{ python3 -c 'import sys; sys.stdout.write("example-credential" * 100000); sys.stdout.flush()'; }}
+ekka_in() {{ echo "connect returned" >&2; return {result}; }}
+{up_function("connect_desk_admin")}
+connect_desk_admin
+"""
+                r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, result, r.stderr)
+                self.assertNotIn("BrokenPipeError", r.stderr)
+                self.assertNotIn("example-credential", r.stdout + r.stderr)
+                if result:
+                    self.assertIn("connect returned", r.stderr)
+
     def test_a_failure_anywhere_in_the_pipe_stops_the_install(self):
         r, _, _, _ = self.run_it(kc_rc=1)
         self.assertNotEqual(r.returncode, 0)
@@ -225,19 +244,22 @@ class ReconnectOnWiderPaths(unittest.TestCase):
     changed; when the paths are the ONLY difference the installer disconnects and connects again, on purpose. Any
     other difference still stops the install, and nothing is disconnected."""
 
-    def run_it(self, what, disconnect_rc=0, second_rc=0):
+    def run_it(self, what, disconnect_rc=0, second_rc=0, early=False):
         state, seen = tempfile.mkdtemp(), tempfile.mkdtemp()
         os.makedirs(os.path.join(state, "deploy"))
         refusal = REFUSED.format(what=what)
+        writer = ("python3 -c 'import sys; sys.stdout.write(\"example-credential\" * 100000); sys.stdout.flush()'"
+                  if early else "printf '%s' \"$KC_SECRET\"")
         script = f"""
 set -euo pipefail
 DESKS_STATE={state}
 ok() {{ echo "ok: $*"; }}
 die() {{ echo "die: $*" >&2; exit 1; }}
-kc() {{ printf '%s' "$KC_SECRET"; }}
+kc() {{ {writer}; }}
 ekka_in() {{
   local n; n=$(( $(cat {seen}/n 2>/dev/null || echo 0) + 1 )); echo $n > {seen}/n
-  printf '%s\\n' "$*" >> {seen}/calls; cat > {seen}/stdin.$n
+  printf '%s\\n' "$*" >> {seen}/calls
+  [[ {int(early)} == 1 ]] || cat > {seen}/stdin.$n
   case "$1 $2" in
     "api disconnect") [[ {disconnect_rc} == 0 ]] || echo "planted: the documentation could not be removed" >&2; return {disconnect_rc} ;;
     "api connect") if [[ $n == 1 ]]; then printf '%s' "$REFUSAL" >&2; return 1; fi; return {second_rc} ;;
@@ -263,6 +285,14 @@ connect_desk_admin
         self.assertEqual([s for s in stdins if s], [SECRET, SECRET], "the secret through stdin, both connects")
         self.assertNotIn(SECRET, "".join(calls) + r.stdout + r.stderr)
         self.assertIn("reconnected with the paths", r.stdout)
+
+    def test_both_connect_attempts_can_return_before_reading_the_python_writer(self):
+        for result in (0, 1):
+            r, calls, _ = self.run_it("the paths it may reach", second_rc=result, early=True)
+            self.assertEqual(r.returncode, result, r.stderr)
+            self.assertEqual(len(calls), 3)
+            self.assertNotIn("BrokenPipeError", r.stderr)
+            self.assertNotIn("example-credential", r.stdout + r.stderr)
 
     def test_any_other_difference_stops_the_install_and_disconnects_nothing(self):
         for what in ("the destination (unix:/a -> unix:/b)", "how it authenticates",

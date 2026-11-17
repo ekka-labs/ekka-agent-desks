@@ -11,7 +11,7 @@
     "operations": [
       {
         "id": "ask",
-        "display_name": "The agent answers on the {{desk}} desk; read it on the installed machine with: sudo ./up.sh ekka run show <run id>",
+        "display_name": "The agent answers on the {{desk}} desk; read it as root on the server with: ekka run show <run id>",
         "execution": {
           "preferred": {
             "mode": "async",

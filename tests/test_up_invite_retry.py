@@ -2,8 +2,7 @@
 
 An invite makes the person's sign-in account in Keycloak, then adds them to the desk workspace. When the second step
 failed, the installer said "run invite again", but the rerun stopped at once with "invited already", because the
-one-time password file was kept; and Keycloak refuses a second account for the same name (review of
-ekka-labs/ekka-agent-desks#1). A rerun now looks the account up (`apply_realm.py person-id`), reads the workspace,
+one-time password file was kept; and Keycloak refuses a second account for the same name. A rerun now looks the account up (`apply_realm.py person-id`), reads the workspace,
 and adds the person if it does not hold them. Someone fully invited is still refused, as before.
 """
 import json

@@ -210,7 +210,7 @@ class DockerIsRestartedOnlyOnAChangeAndNeverUnderDesks(unittest.TestCase):
 class TheDockerPortFirewallIsReappliedOnARerun(unittest.TestCase):
     """desks-docker-user.service is a oneshot unit with RemainAfterExit=yes. `systemctl enable --now` starts it only
     when it is not already active, so a rerun with fewer allowed addresses kept the old ones in DOCKER-USER: a
-    removed address still reached published container ports (review of ekka-labs/ekka-agent-desks#1)."""
+    removed address still reached published container ports."""
 
     def test_the_unit_is_restarted_so_the_rewritten_rules_apply(self):
         rc, out, calls, _ = run_harden("start_docker_user")
@@ -260,7 +260,7 @@ def run_firewall(allow_from, route="default via 10.0.0.1 dev eth0 proto dhcp", t
 
 class TheDockerPortFirewallIsReplacedInOneStep(unittest.TestCase):
     """Flushing DOCKER-USER and then appending left published container ports open to anyone until the final DROP,
-    on every rerun (review of ekka-labs/ekka-agent-desks#1). The chain is now replaced in one iptables-restore."""
+    on every rerun. The chain is now replaced in one iptables-restore."""
 
     def test_the_chain_is_replaced_in_one_restore_with_drop_last(self):
         rc, calls, fed, _ = run_firewall("203.0.113.7 198.51.100.0/24 2001:db8::1")
@@ -408,3 +408,140 @@ exit 0'''
         self.assertNotEqual(rc, 0)
         self.assertIn("could not hold docker-ce", out)
         self.assertFalse(any(c.startswith("apt-get") and "upgrade" in c for c in calls), calls)
+
+
+class FirewallRecovery(unittest.TestCase):
+    """Run the shipped snapshot/restore helper against temporary files and stub firewall/systemd commands."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for directory in ('etc/ufw', 'etc/default', 'etc/systemd/system', 'usr/local/sbin', 'state', 'bin'):
+            (self.root / directory).mkdir(parents=True, exist_ok=True)
+        self.saved_files = {
+            'etc/ufw/user.rules': 'old IPv4 rules\n',
+            'etc/ufw/user6.rules': 'old IPv6 rules\n',
+            'etc/ufw/before.rules': 'old before rules\n',
+            'etc/ufw/ufw.conf': 'ENABLED=yes\n',
+            'etc/default/ufw': 'DEFAULT_INPUT_POLICY="DROP"\n',
+            'usr/local/sbin/desks-docker-user': '#!/bin/sh\n# original writer\n',
+            'etc/systemd/system/desks-docker-user.service': '# original unit\n',
+        }
+        for path, value in self.saved_files.items():
+            (self.root / path).write_text(value)
+        (self.root / 'status').write_text('Status: active\n')
+        (self.root / 'filter').write_text(
+            '*filter\n:INPUT ACCEPT [0:0]\n:DOCKER-USER - [0:0]\n'
+            '-A INPUT -j ACCEPT\n-A DOCKER-USER -s 198.51.100.7/32 -j RETURN\n'
+            '-A DOCKER-USER -j DROP\nCOMMIT\n')
+        source = Path(ROOT, 'deploy/firewall-state.sh').read_text()
+        # Every filesystem write is redirected before execution; firewall commands are all stubs.
+        for path in ('/etc/', '/usr/local/'):
+            source = source.replace(path, str(self.root) + path)
+        self.helper = self.root / 'helper.sh'
+        self.helper.write_text(source)
+        stubs = {
+            'ufw': '''if [[ $1 == status ]]; then cat "$TEST_ROOT/status"; exit; fi
+exit 0''',
+            'iptables-save': '''[[ ${SAVE_FAILS:-0} == 0 ]] || exit 1
+cat "$TEST_ROOT/filter"''',
+            'iptables-restore': 'cat > "$TEST_ROOT/restored-rules"',
+            'systemctl': '''case "$1" in
+is-active) [[ ${!#} != desks-harden-rollback.timer && ${SERVICE_ACTIVE:-1} == 1 ]] ;;
+is-enabled) [[ ${SERVICE_ENABLED:-1} == 1 ]] ;;
+*) exit 0 ;;
+esac''',
+            'systemd-run': '''[[ ${SCHEDULE_FAILS:-0} == 0 ]] || exit 1
+printf '%s\\n' "$@" > "$TEST_ROOT/scheduled"''',
+            'logger': 'exit 0',
+            'flock': 'exit 0',
+        }
+        for name, body in stubs.items():
+            path = self.root / 'bin' / name
+            path.write_text(f'#!/bin/bash\necho "{name} $*" >> "$TEST_ROOT/calls"\n{body}\n')
+            path.chmod(0o755)
+        self.env = dict(os.environ, TEST_ROOT=str(self.root),
+                        PATH=str(self.root / 'bin') + os.pathsep + os.environ['PATH'])
+
+    def call(self, mode, **env):
+        args = ['bash', str(self.helper), mode, str(self.root / 'state')]
+        if mode == 'restore':
+            # Run exactly the copied helper and arguments handed to systemd-run.
+            scheduled = (self.root / 'scheduled').read_text().splitlines()
+            args = scheduled[scheduled.index('/bin/bash'):]
+        return subprocess.run(args, env=dict(self.env, **env), capture_output=True, text=True, timeout=30)
+
+    def calls(self):
+        return (self.root / 'calls').read_text().splitlines()
+
+    def test_unconfirmed_restores_active_and_inactive_ufw_and_only_the_saved_docker_chain(self):
+        for active in (True, False):
+            with self.subTest(active=active):
+                (self.root / 'status').write_text('Status: ' + ('active' if active else 'inactive') + '\n')
+                r = self.call('prepare')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn('--on-active=300', (self.root / 'scheduled').read_text())
+                self.assertIn('--timer-property=RemainAfterElapse=no', (self.root / 'scheduled').read_text())
+                for path in self.saved_files:
+                    (self.root / path).write_text('new configuration\n')
+                (self.root / 'calls').write_text('')
+                r = self.call('restore')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for path, value in self.saved_files.items():
+                    self.assertEqual((self.root / path).read_text(), value, path)
+                self.assertIn('ufw --force ' + ('enable' if active else 'disable'), self.calls())
+                self.assertNotIn('ufw --force ' + ('disable' if active else 'enable'), self.calls())
+                self.assertIn('systemctl enable desks-docker-user.service', self.calls())
+                self.assertIn('systemctl start desks-docker-user.service', self.calls())
+                self.assertEqual((self.root / 'restored-rules').read_text(),
+                                 '*filter\n:DOCKER-USER - [0:0]\n'
+                                 '-A DOCKER-USER -s 198.51.100.7/32 -j RETURN\n'
+                                 '-A DOCKER-USER -j DROP\nCOMMIT\n')
+                self.assertIn('iptables-restore --noflush', self.calls())
+
+    def test_confirmed_leaves_new_rules_alone(self):
+        self.assertEqual(self.call('prepare').returncode, 0)
+        (self.root / 'state/confirmed').touch()
+        (self.root / 'calls').write_text('')
+        self.assertEqual(self.call('restore').returncode, 0)
+        self.assertEqual(self.calls(), ['flock 8'])
+
+    def test_fresh_install_removes_new_persistent_writer_and_restores_empty_chain(self):
+        for path in ('usr/local/sbin/desks-docker-user', 'etc/systemd/system/desks-docker-user.service'):
+            (self.root / path).unlink()
+        (self.root / 'filter').write_text('*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n')
+        self.assertEqual(self.call('prepare', SERVICE_ACTIVE='0', SERVICE_ENABLED='0').returncode, 0)
+        for path in ('usr/local/sbin/desks-docker-user', 'etc/systemd/system/desks-docker-user.service'):
+            (self.root / path).write_text('new writer\n')
+        self.assertEqual(self.call('restore').returncode, 0)
+        self.assertFalse((self.root / 'usr/local/sbin/desks-docker-user').exists())
+        self.assertFalse((self.root / 'etc/systemd/system/desks-docker-user.service').exists())
+        self.assertEqual((self.root / 'restored-rules').read_text(), '*filter\n:DOCKER-USER - [0:0]\nCOMMIT\n')
+        self.assertNotIn('systemctl enable desks-docker-user.service', self.calls())
+
+    def test_snapshot_or_scheduling_failure_changes_no_firewall_state(self):
+        for env in ({'SAVE_FAILS': '1'}, {'SCHEDULE_FAILS': '1'}):
+            with self.subTest(env=env):
+                r = self.call('prepare', **env)
+                self.assertNotEqual(r.returncode, 0)
+                if 'SCHEDULE_FAILS' in env:
+                    self.assertIn('could not schedule the 5-minute firewall rollback', r.stderr)
+                self.assertFalse((self.root / 'scheduled').exists())
+                self.assertFalse((self.root / 'restored-rules').exists())
+                for path, value in self.saved_files.items():
+                    self.assertEqual((self.root / path).read_text(), value)
+                self.assertFalse(any(c.startswith('ufw --force') for c in self.calls()))
+
+    def test_harden_stops_before_reset_if_recovery_cannot_be_prepared(self):
+        text = harden()
+        section = text.split('say "firewall: only $ALLOW_FROM"\n', 1)[1].split('ufw --force reset', 1)[0]
+        script = ('set -euo pipefail\nSTATE=' + shlex_quote(str(self.root / 'state')) + '\n'
+                  'flock() { :; }\nbash() { return 1; }\ndie() { echo "$*" >&2; exit 1; }\n'
+                  + section + '\necho MUTATED\n')
+        r = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('no firewall rules were changed', r.stderr)
+        self.assertNotIn('MUTATED', r.stdout)

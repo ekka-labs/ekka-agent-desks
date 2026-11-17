@@ -69,7 +69,7 @@ It does this:
 | The journal kept across reboots (2 GB), audit on SSH settings, sudo, Docker and the desks secrets | a record of who changed what |
 | Docker from Docker's own packages, live restore enabled, logs capped | logs cannot fill the disk; plan Engine updates using [Docker Engine maintenance](OPERATIONS.md#docker-engine-maintenance) |
 
-**Confirm access from a second SSH session.** The host firewall change has a 5-minute rollback unless you confirm:
+**Confirm access from a second SSH session.** Before changing the firewall, harden saves UFW's rules and active/inactive state and the Docker port rules and their service configuration; if scheduling recovery fails, it stops without changing the firewall. After 5 minutes, it restores that saved state unless you confirm:
 
 ```sh
 sudo touch /var/lib/desks-harden/confirmed
@@ -185,7 +185,6 @@ Their browser trusts the sign-in page's certificate, once, for websites under yo
 |---|---|---|
 | macOS | `security add-trusted-cert -r trustRoot -p ssl -s <server name> -k ~/Library/Keychains/login.keychain-db desks-ca.pem` | `security remove-trusted-cert desks-ca.pem` |
 | Linux, Chrome and Chromium | `certutil -d sql:$HOME/.pki/nssdb -A -t C,, -n "EKKA desks CA (<server name>)" -i desks-ca.pem` (`certutil` is in `libnss3-tools`) | `certutil -d sql:$HOME/.pki/nssdb -D -n "EKKA desks CA (<server name>)"` |
-| Windows (administrator) | `certutil -addstore -f Root desks-ca.pem` | `certutil -delstore Root "EKKA desks CA (<server name>)"` |
 
 `install.sh` prints the right one for the computer it runs on, with the CA's SHA-256 fingerprint, and runs
 nothing; `./trust-ca.sh --all` in the bundle prints both. Read people the fingerprint `ekka desk invite` shows, so they
@@ -195,8 +194,9 @@ The trust is as narrow as each system allows: websites only, the server's name o
 constraint names DNS names and IP addresses alone, so a CA trusted for every purpose (the old
 `sudo security add-trusted-cert -d ... System.keychain`) would also let anyone holding the server's CA key sign
 software or mail that computer trusts. On Linux, Chrome and Firefox do not read the system store, so
-`update-ca-certificates` needed root for the whole machine and still left the warning. The Windows command still
-trusts for every purpose; narrowing it is its own change.
+`update-ca-certificates` needed root for the whole machine and still left the warning.
+
+A restricted Windows trust procedure is not provided yet; meanwhile, use the documented setup on a macOS or Linux computer.
 
 Then they sign in:
 
@@ -232,6 +232,8 @@ sudo -i
 ekka desk login
 ekka desk create code-desk --provider claude-code
 ```
+
+Wait until `ekka desk list` shows the desk as pinned, about a minute or two, and run the setup plan again if the first clone fails with a certificate message.
 
 **Who can change a desk.** In this release every desk change (create, delete, stop, start, policy, allow, deny, disconnect) runs here, through the Enclave, as `ekka desk <command>`. It runs under the EKKA sign-in of the person who installed the server, whoever types it, so only people with sudo on this server can change a desk. A person's `ekka` on their own computer reads desks and is refused for changes ([Change a desk](OPERATIONS.md#change-a-desk)).
 
