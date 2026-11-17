@@ -147,6 +147,27 @@ class TheComposeWrapper(unittest.TestCase):
         self.assert_refused(*self.run_wrapper(state(profile=None, config=None), ("up", "-d"),
                                               {"COMPOSE_PROFILES": "desk-admin"}))
 
+    # Found in review: other ways to start the adapter with its profile off in up.env.
+    def test_planted_a_wildcard_profile_or_an_override_is_still_checked(self):
+        for args, env in ((("--profile", "*", "up"), {}), (("--profile=*", "up"), {}),
+                          (("up",), {"COMPOSE_PROFILES": "*"}),
+                          (("up",), {"COMPOSE_PROFILES": "other,*"}),
+                          (("--env-file", "other.env", "up"), {}),
+                          (("--env-file=other.env", "up"), {}),
+                          (("-f", "compose.yml", "up"), {}),
+                          (("-fcompose.yml", "up"), {}),
+                          (("--file=compose.yml", "up"), {}),
+                          (("--project-directory", ".", "up"), {}),
+                          (("scale", "ekka-backend=1"), {}),
+                          (("unpause", "ekka-backend"), {}),
+                          (("watch", "ekka-backend"), {})):
+            with self.subTest(args=args, env=env):
+                self.assert_refused(*self.run_wrapper(state(profile=None, baseline=None), args, env))
+
+    def test_planted_a_wildcard_profile_in_the_saved_settings_is_checked(self):
+        self.assertEqual(bp.main([state(profile="*", baseline=None)]), 1)
+        self.assert_refused(*self.run_wrapper(state(profile="*", baseline=None), ("unpause",)))
+
     def test_a_command_that_starts_nothing_is_not_checked(self):
         _, calls = self.run_wrapper(state(config=None), ("exec", "ekka-enclave", "true"))
         self.assertIn("exec", calls, "exec starts nothing, so it went straight to docker")

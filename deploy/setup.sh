@@ -14,7 +14,7 @@
 #   setup.sh supervisor                      the desks' supervisor binary from the pinned image (again after a pin bump)
 #   setup.sh preflight                       refuse, by name, a gateway that could hand credentials out
 #   setup.sh compose <args...>               docker compose with this setup's settings loaded (ps, logs, down, ...);
-#                                            up, start, restart, create and run first pass the gateway preflight
+#                                            commands that can start a service first pass both preflights
 #
 # Nothing here prints a secret. Secrets move on stdin or stay in files that are mode 0600.
 set -euo pipefail
@@ -85,9 +85,16 @@ compose_starts() {
       *) sub=$a; break ;;
     esac
   done
-  case $sub in up|start|restart|create|run) ;; *) return 0 ;; esac
-  for a in "$@"; do case $a in ekka-backend|desk-admin|--profile=desk-admin) always=--always ;; esac; done
-  [[ ,${COMPOSE_PROFILES:-}, == *,desk-admin,* ]] && always=--always
+  case $sub in up|start|restart|create|run|unpause|scale|watch) ;; *) return 0 ;; esac
+  # `*` turns every profile on. Another compose file, env file or project folder can turn the adapter on too, so a
+  # caller who overrides one of those gets the adapter's check even when up.env leaves its profile off.
+  for a in "$@"; do
+    case $a in
+      ekka-backend|ekka-backend=*|desk-admin|'*'|--profile=desk-admin|'--profile=*') always=--always ;;
+      --env-file|--env-file=*|-f|-f?*|--file|--file=*|--project-directory|--project-directory=*) always=--always ;;
+    esac
+  done
+  case ,${COMPOSE_PROFILES:-}, in *,desk-admin,*|*,'*',*) always=--always ;; esac
   backend_preflight $always
   gateway_preflight
 }
