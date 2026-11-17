@@ -908,14 +908,134 @@ class AProject(unittest.TestCase):
     def test_two_runs_with_the_same_project_change_nothing(self):
         self.assertEqual(dg.canonical(build(projects=[record()])), dg.canonical(build(projects=[record()])))
 
-    def test_a_policy_with_other_file_rules_user_or_landlock_is_refused(self):
-        for part, value in (("filesystem", {"includeWorkdir": True, "readOnly": ["/"], "readWrite": ["/"]}),
-                            ("filesystem", None),
-                            ("process", {"runAsUser": "0", "runAsGroup": "0"}),
-                            ("landlock", {"compatibility": "best_effort"})):
-            with self.assertRaises(dg.Refused, msg=part) as c:
-                dg.project("acme", P_IMAGE, P_POLICY, project_policy(**{part: value}), POLICY, dg.profile_hosts(), P_NOW)
-            self.assertIn(f"changes `{part}`", str(c.exception))
+    def test_project_policy_floors_refuse_each_attack_by_name(self):
+        cases = []
+
+        def case(label, section, value, why):
+            mine = project_policy()
+            mine[section] = value
+            cases.append((label, mine, why))
+
+        def filesystem_case(label, key, value, why):
+            fs = copy.deepcopy(POLICY["filesystem"])
+            fs[key] = value
+            case(label, "filesystem", fs, why)
+
+        for key in ("readOnly", "readWrite"):
+            for value in (None, "/tmp", {}, [1], [None], [True], [[]], [{}]):
+                filesystem_case(repr(value), key, value, f"filesystem.{key} must be a list of strings")
+            for path, why in (("relative", "absolute"), ("", "absolute"),
+                              ("/tmp/../etc", "normalized"), ("//etc", "normalized"),
+                              ("/tmp/./file", "normalized"), ("/tmp//file", "normalized"),
+                              ("/tmp/file/", "normalized"), ("/tmp/*", "glob or wildcard"),
+                              ("/tmp/?", "glob or wildcard"), ("/tmp/[ab]", "glob or wildcard"),
+                              ("/tmp/{a,b}", "glob or wildcard"), ("/tmp/\\x", "glob or wildcard"),
+                              ("/tmp/\nfile", "control"), ("/tmp/\x00file", "control"),
+                              ("/tmp/\x7ffile", "control"), ("/tmp/\x85file", "control"),
+                              ("/tmp/\u202efile", "control"), ("/tmp/\ud800", "invalid Unicode"),
+                              ("/tmp/" + "x" * 4091, "4095 UTF-8 bytes"),
+                              ("/tmp/" + "é" * 2046, "4095 UTF-8 bytes")):
+                filesystem_case(repr(path), key, POLICY["filesystem"][key] + [path], why)
+            filesystem_case("duplicate", key, POLICY["filesystem"][key] * 2,
+                            f"filesystem.{key} must not contain duplicate paths")
+            fs = copy.deepcopy(POLICY["filesystem"])
+            del fs[key]
+            case("missing list", "filesystem", fs, f"filesystem.{key} must be a list of strings")
+
+        for path in ("/", "/bin", "/sbin", "/usr", "/usr/local/bin", "/lib", "/lib32", "/lib64", "/libexec",
+                     "/etc", "/var", "/var/lib/docker", "/var/lib/ekka/.ekka", "/var/log/jobs",
+                     "/proc/1", "/sys/kernel", "/dev", "/dev/sda", "/dev/shm/extra", "/dev/null/extra",
+                     "/boot", "/root", "/run", "/var/run/docker.sock", "/home", "/home/other/.ssh",
+                     "/home/node", "/sandbox", "/sandbox/ekka-workspace", "/sandbox/ekka-workspace/repo",
+                     "/sandbox/.ekka-inputs", "/sandbox/.ekka-inputs/job", "/.openshell"):
+            # Keep the cross-list rule separate from the protected-location rule.
+            why = "must not share a path" if path in POLICY["filesystem"]["readOnly"] else "overlaps protected location"
+            filesystem_case(path, "readWrite", POLICY["filesystem"]["readWrite"] + [path], why)
+        for path in ("/opt", "/opt/project-tools", "/opt/projects", "/opt/projects/acme-other",
+                     "/var/cache", "/var/cache/other", "/var/cache/acme-other", "/data", "/host", "/mnt"):
+            filesystem_case(path, "readWrite", POLICY["filesystem"]["readWrite"] + [path],
+                            "outside the allowed project write locations")
+        for path in ("/", "/root/.ssh", "/home/other/.ssh", "/home/node/.ssh", "/var", "/var/lib/docker",
+                     "/var/lib/ekka/.ekka", "/run/secrets", "/var/run/docker.sock", "/sys", "/dev/sda", "/.openshell",
+                     "/proc/1", "/proc/self/root", "/proc/self/root/root", "/proc/1/fd/3"):
+            filesystem_case(path, "readOnly", POLICY["filesystem"]["readOnly"] + [path],
+                            "overlaps protected location")
+        for path in ("/opt", "/opt/other", "/opt/project-tools-other", "/var/cache", "/var/cache/other",
+                     "/sandbox", "/sandbox/.ekka-inputs-other", "/host", "/mnt/host", "/media", "/data"):
+            filesystem_case(path, "readOnly", POLICY["filesystem"]["readOnly"] + [path],
+                            "outside the allowed project read locations")
+        for value in (None, [], "filesystem", True):
+            case("not an object", "filesystem", value, "filesystem must be an object")
+        for value in (False, None, 1, "true"):
+            filesystem_case("changed includeWorkdir", "includeWorkdir", value, "filesystem.includeWorkdir")
+        fs = copy.deepcopy(POLICY["filesystem"])
+        del fs["includeWorkdir"]
+        case("missing includeWorkdir", "filesystem", fs, "filesystem.includeWorkdir")
+        filesystem_case("unknown key", "allowAll", True, "filesystem has unknown keys: allowAll")
+        for path in POLICY["filesystem"]["readOnly"]:
+            filesystem_case("dropped baseline read", "readOnly",
+                            [p for p in POLICY["filesystem"]["readOnly"] if p != path],
+                            "filesystem.readOnly must keep every shipped entry")
+        fs = copy.deepcopy(POLICY["filesystem"])
+        fs["readOnly"].remove("/etc")
+        fs["readWrite"].append("/etc")
+        case("move etc to writes", "filesystem", fs, "filesystem.readOnly must keep every shipped entry")
+        fs = copy.deepcopy(POLICY["filesystem"])
+        for key in ("readOnly", "readWrite"):
+            fs[key].append("/var/cache/acme")
+        case("same path in both lists", "filesystem", fs, "must not share a path")
+        for part, value in (("process", {"runAsUser": "0", "runAsGroup": "1000"}),
+                            ("process", {"runAsUser": "1000", "runAsGroup": "0"}),
+                            ("process", {"runAsUser": 1000, "runAsGroup": 1000}),
+                            ("process", None), ("landlock", {"compatibility": "best_effort"}),
+                            ("landlock", None), ("version", True), ("version", 1.0), ("version", 2)):
+            case(part, part, value, f"changes `{part}`")
+
+        for label, mine, why in cases:
+            with self.subTest(attack=label, refusal=why):
+                with self.assertRaises(dg.Refused) as caught:
+                    dg.project("acme", P_IMAGE, P_POLICY, mine, POLICY, dg.profile_hosts(), P_NOW)
+                self.assertIn(why, str(caught.exception))
+                self.assertNotIn("\n", str(caught.exception))
+
+    def test_project_file_additions_and_tighter_writes_are_accepted(self):
+        for key, paths in (
+            ("readOnly", ["/opt/project-tools", "/opt/project-tools/bin", "/etc/ssl",
+                          "/sandbox/.ekka-inputs", "/sandbox/ekka-workspace/repo", "/var/cache/acme/tools"]),
+            ("readWrite", ["/var/cache/acme", "/var/cache/acme/build", "/opt/projects/acme",
+                           "/opt/projects/acme/build", "/tmp/acme", "/tmp/" + "x" * 4090]),
+        ):
+            for path in paths:
+                with self.subTest(key=key, path=path):
+                    mine = project_policy()
+                    mine["filesystem"][key].append(path)
+                    before = copy.deepcopy(mine)
+                    self.assertEqual(dg.project("acme", P_IMAGE, P_POLICY, mine, POLICY, dg.profile_hosts(), P_NOW), record())
+                    self.assertEqual(mine, before, "validation does not rewrite the policy being digested")
+        mine = project_policy()
+        mine["filesystem"]["readWrite"] = []
+        mine["filesystem"]["readOnly"].reverse()
+        self.assertEqual(dg.project("acme", P_IMAGE, P_POLICY, mine, POLICY, dg.profile_hosts(), P_NOW), record())
+        mine["filesystem"]["readWrite"] = ["/var/cache/project"]
+        self.assertEqual(dg.project("project", P_IMAGE, P_POLICY, mine, POLICY, dg.profile_hosts(), P_NOW)["name"], "project")
+
+    def test_network_ceiling_is_unchanged_with_project_file_rules(self):
+        for key in ("networkPolicies", "network_policies"):
+            for host, accepted in (("github.com", True), ("evil.example.com", False)):
+                with self.subTest(key=key, host=host):
+                    mine = project_policy()
+                    mine.pop("networkPolicies", None)
+                    mine.pop("network_policies", None)
+                    rule = copy.deepcopy(next(iter(POLICY["networkPolicies"].values())))
+                    rule["endpoints"][0]["host"] = host
+                    mine[key] = {"project": rule}
+                    mine["filesystem"]["readOnly"].append("/opt/project-tools")
+                    mine["filesystem"]["readWrite"].append("/var/cache/acme")
+                    if accepted:
+                        self.assertEqual(dg.project("acme", P_IMAGE, P_POLICY, mine, POLICY, dg.profile_hosts(), P_NOW), record())
+                    else:
+                        with self.assertRaisesRegex(dg.Refused, "outside the ceiling"):
+                            dg.project("acme", P_IMAGE, P_POLICY, mine, POLICY, dg.profile_hosts(), P_NOW)
 
     def test_planted_without_the_must_equal_check_a_root_policy_would_be_accepted(self):
         # The red this check prevents: the same call with the parts it compares emptied.
@@ -992,12 +1112,18 @@ class AProject(unittest.TestCase):
     def test_the_command_prints_the_record_and_a_refusal_prints_nothing(self):
         import contextlib, tempfile
         with tempfile.TemporaryDirectory() as d:
-            good, bad = os.path.join(d, "good.json"), os.path.join(d, "bad.json")
+            good, bad, bad_files = (os.path.join(d, name) for name in ("good.json", "bad.json", "bad-files.json"))
+            mine = project_policy()
+            mine["filesystem"]["readOnly"].append("/opt/project-tools")
+            mine["filesystem"]["readWrite"].append("/var/cache/acme")
             with open(good, "w") as f:
-                json.dump(project_policy(), f)
+                json.dump(mine, f)
             with open(bad, "w") as f:
                 json.dump(project_policy(process={"runAsUser": "0", "runAsGroup": "0"}), f)
-            for path, want in ((good, 0), (bad, 1), (os.path.join(d, "missing.json"), None)):
+            mine["filesystem"]["readWrite"].append("/")
+            with open(bad_files, "w") as f:
+                json.dump(mine, f)
+            for path, want in ((good, 0), (bad, 1), (bad_files, 1), (os.path.join(d, "missing.json"), None)):
                 out, err = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     try:
@@ -1010,6 +1136,8 @@ class AProject(unittest.TestCase):
                     self.assertEqual(json.loads(out.getvalue()), record())
                 else:
                     self.assertEqual(out.getvalue(), "", "a refusal writes no record")
+                    if path == bad_files:
+                        self.assertIn("filesystem.readWrite", err.getvalue())
 
 
 class UpShStepKeepsAProject(unittest.TestCase):

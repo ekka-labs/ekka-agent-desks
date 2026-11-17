@@ -34,8 +34,8 @@ and `sudo ekka desk grant restore` removes it, so the shipped limits are written
 
 A PROJECT (a project's own desk): its image, built on this machine and named by its content ID, and its own policy,
 named by its digest, are ADDED to the two lists; the shipped image and policy stay. A project's policy must hold the
-shipped policy's file rules, user and landlock setting exactly (the backend's `must_equal` parts a policy file carries)
-and may open no host outside the ceiling. It lasts until removed: unlike a window it has no end time, opens no auto
+shipped user and landlock setting exactly, keeps the filesystem floors below, and may open no host outside the
+ceiling. It lasts until removed: unlike a window it has no end time, opens no auto
 approval, and an installer run keeps it. `project` writes its record:
 
     python3 tools/desk_grant.py project --name <name> --image-id sha256:<hex> --policy-digest sha256:<hex> \\
@@ -54,6 +54,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -175,14 +176,94 @@ def check_discovery(block):
 MAX_GRANT_DIGESTS = 32         # contracts desks.v1 `image_digests` and `policy_digests`: 1 to 32 each
 MAX_PROJECTS = 8
 PROJECT_KEYS = ("name", "image_id", "policy_digest", "since")
-# The parts of the backend's `policy_baseline.must_equal` that a policy file itself carries. The backend holds a
-# desk's later policy changes to them; a project's creation policy is held to the shipped one's here, so "a project
-# policy" can never mean other file rules, another user, or a desk that starts where landlock cannot be enforced.
-POLICY_MUST_EQUAL = ("filesystem", "process", "landlock")
+# Creation may use project file rules; later changes still keep the desk's own pinned filesystem baseline.
+POLICY_MUST_EQUAL = ("process", "landlock")
 # Everything a project's policy file may hold: the shipped policy's own parts, and its network rules under either
-# spelling. Any other part (a network middleware, a setting a later OpenShell adds) is refused by name here, so a
-# project policy can only ever differ from the shipped one in the hosts it opens.
-POLICY_PARTS = ("version",) + POLICY_MUST_EQUAL + ("networkPolicies", "network_policies")
+# spelling; new OpenShell fields need an explicit review before admission.
+POLICY_PARTS = ("version", "filesystem") + POLICY_MUST_EQUAL + ("networkPolicies", "network_policies")
+MAX_POLICY_PATH_BYTES = 4095
+WRITE_PROTECTED = (
+    "/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libexec", "/etc", "/proc", "/sys",
+    "/dev", "/boot", "/root", "/run", "/var/run", "/var/lib", "/var/log", "/home",
+    "/sandbox/ekka-workspace", "/sandbox/.ekka-inputs", "/.openshell",
+)
+READ_PROTECTED = (
+    "/root", "/home", "/run", "/var/run", "/var/lib", "/proc", "/sys", "/dev", "/boot", "/.openshell",
+)
+
+
+def within(path, parent):
+    """Component-boundary comparison of already normalized Linux paths, without touching the host filesystem."""
+    return path == parent or parent == "/" or path.startswith(parent + "/")
+
+
+def overlaps(path, protected):
+    return within(path, protected) or within(protected, path)
+
+
+def check_policy_path(path, key):
+    prefix = f"filesystem.{key}"
+    if not isinstance(path, str):
+        raise Refused(f"{prefix} must be a list of strings")
+    # Reject surrogate escapes as well as control/format characters before UTF-8 encoding or diagnostics.
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Cs") for c in path):
+        raise Refused(f"{prefix} paths must not contain control or invalid Unicode characters")
+    if len(path.encode("utf-8")) > MAX_POLICY_PATH_BYTES:
+        raise Refused(f"{prefix} paths must not exceed {MAX_POLICY_PATH_BYTES} UTF-8 bytes")
+    if not path.startswith("/"):
+        raise Refused(f"{prefix} paths must be absolute")
+    if path != "/" and any(part in ("", ".", "..") for part in path.split("/")[1:]):
+        raise Refused(f"{prefix} paths must already be normalized without empty, dot or dot-dot parts")
+    if any(c in path for c in "*?[]{}\\"):
+        raise Refused(f"{prefix} paths must not contain glob or wildcard characters")
+
+
+def check_project_filesystem(filesystem, shipped, name):
+    """Lexical admission floors, not an image/mount/symlink audit; paths belong to the desk, never the host."""
+    if not isinstance(filesystem, dict):
+        raise Refused("filesystem must be an object")
+    other = sorted(set(filesystem) - set(shipped))
+    if other:
+        raise Refused(f"filesystem has unknown keys: {', '.join(other)}")
+    if canonical(filesystem.get("includeWorkdir")) != canonical(shipped["includeWorkdir"]):
+        raise Refused("filesystem.includeWorkdir must stay exactly as shipped")
+    for key in ("readOnly", "readWrite"):
+        paths = filesystem.get(key)
+        if not isinstance(paths, list):
+            raise Refused(f"filesystem.{key} must be a list of strings")
+        for path in paths:
+            check_policy_path(path, key)
+        if len(set(paths)) != len(paths):
+            raise Refused(f"filesystem.{key} must not contain duplicate paths")
+    ro, rw = filesystem["readOnly"], filesystem["readWrite"]
+    both = sorted(set(ro) & set(rw))
+    if both:
+        raise Refused(f"filesystem.readOnly and filesystem.readWrite must not share a path: {both[0]!r}")
+    missing = sorted(set(shipped["readOnly"]) - set(ro))
+    if missing:
+        raise Refused(f"filesystem.readOnly must keep every shipped entry, including {missing[0]!r}")
+
+    # Dedicated project namespaces avoid guessing ownership of arbitrary image folders or host mount aliases.
+    project_roots = (f"/opt/projects/{name}", f"/var/cache/{name}")
+    read_roots = (*shipped["readOnly"], *shipped["readWrite"], *project_roots,
+                  "/opt/project-tools", "/sandbox/ekka-workspace", "/sandbox/.ekka-inputs")
+    for path in ro:
+        if path in shipped["readOnly"]:
+            continue
+        # Keep /proc itself, but never add a rule resolved through its magic links (for example self/root).
+        blocked = next((root for root in READ_PROTECTED if overlaps(path, root)), None)
+        if blocked:
+            raise Refused(f"filesystem.readOnly path {path!r} overlaps protected location {blocked!r}")
+        if not any(within(path, root) for root in read_roots):
+            raise Refused(f"filesystem.readOnly path {path!r} is outside the allowed project read locations")
+    for path in rw:
+        if path in shipped["readWrite"]:
+            continue  # Only exact shipped device entries are grandfathered, including /dev/shm.
+        blocked = next((root for root in WRITE_PROTECTED if overlaps(path, root)), None)
+        if blocked:
+            raise Refused(f"filesystem.readWrite path {path!r} overlaps protected location {blocked!r}")
+        if not any(within(path, root) for root in ("/tmp", *project_roots)):
+            raise Refused(f"filesystem.readWrite path {path!r} is outside the allowed project write locations")
 
 
 def check_project(record):
@@ -213,8 +294,8 @@ def project(name, image_id, policy_digest, policy, shipped, ceiling, now):
         raise Refused("the project's policy changes `version`; it keeps the shipped policy's")
     for part in POLICY_MUST_EQUAL:
         if canonical(policy.get(part)) != canonical(shipped.get(part)):
-            raise Refused(f"the project's policy changes `{part}`; a project policy keeps the shipped policy's file "
-                          "rules, user and landlock setting exactly, and differs only in what it opens on the network")
+            raise Refused(f"the project's policy changes `{part}`; it must stay exactly as shipped")
+    check_project_filesystem(policy.get("filesystem"), shipped["filesystem"], name)
     outside = [h for h in baseline_hosts(policy) if h not in ceiling]
     if outside:
         raise Refused(f"the project's policy opens {', '.join(outside)}, outside the ceiling the profiles set; "
