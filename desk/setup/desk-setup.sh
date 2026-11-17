@@ -20,6 +20,12 @@ REPOS=${R-}
 RUN=${I-}
 # Nothing the caller's environment says about Git reaches a Git command here.
 for v in $(compgen -e); do case $v in GIT_*) unset "$v" ;; esac; done
+# That also drops GIT_SSL_CAINFO, which is how the desk backend tells git to trust the desk's own certificate; without
+# it every clone fails "certificate signer not trusted". The bundle is named here by its fixed place, never taken from
+# the environment, and only when it is a real file (not a link). A desk without it uses git's own default.
+CA=/run/openshell-supervisor-ca/material/ca-bundle.crt
+TRUST=()
+[ -f "$CA" ] && [ ! -L "$CA" ] && TRUST=(-c "http.sslCAInfo=$CA")
 command -v jq >/dev/null || { echo "desk setup: jq is missing on this desk image; nothing was set up" >&2; exit 1; }
 command -v git >/dev/null || { echo "desk setup: git is missing on this desk image; nothing was set up" >&2; exit 1; }
 [ -d "$W" ] && [ ! -L "$W" ] || { echo "desk setup: the workspace $W is not a folder" >&2; exit 1; }
@@ -32,7 +38,7 @@ clone() {   # clone <address> <folder> [<branch>]
   (cd / && env -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
     GIT_TERMINAL_PROMPT=0 git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.allow=never \
     -c protocol.https.allow=always -c http.followRedirects=false -c credential.helper=/usr/local/bin/ekka-git-credential \
-    clone --template= --no-local --no-recurse-submodules ${b[@]+"${b[@]}"} -- "$1" "$2")
+    ${TRUST[@]+"${TRUST[@]}"} clone --template= --no-local --no-recurse-submodules ${b[@]+"${b[@]}"} -- "$1" "$2")
 }
 # A read in a checkout. Only rev-parse, symbolic-ref and config --get: none of them runs a program a repository's
 # own config names (no index refresh, no filter, no hook, no network), so an old checkout's config cannot run here.
