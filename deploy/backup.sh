@@ -50,6 +50,12 @@ save_backend_state() {  # save_backend_state <dir> <yes|no>: the adapter volume 
   [[ $2 == yes ]] || { say "this server runs no backend adapter (no ekka-backend-state volume): none to back up"; return 0; }
   vol ekka-backend-state "$1" "tar -C /v -czpf /b/ekka-backend-state.tgz ."
 }
+trust_restored_ca() {  # the Enclave's own copy of the desks CA (/etc/ekka/desks-ca.crt) and the gateway's bundle, from the
+  # RESTORED $DESKS_STATE. Both live outside what is restored. On the machine the backup was made on they already
+  # match; on a machine set up again since, they are the NEW setup's, the Enclave refuses the restored certificates,
+  # and every desk reads "issuer did not answer".
+  DESKS_STATE=$DESKS_STATE bash ./certs.sh bundle >/dev/null || die "the restored certificate authority could not be put in place (certs.sh bundle); nothing was started"
+}
 restore_backend_state() {  # restore_backend_state <dir>: the backup's copy, or an empty volume when it holds none
   docker volume rm -f ekka-desks_ekka-backend-state >/dev/null
   if [[ -f $1/ekka-backend-state.tgz ]]; then
@@ -90,6 +96,7 @@ case "${1:-}" in
     stop_writers   # refuses, touching nothing, if either unit or a stack container is still running
     P down >/dev/null 2>&1 || true
     tar -C "$DESKS_STATE" -xzf "$d/desks-state.tgz"
+    trust_restored_ca
     docker volume rm -f ekka-desks_gateway-state >/dev/null; docker volume create ekka-desks_gateway-state >/dev/null
     vol gateway-state "$d" "tar -C /v -xzpf /b/gateway-state.tgz"
     restore_backend_state "$d"
