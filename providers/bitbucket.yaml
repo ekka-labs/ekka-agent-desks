@@ -6,7 +6,8 @@
 #                    Git over HTTPS takes it with the fixed username `x-bitbucket-api-token-auth`; the desk
 #                    image's git helper (/usr/local/bin/ekka-git-credential) answers that for bitbucket.org.
 # Endpoint access:   api.bitbucket.org REST read-only; bitbucket.org clone/fetch only. Push
-#                    (git-receive-pack) stays denied.
+#                    (git-receive-pack) stays denied. curl may read the API too (a QA or CI check reads a pull
+#                    request's checks and pipeline results that way); the read-only preset still refuses every write.
 # Connect:           sudo ekka desk connect bitbucket   (the token on stdin)
 
 id: bitbucket
@@ -38,4 +39,4 @@ endpoints:
       - allow: { method: HEAD, path: "**" }
       - allow: { method: OPTIONS, path: "**" }
       - allow: { method: POST, path: "/**/git-upload-pack" }
-binaries: [/usr/bin/git, /usr/local/bin/git]
+binaries: [/usr/bin/git, /usr/local/bin/git, /usr/bin/curl, /usr/local/bin/curl]

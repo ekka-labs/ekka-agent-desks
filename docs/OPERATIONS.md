@@ -532,11 +532,17 @@ This deletes your desks, the keys you connected, the sign-in accounts and the En
 ```sh
 sudo -i
 ekka enclave list                                   # note this machine's Enclave id
+ekka enclave revoke <id>                            # removes it from your EKKA organization; do this FIRST
 systemctl disable --now ekka-desks ekka             # the stack, then the Enclave
-cd /usr/local/lib/ekka-desks/deploy && ./setup.sh compose down -v   # every container and volume
+docker rm -f $(docker ps -aq --filter label=openshell.ai/managed-by=openshell)          # each desk's container
+docker volume rm $(docker volume ls -q --filter label=openshell.ai/managed-by=openshell)   # each desk's volumes
+cd /usr/local/lib/ekka-desks/deploy && ./setup.sh compose down -v   # the stack's containers and volumes
 rm -rf /var/lib/ekka-agent-desks /var/lib/ekka/.ekka
-ekka enclave revoke <id>                            # removes it from your EKKA organization
 ```
+
+The order matters. `ekka enclave revoke` needs the sign-in that the last line deletes, so it runs first. The desks'
+own containers and volumes do not belong to the stack, so `compose down -v` leaves them: remove them by their label.
+If the server has no desk, the two `docker` lines print a usage error and change nothing.
 
 ## Backup and restore
 
@@ -546,7 +552,17 @@ ekka enclave revoke <id>                            # removes it from your EKKA 
 ```
 
 The stack and the Enclave are stopped while their state is copied (a minute), and started again only if the Enclave
-was running before. **A backup is a secret:** it holds the Enclave's vault and the key that unlocks it. Keep it where you keep
+was running before.
+
+**Restoring onto a server that was set up again after the backup** (a rebuilt machine is the usual reason to restore).
+The restore puts back the desks' certificate authority and the copy the Enclave trusts, so the Enclave can reach the
+sign-in service again. Two things live outside any backup, and the restore names them when it sees a different
+Enclave than the one it replaced:
+
+1. The organization's desk plans still point at the Enclave the new setup created. Run the install line once more,
+   `sudo ./up.sh server <name>`; it points them at the restored Enclave.
+2. Desk work folders are not in a backup. Make each desk again, `ekka desk create <desk> --provider <profile>`, and
+   revoke the Enclave the restore replaced, `ekka enclave revoke <id>`. **A backup is a secret:** it holds the Enclave's vault and the key that unlocks it. Keep it where you keep
 passwords.
 
 Discovery windows live in the active grant and are not restored from a local backup. Backups exclude the retired
