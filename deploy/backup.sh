@@ -50,6 +50,23 @@ save_backend_state() {  # save_backend_state <dir> <yes|no>: the adapter volume 
   [[ $2 == yes ]] || { say "this server runs no backend adapter (no ekka-backend-state volume): none to back up"; return 0; }
   vol ekka-backend-state "$1" "tar -C /v -czpf /b/ekka-backend-state.tgz ."
 }
+trust_restored_ca() {  # the Enclave's own copy of the desks CA (/etc/ekka/desks-ca.crt) and the gateway's bundle, from the
+  # RESTORED $DESKS_STATE. Both live outside what is restored. On the machine the backup was made on they already
+  # match; on a machine set up again since, they are the NEW setup's, the Enclave refuses the restored certificates,
+  # and every desk reads "issuer did not answer".
+  DESKS_STATE=$DESKS_STATE bash ./certs.sh bundle >/dev/null || die "the restored certificate authority could not be put in place (certs.sh bundle); nothing was started"
+}
+node_of() {  # node_of <home> <env dir>: the Enclave id an EKKA home holds, or nothing
+  sed -n 's/^EKKA_NODE_ID=//p' "$1/$2/enclave.env" 2>/dev/null | head -1
+}
+set_up_again_note() {  # set_up_again_note <id before> <id restored>: what a restore onto a server set up again still needs
+  [[ -n $1 && -n $2 && $1 != "$2" ]] || return 0
+  say "this server was set up again after the backup was taken: its Enclave was $1, the backup's is $2"
+  say "  the organization's desk plans still point at $1's gate. Run the install line once more, which points them here:"
+  say "    sudo ./up.sh server <name>"
+  say "  then make each desk again (desk work folders are not in a backup), and revoke the Enclave this replaced:"
+  say "    ekka desk create <desk> --provider <profile>        ekka enclave revoke $1"
+}
 restore_backend_state() {  # restore_backend_state <dir>: the backup's copy, or an empty volume when it holds none
   docker volume rm -f ekka-desks_ekka-backend-state >/dev/null
   if [[ -f $1/ekka-backend-state.tgz ]]; then
@@ -90,9 +107,12 @@ case "${1:-}" in
     stop_writers   # refuses, touching nothing, if either unit or a stack container is still running
     P down >/dev/null 2>&1 || true
     tar -C "$DESKS_STATE" -xzf "$d/desks-state.tgz"
+    trust_restored_ca
     docker volume rm -f ekka-desks_gateway-state >/dev/null; docker volume create ekka-desks_gateway-state >/dev/null
     vol gateway-state "$d" "tar -C /v -xzpf /b/gateway-state.tgz"
     restore_backend_state "$d"
+    envdir=$(sed -n 's/^EKKA_ENV=//p' /etc/ekka/desks.env 2>/dev/null | head -1); envdir=${envdir:-prod}; [[ $envdir == prod ]] && envdir=.
+    replaced_id=$(node_of /var/lib/ekka/.ekka "$envdir")   # read before the home is replaced
     rm -rf /var/lib/ekka/.ekka.restoring && mkdir -m 0700 /var/lib/ekka/.ekka.restoring
     tar -C /var/lib/ekka/.ekka.restoring -xzpf "$d/ekka-home.tgz" --strip-components=1
     rm -rf /var/lib/ekka/.ekka && mv /var/lib/ekka/.ekka.restoring /var/lib/ekka/.ekka && chown -R ekka:ekka /var/lib/ekka/.ekka
@@ -101,7 +121,6 @@ case "${1:-}" in
     for _ in $(seq 1 30); do P exec -T keycloak-db pg_isready -U keycloak -d keycloak >/dev/null 2>&1 && break; sleep 2; done
     P exec -T keycloak-db pg_restore -U keycloak -d keycloak --clean --if-exists --no-owner < "$d/keycloak.pgdump"
     P stop keycloak-db >/dev/null 2>&1 || true   # the stack's unit starts it again below
-    envdir=$(sed -n 's/^EKKA_ENV=//p' /etc/ekka/desks.env 2>/dev/null | head -1); envdir=${envdir:-prod}; [[ $envdir == prod ]] && envdir=.
     if [[ -f /var/lib/ekka/.ekka/$envdir/enclave.env ]]; then   # this server's environment, the same file the daemon reads
       preflight || die "the gateway preflight refused the restored setup (above); the data is restored, nothing else started"
       say "the restored home holds an enrolled Enclave: starting the Enclave, and the desks stack it wants"
@@ -110,6 +129,7 @@ case "${1:-}" in
       say "the restored home has no enrolled Enclave: enroll (sudo ./up.sh server <name>), which starts the stack"
     fi
     say "restored from $d; check: sudo ./up.sh status; deploy/keycloak/apply_realm.py apply (says nothing to do)"
+    set_up_again_note "$replaced_id" "$(node_of /var/lib/ekka/.ekka "$envdir")"
     ;;
   *) sed -n '2,11p' "$0"; exit 2 ;;
 esac
