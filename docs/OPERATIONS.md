@@ -537,7 +537,17 @@ If the server has no desk, the two `docker` lines print a usage error and change
 ```
 
 The stack and the Enclave are stopped while their state is copied (a minute), and started again only if the Enclave
-was running before. **A backup is a secret:** it holds the Enclave's vault and the key that unlocks it. Keep it where you keep
+was running before.
+
+**Restoring onto a server that was set up again after the backup** (a rebuilt machine is the usual reason to restore).
+The restore puts back the desks' certificate authority and the copy the Enclave trusts, so the Enclave can reach the
+sign-in service again. Two things live outside any backup, and the restore names them when it sees a different
+Enclave than the one it replaced:
+
+1. The organization's desk plans still point at the Enclave the new setup created. Run the install line once more,
+   `sudo ./up.sh server <name>`; it points them at the restored Enclave.
+2. Desk work folders are not in a backup. Make each desk again, `ekka desk create <desk> --provider <profile>`, and
+   revoke the Enclave the restore replaced, `ekka enclave revoke <id>`. **A backup is a secret:** it holds the Enclave's vault and the key that unlocks it. Keep it where you keep
 passwords.
 
 Tested: back up, destroy every volume and a certificate, restore. The sign-in realm, the administrator, both
