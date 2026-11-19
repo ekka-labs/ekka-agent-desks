@@ -126,10 +126,10 @@ Read the file before running this command; `--yes` confirms the change without a
 
 The desks grant allows the install's one image and one policy, plus those of each project added to it (below).
 The installer writes the input records, ensures plain API read access, and calls `ekka desk grant update --yes`
-(EKKA 0.6.10 or newer) to build and apply the limits. It confirms and saves the CLI's `keep` answer;
+(EKKA 0.6.12 or newer) to build and apply the limits. It confirms and saves the CLI's `keep` answer;
 see [Updating the desks grant](OPERATIONS.md#updating-the-desks-grant). To learn what a new project's build needs, the server's administrator
-opens a window for ONE disposable desk, created from the project's own image with the shipped policy. While the window
-is open, the backend adapter may switch that desk, and only that desk, to NVIDIA OpenShell's auto approval mode: the
+opens a window for disposable discovery desks, created from the project's own image with the shipped policy. While the window
+is open, the backend adapter may switch eligible desks to NVIDIA OpenShell's auto approval mode: the
 build's network requests are approved as they arrive, except those OpenShell holds as risky, and every one is recorded.
 The adapter turns auto mode on only after it reads the setting back as applied, and only then writes a permit for that
 desk; the Enclave's gateway interceptor lets the desk's proposals through only while that permit is valid. The records
@@ -141,15 +141,19 @@ or port is added for the window.
 | `<token> \| sudo ekka desk registry login <host> <user>` | A registry's read-only credential, kept root-only on the server for image pulls. For GitHub Packages the token must be classic with the scope `read:packages` only, and that is checked before it is kept. |
 | `sudo ekka desk registry show`, `sudo ekka desk registry logout <host>` | The registries with a kept credential; forget one. |
 | `sudo ekka desk image pull <registry>/<name>@sha256:<64 hex> [--signed-by <identity> --issuer <url>]` | The project image onto this machine, by digest, through a throwaway Docker login that is deleted after; with `--signed-by`, cosign checks the signature first. |
-| `sudo ekka desk grant discovery --image <registry>/<name>@sha256:<64 hex> --providers <provider>,<provider> [--minutes 60]` | Opens the window: adds that image to the grant and writes the grant's `discovery` block (that image, those providers, desks named `discover-*`, the time it closes). Open for 60 minutes unless `--minutes` says otherwise, at most 240. Each provider must already be connected. |
-| `sudo ekka desk grant show` | The CLI reads live facts and previews the update. `sudo ./up.sh grant show` displays the last confirmed local limits: images, policies, ports, address ranges, and whether a window is open, for which image and providers, and until when. |
-| `sudo ekka desk grant restore` | Ends the window: the discovery block and the window's image leave the grant, and the shipped limits are written back. Run it when the discovery desk is deleted, or after the window has closed by itself. |
+| `ekka desk grant discovery --image <ref> --providers <a,b> [--minutes 60] [--yes] [--json]` | Opens the window in the grant itself. The image must be `<registry>/<name>@sha256:<64 lowercase hex>`. Name 1 to 8 distinct providers already in this server's limits; minutes range from 1 to 240. As root on the server, confirm with the literal word `yes`, or pass `--yes`. |
+| `ekka desk grant show [--json]` | Reads live facts and previews an update, including the open window's image digests, providers and expiry from the active grant. Changes nothing. |
+| `ekka desk grant restore [--yes] [--json]` | Rebuilds the limits without the discovery block, including an expired one, and without images supplied only by that block. Keeps project records. Uses the same confirmation as discovery. With no block, succeeds without changing a grant. |
+
+An update carries an unexpired window unchanged, including its original expiry. An expired window is dropped on the
+next update. A window restricts eligible desks; it does not enforce a one-desk quota. Restore does not revoke
+already-issued desk permits: return the desk to manual approval mode or delete it at the end of discovery.
+Run these CLI commands as root on the installed server (`sudo -i`).
 
 ### A project's own desk: its image and its policy
 
 A project's desk runs the project's own image (the desk image plus the project's tools) and may have its own policy.
-Both are added to the grant, beside the shipped image and policy, until they are removed. A window is for one
-disposable desk and ends; a project is for the desks the project works on and stays through an installer run.
+Both are added to the grant, beside the shipped image and policy, until they are removed. A window is temporary and ends; a project is for the desks the project works on and stays through an installer run.
 
 | Command | What it does |
 |---|---|

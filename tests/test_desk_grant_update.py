@@ -27,7 +27,7 @@ def function(name):
 
 
 class UpdateStep(unittest.TestCase):
-    def run_step(self, rows=None, answer=None, fail="", list_text=None, plan_fails=False, record_fails=False, grant_record_fails=False, agent="desks"):
+    def run_step(self, rows=None, answer=None, fail="", list_text=None, plan_fails=False, record_fails=False, grant_record_fails=False, agent="desks", retired="files"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = root / "state"
@@ -35,14 +35,26 @@ class UpdateStep(unittest.TestCase):
             backend.mkdir(parents=True)
             (backend / "desks-grant.json").write_text('{"old_record":true}\n')
             (state / "up.env").write_text("EKKA_BACKEND_IMAGE=example\n")
-            # Already written by the image/baseline steps and the window/project commands.
+            # Already written by the image/baseline steps and project commands.
             inputs = {"desk-image.json": {"image": "ekka-desk:local", "id": LIMITS["image_digests"][0]},
                       "baseline-policy.json": json.loads((ROOT / "desk/policy.json").read_text()),
-                      "desks-grant.extras.json": {"discovery": {}}, "projects/acme.project.json": {"name": "acme"}}
+                      "projects/acme.project.json": {"name": "acme"}}
             for name, value in inputs.items():
                 path = backend / name
                 path.parent.mkdir(exist_ok=True)
                 path.write_text(json.dumps(value))
+            target = root / "untouched"
+            target.write_text("unchanged")
+            for name in cli.RETIRED_FILES:
+                path = backend / name
+                if retired == "files":
+                    path.write_text("not JSON; must never be read")
+                elif retired == "links":
+                    path.symlink_to(target)
+                elif retired == "dangling":
+                    path.symlink_to(root / "missing")
+                elif retired == "directory":
+                    path.mkdir()
             (root / "tools").mkdir()
             # Exercise the real parsers and atomic writer in a trusted test-owned tree.
             for name in ("desk_grant_cli", "desk_records"):
@@ -56,6 +68,9 @@ def write(dest, data):
     original(dest, data, top=os.environ["TEST_ROOT"], owner=os.getuid())
 desk_records.write = write
 import ''' + name + ''' as command
+if hasattr(command, "remove_retired"):
+    remove = command.remove_retired
+    command.remove_retired = lambda folder: remove(folder, top=os.environ["TEST_ROOT"], owner=os.getuid())
 sys.exit(command.main(sys.argv[1:]))
 ''')
             (root / "docker").write_text('''#!/usr/bin/env python3
@@ -71,8 +86,10 @@ elif key == "gate grant list --json": print(os.environ["ROWS"])
 elif key == "desk grant show --json": print(os.environ["ANSWER"])
 elif key == "desk grant update --yes":
     folder = os.path.join(os.environ["DESKS_STATE"], "backend")
-    for name in ("desk-image.json", "baseline-policy.json", "provider-ceiling.json", "desks-grant.extras.json", "projects/acme.project.json"):
+    for name in ("desk-image.json", "baseline-policy.json", "provider-ceiling.json", "projects/acme.project.json"):
         assert os.path.isfile(os.path.join(folder, name)), name
+    for name in ("desks-grant.extras.json", "discovery-policy.json", "discovery-composed.json"):
+        assert not os.path.lexists(os.path.join(folder, name)), name
     print("Update completed")
 elif args[:3] == ["gate", "grant", "add"]: print("Granted api.read")
 else: raise SystemExit("unexpected CLI call")
@@ -83,7 +100,7 @@ if key.startswith(os.environ["FAIL_CALL"]) and os.environ["FAIL_CALL"]:
             (root / "docker").chmod(0o755)
             script = '''set -euo pipefail
 die() { echo "$*" >&2; exit 1; }
-say() { :; }; ok() { :; }
+say() { :; }; ok() { echo "ok: $*"; }
 ekka_in() { docker "$@"; }
 create_desk_admin_plans() {
   echo '["plans", "read", "write"]' >> "$CALLS"
@@ -105,9 +122,35 @@ profile_source() { echo "$REAL_PROVIDERS/$1.yaml"; }
             mode = (backend / "desks-grant.json").stat().st_mode & 0o777
             for name, value in inputs.items():
                 self.assertEqual(json.loads((backend / name).read_text()), value)
+            self.assertEqual(target.read_text(), "unchanged")
             self.assertFalse(list(backend.glob(".*.tmp")))
             self.assertFalse(any(c[:3] == ["gate", "grant", "revoke"] for c in calls))
             return result, calls, record, mode
+
+    def test_retired_names_are_unlinked_before_update_including_links(self):
+        for kind in ("files", "links", "dangling", "absent"):
+            with self.subTest(kind=kind):
+                result, calls, _, _ = self.run_step(retired=kind)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(["desk", "grant", "update", "--yes"], calls)
+                lines = [line for line in result.stdout.splitlines() if "removed retired grant files:" in line]
+                self.assertEqual(len(lines), 0 if kind == "absent" else 1)
+                if lines:
+                    self.assertTrue(all(name in lines[0] for name in cli.RETIRED_FILES))
+
+    def test_cleanup_failure_stops_before_update(self):
+        result, calls, record, _ = self.run_step(retired="directory")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("retired grant files could not be removed", result.stderr)
+        self.assertFalse(any(call[:2] == ["desk", "grant"] for call in calls))
+        self.assertEqual(record, {"old_record": True})
+
+    def test_only_cleanup_names_the_retired_window_file_in_installer_tools(self):
+        paths = [ROOT / "up.sh", *(ROOT / "tools").rglob("*.py"), *(ROOT / "tools").rglob("*.sh")]
+        hits = [(path.relative_to(ROOT).as_posix(), line.strip()) for path in paths
+                for line in path.read_text().splitlines() if "desks-grant.extras.json" in line]
+        self.assertEqual(hits, [("tools/desk_grant_cli.py",
+                               'RETIRED_FILES = ("desks-grant.extras.json", "discovery-policy.json", "discovery-composed.json")')])
 
     def test_missing_read_grant_is_added_then_update_and_show_confirm_the_record(self):
         result, calls, record, mode = self.run_step()
@@ -223,6 +266,25 @@ profile_source() { echo "$REAL_PROVIDERS/$1.yaml"; }
 
 
 class CliRecord(unittest.TestCase):
+    def test_cleanup_refuses_untrusted_parent_folders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = root / "backend"
+            backend.mkdir()
+            record = backend / cli.RETIRED_FILES[0]
+            record.write_text("untouched")
+            link = root / "link"
+            link.symlink_to(backend, target_is_directory=True)
+            for folder, owner, mode in ((link, os.getuid(), 0o755), (backend, os.getuid(), 0o777),
+                                        (backend, os.getuid() + 1, 0o755)):
+                backend.chmod(mode)
+                with self.assertRaises(desk_records.Refused):
+                    cli.remove_retired(folder, top=root, owner=owner)
+                self.assertEqual(record.read_text(), "untouched")
+            backend.chmod(0o755)
+            self.assertEqual(cli.remove_retired(backend, top=root, owner=os.getuid()), [record.name])
+            self.assertEqual(cli.remove_retired(backend, top=root, owner=os.getuid()), [])
+
     def test_rejects_duplicate_json_keys_non_json_numbers_and_trailing_output(self):
         for text in ('{"preview":{},"preview":{}}', 'NaN', '{} trailing', '[] []'):
             with self.assertRaises(cli.Refused):

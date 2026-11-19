@@ -188,7 +188,7 @@ ekka desk stop code-desk
 
 - **Whose sign-in.** It runs under the Enclave's EKKA sign-in, the person who installed the server (an organization admin), whoever types the command. So who may change a desk comes down to who has root on this machine: `sudo -i`, then `ekka desk ...`; the `ekka` command there runs as the Enclave's own user.
 - **Not from your own computer.** A person's `ekka` on their own computer reads desks (`list`, `logs`, `policy show`, `connections`). A change from there is refused, because no Enclave runs there. Changing a desk from another computer is not in this release.
-- **Reading a desk's policy here needs no sign-in.** On this machine, `ekka desk policy show <desk>` runs the plan `ekka.desk.read.v1` through the Enclave, like `status`, and reads the live policy back from the Enclave's own record of the run. This setup requires EKKA 0.6.10 or newer and installs the general read plan.
+- **Reading a desk's policy here needs no sign-in.** On this machine, `ekka desk policy show <desk>` runs the plan `ekka.desk.read.v1` through the Enclave, like `status`, and reads the live policy back from the Enclave's own record of the run. This setup requires EKKA 0.6.12 or newer and installs the general read plan.
 - **Policy changes read first.** `allow`, `deny` and `policy set` read the desk's current policy before they change it, so the Enclave needs its own desk sign-in, once: `ekka desk login`. It prints an address. Open it in a browser on a computer set up as in [step 6](SERVER.md#6-each-person-connects-to-the-server), and sign in as `desks-admin`. That sign-in has read permissions only. OpenShell 0.1.4 checks those permissions even for its admin role. The change itself is made by the backend adapter.
 
 ## Administer desks from the server itself
@@ -214,9 +214,9 @@ Gateway reads such as `ekka desk logs` and `ekka desk connections` now work from
 ## Updating the desks grant
 
 The CLI uses the organization's `desks` agent; a different `DESKS_AGENT` override is refused.
-EKKA 0.6.10 or newer builds and writes the grant through `ekka desk grant update --yes`.
+EKKA 0.6.12 or newer builds and writes the grant through `ekka desk grant update --yes`.
 The installer creates the two desk administration plans with `ekka plan create` and writes the
-root-owned image, baseline policy, provider ceiling, discovery window and project records the CLI reads.
+root-owned image, baseline policy, provider ceiling and project records the CLI reads.
 It first checks `ekka gate grant list --json` for active `api.read` access on `apis/desks` for this
 agent and API gate. Only when missing, it adds a plain read grant with `ekka gate grant add`,
 `--capability api.read --ttl 31536000 --no-fingerprint`, without limits. That read access lets the
@@ -225,16 +225,19 @@ CLI fetch the adapter's facts even before a write grant exists.
 The CLI keeps an unchanged grant, or adds a 365-day grant, reads it back, then removes the old ones.
 A refusal or failure stops the installer and preserves the CLI's reason. A failure during removal
 may leave the new grant and some old grants in place; inspect `sudo ekka desk grant show --json`
-before retrying. Project and discovery input records are kept for inspection after an uncertain
-update; no automatic rollback grant is attempted. A pending project removal keeps its record as
-`<name>.project.json.old`.
+before retrying. If a project update fails, the installer restores the previous project records and
+attempts one more grant update. Inspect the CLI answer after a failure; this is not an atomic rollback.
 
 After success, the installer calls `ekka desk grant show --json` and accepts only a `keep` decision
 for the expected agent and API gate, with valid FULL limits at `preview.proposed`. It saves those limits atomically in
-`/var/lib/ekka-agent-desks/backend/desks-grant.json`, root-owned and mode 0644, for its local display,
-discovery provider checks and before/after image display. A failed confirmation stops with the grant
+`/var/lib/ekka-agent-desks/backend/desks-grant.json`, root-owned and mode 0644, for before/after image display and project commands. A failed confirmation stops with the grant
 in place and the previous local record retained (unless the disk fails to confirm a completed rename).
 The installer never computes a second set of limits.
+
+Before updating, the installer removes the retired window and policy files from the root-owned backend folder.
+It unlinks their names without following links and reports removed files in one line. Windows live in the active
+grant: the CLI preserves an unexpired window and its original expiry, and drops an expired window on update.
+If a grant command reports an outdated server setup, rerun the updated installer before using it.
 
 ## Onboarding a project: the discovery window
 
@@ -252,7 +255,19 @@ sudo ekka desk grant show               # the window: its image, its providers, 
 sudo ekka desk grant restore
 ```
 
-What holds it to one desk:
+The CLI commands are `ekka desk grant discovery --image <ref> --providers <a,b> [--minutes 60] [--yes] [--json]`
+and `ekka desk grant restore [--yes] [--json]`. Both preview the change and require the literal word `yes`,
+unless `--yes` is supplied. Without a terminal, pass `--yes`. The image must be
+`<registry>/<name>@sha256:<64 lowercase hex>`; name 1 to 8 distinct providers already in this server's limits.
+Minutes range from 1 to 240, default 60. A second opening is refused while a window is unexpired.
+Restore removes even an expired block, keeping project limits; with no block it succeeds without a grant write.
+
+The window does not enforce a one-desk quota. Restore closes the grant window but does not remove already-issued
+backend permits, which remain valid until their own expiry unless the desk returns to manual approval mode or is
+deleted. Finish the discovery run and clean up its desk as shown above. Simultaneous administrator changes are
+not atomic; inspect `ekka desk grant show` after overlapping changes.
+
+What restricts an eligible desk:
 
 - The grant's `discovery` block names the image, the providers and the closing time. The backend adapter turns auto
   mode on only for a desk named `discover-*`, created from that image, holding no other provider, while the window is
@@ -470,7 +485,7 @@ The installer installs the pinned EKKA release through EKKA's signed installer (
 
 Update one component at a time:
 
-- **EKKA Enclave:** use the release this setup configures. An explicit override, such as `sudo EKKA_VERSION=0.6.10 ./up.sh server <name>`, must be compatible with the integration's minimum release.
+- **EKKA Enclave:** use the release this setup configures. An explicit override, such as `sudo EKKA_VERSION=0.6.12 ./up.sh server <name>`, must be compatible with the integration's minimum release.
 - **Base image:** change `desk/image/` in a reviewed pull request; the next install or upgrade builds it. There is one Dockerfile, here.
 - **OpenShell:** update the release and image pins together. Verify checksums and run the integration checks before installing the change.
 - **Keycloak and Postgres:** back up their data before changing image pins. Startup may migrate the database; restoring an older image alone may not reverse a migration.
@@ -549,6 +564,10 @@ Enclave than the one it replaced:
 2. Desk work folders are not in a backup. Make each desk again, `ekka desk create <desk> --provider <profile>`, and
    revoke the Enclave the restore replaced, `ekka enclave revoke <id>`. **A backup is a secret:** it holds the Enclave's vault and the key that unlocks it. Keep it where you keep
 passwords.
+
+Discovery windows live in the active grant and are not restored from a local backup. Backups exclude the retired
+window and policy files; restore excludes them from older archives and safely unlinks any already on the machine
+before restarting services. Check `ekka desk grant show` after restoring.
 
 Tested: back up, destroy every volume and a certificate, restore. The sign-in realm, the administrator, both
 volumes with their owners and modes, and the certificate came back. A tampered backup is refused before anything
