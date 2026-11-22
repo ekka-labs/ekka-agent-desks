@@ -5,28 +5,11 @@ import re
 import tempfile
 from urllib.parse import urlsplit
 
-from .files import root_directory, root_file
+from .files import root_directory
+from .registry import read_credential
 from .runtime import HostError, STATE
 
 IMAGE = re.compile(r"[a-z0-9.-]+(?::[0-9]+)?(?:/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}")
-USER = re.compile(r"[A-Za-z0-9._-]{1,128}")
-
-
-def credential(path):
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return None
-    fields = {}
-    for line in root_file(path, private=True).splitlines():
-        key, sep, value = line.partition("=")
-        if not sep or key not in ("REGISTRY_USER", "REGISTRY_TOKEN") or key in fields:
-            raise HostError("the registry credential file is malformed")
-        fields[key] = value
-    user, token = fields.get("REGISTRY_USER", ""), fields.get("REGISTRY_TOKEN", "")
-    if not USER.fullmatch(user) or not (1 <= len(token) <= 8192) or not all(33 <= ord(c) <= 126 for c in token):
-        raise HostError("the registry credential file is malformed")
-    return user, token
 
 
 def pull(runtime, ref, identity=None, issuer=None):
@@ -44,7 +27,7 @@ def pull(runtime, ref, identity=None, issuer=None):
         raise HostError("the default desks installation is not complete")
     secrets = root_directory(STATE / "secrets")
     host = ref.split("/", 1)[0]
-    saved = credential(secrets / "registry" / (host + ".env"))
+    saved = read_credential(secrets / "registry" / (host + ".env"))
     action = "image pull " + ref
     runtime.audit(action, "requested")
     try:

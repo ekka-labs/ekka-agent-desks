@@ -6,6 +6,7 @@ import sys
 from .runtime import HostError, Runtime, stack_change, status
 from .settlement import recover
 from .images import pull
+from . import registry
 
 DESK_COMMANDS = {"connect": "ekka desk connect", "invite": "ekka desk people invite",
                  "revoke": "ekka desk people revoke", "grant": "ekka desk grant",
@@ -35,6 +36,14 @@ def parser():
     image_pull.add_argument("reference")
     image_pull.add_argument("--signed-by")
     image_pull.add_argument("--issuer")
+    registries = commands.add_parser("registry", help="keep or remove a private image-pull credential")
+    registry_actions = registries.add_subparsers(dest="verb", required=True)
+    registry_login = registry_actions.add_parser("login", help="validate and keep a credential from hidden input or stdin")
+    registry_login.add_argument("host")
+    registry_login.add_argument("user")
+    registry_actions.add_parser("show", help="list hosts and usernames, never credentials")
+    registry_logout = registry_actions.add_parser("logout", help="remove the local credential for one host")
+    registry_logout.add_argument("host")
     return cli
 
 
@@ -56,6 +65,13 @@ def main(argv=None, runtime=None, uid=None):
             stack_change(runtime, options.verb)
         elif options.command == "image":
             pull(runtime, options.reference, options.signed_by, options.issuer)
+        elif options.command == "registry":
+            if options.verb == "login":
+                registry.login(runtime, options.host, options.user)
+            elif options.verb == "show":
+                registry.show(runtime)
+            else:
+                registry.logout(runtime, options.host)
         else:
             recover(runtime, options.command, options.desk, options.operation,
                     getattr(options, "backend_id", None))

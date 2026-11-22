@@ -35,6 +35,18 @@ Exit codes: 0 means the requested check or service change passed, 1 means refuse
 invalid arguments or a desk action requested through the host command. Desk actions are refused with their intended
 native EKKA command; that message does not enable commands absent from the installed runner.
 
+## Registry credentials
+
+`registry login <host> <user>` validates and keeps one image-pull credential. Input is hidden at a terminal or read
+from stdin; it is never a command argument. For GitHub Packages the helper requires a classic token with exactly
+`read:packages` scope and checks the response from GitHub's API before attempting Docker login. A failed validation
+or login preserves the previous credential. A successful credential is written atomically with mode 0600 below the
+root-owned state directory, in the existing registry-file format. Docker login uses a temporary configuration that
+is removed after each command.
+
+`registry show` prints host and username only. `registry logout <host>` removes that host's local credential; it does
+not revoke the token at its issuer. All changes require a writable root audit log before execution.
+
 ## Pulling an image
 
 `image pull <registry>/<repository>@sha256:<digest>` pulls one immutable image and checks that Docker reports its
@@ -60,7 +72,7 @@ execution and after completion or failure. They do not invoke `up.sh`.
 
 ## Remaining migration
 
-Installation, upgrades, named instances, registry credential management, the full walk and the allow-listed
+Installation, upgrades, named instances, the full walk and the allow-listed
 NVIDIA recovery CLI still need native host implementations. Provider keys, people and grants belong in governed
 `ekka desk` commands. The old script and shadowing wrapper can be retired once all their actions have working
 replacements and the upgrade path preserves installed state. Do not use this preview to provision a second

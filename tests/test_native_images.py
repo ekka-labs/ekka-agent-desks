@@ -49,7 +49,7 @@ class NativeImageTests(unittest.TestCase):
     def invoke(self, **kwargs):
         with patch("ekka_host.images.STATE", self.state), \
              patch("ekka_host.images.root_directory", return_value=self.secrets), \
-             patch("ekka_host.images.root_file", side_effect=lambda p, **_: p.read_text()):
+             patch("ekka_host.registry.root_file", side_effect=lambda p, **_: p.read_text()):
             pull(self.host, kwargs.pop("ref", REF), **kwargs)
 
     def save_credential(self, text=None):
@@ -94,7 +94,7 @@ class NativeImageTests(unittest.TestCase):
         for options in ({"ref":"registry.example/team/desk:latest"}, {"ref":"--version"},
                         {"identity":"https://example.com/release"},
                         {"identity":"bad\x1bidentity", "issuer":"https://issuer.example"},
-                        {"identity":"release", "issuer":"https://user:password@issuer.example"}):
+                        {"identity":"release", "issuer":"https://user:password@example.com"}):
             with self.subTest(options=options), self.assertRaises(HostError):
                 self.invoke(**options)
         self.assertEqual(self.host.processes, [])
