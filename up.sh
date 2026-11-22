@@ -1186,7 +1186,7 @@ server_ekka() {
 registry_dir() { install -d -m 0700 -o root -g root "$DESKS_STATE/secrets/registry"; echo "$DESKS_STATE/secrets/registry"; }
 registry_login() {
   local host=$1 user=$2 token scopes cfg
-  [[ $host =~ ^[a-z0-9.-]+(:[0-9]+)?$ && -n $user && $user =~ ^[A-Za-z0-9._-]+$ ]] \
+  [[ $host =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ && -n $user && $user =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "usage: <token> | sudo ekka desk registry login <host> <user>   (the token comes on stdin, never as an argument)"
   [[ -t 0 ]] && die "the token comes from a pipe, never typed at a terminal: <token source> | sudo ekka desk registry login $host $user"
   IFS= read -r -d '' token || true; token=${token%$'\n'}
@@ -1194,7 +1194,8 @@ registry_login() {
   cfg=$(mktemp -d "$DESKS_STATE/secrets/.registry-login.XXXXXX"); chmod 0700 "$cfg"
   # shellcheck disable=SC2064  # expanded now on purpose: the folder's name
   trap "rm -rf '$cfg'" EXIT
-  if [[ $host == ghcr.io || $host == *.pkg.github.com ]]; then
+  local name=${host%:*}   # the registry without its port: ghcr.io:443 is still GitHub Packages
+  if [[ $name == ghcr.io || $name == *.pkg.github.com ]]; then
     # GitHub Packages: a CLASSIC token whose scopes are exactly read:packages. Its npm registry refuses fine-grained tokens,
     # and anything wider than read:packages is more than a pull needs. The header reaches curl from a file, never argv.
     [[ $token == ghp_* ]] || { token=; die "GitHub Packages needs a classic token (ghp_…) with the scope read:packages only; nothing was kept"; }
@@ -1203,7 +1204,9 @@ registry_login() {
     [[ $scopes == "read:packages" ]] || { token=; die "the token's scopes are '${scopes:-none}', not exactly read:packages; nothing was kept"; }
     ok "GitHub token: scope read:packages only"
   fi
-  mkdir -p "$cfg/docker"
+  # A config that names the registry: Docker picks a host credential helper (pass, secretservice) only for a config
+  # with no auth entry, so the credential stays in this throwaway folder and never reaches a helper's store.
+  mkdir -p "$cfg/docker"; ( umask 077; printf '{"auths":{"%s":{}}}\n' "$host" > "$cfg/docker/config.json" )
   printf '%s' "$token" | docker --config "$cfg/docker" login "$host" -u "$user" --password-stdin >/dev/null 2>&1 \
     || { token=; die "$host refused the credential for $user; nothing was kept"; }
   docker --config "$cfg/docker" logout "$host" >/dev/null 2>&1 || true
@@ -1221,16 +1224,19 @@ registry_show() {
   (( n > 0 )) || echo "no registry credential kept; public images need none"
 }
 image_pull() {  # image_pull <ref@sha256:…> [--signed-by <identity> --issuer <url>]: by digest, signature checked when asked, no login saved
-  local ref="" identity="" issuer=""
+  local ref="" identity="" issuer="" asked=0
   while (( $# )); do case "$1" in
-    --signed-by) identity=${2:-}; shift 2 ;; --issuer) issuer=${2:-}; shift 2 ;;
+    --signed-by) identity=${2:-}; asked=1; shift 2 ;; --issuer) issuer=${2:-}; asked=1; shift 2 ;;
     --*) die "usage: sudo ekka desk image pull <registry>/<name>@sha256:<64 hex> [--signed-by <certificate identity> --issuer <oidc issuer>]" ;;
     *) [[ -z $ref ]] || die "one image at a time"; ref=$1; shift ;; esac; done
   [[ $ref =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$ ]] \
     || die "the image must be <registry>/<name>@sha256:<64 hex>: a digest names exactly one image, a tag can move"
   [[ -z $identity && -z $issuer || -n $identity && -n $issuer ]] || die "--signed-by and --issuer go together"
+  # Asked for, even with empty values, a signature check is never skipped.
+  (( asked == 0 )) || [[ -n $identity ]] || die "--signed-by and --issuer must both name a value; nothing was pulled"
   local host=${ref%%/*} digest=${ref##*@} cfg cred
   cfg=$(mktemp -d "$DESKS_STATE/secrets/.image-pull.XXXXXX"); chmod 0700 "$cfg"; mkdir -p "$cfg/docker"
+  ( umask 077; printf '{"auths":{"%s":{}}}\n' "$host" > "$cfg/docker/config.json" )   # no host credential helper
   # shellcheck disable=SC2064
   trap "docker --config '$cfg/docker' logout '$host' >/dev/null 2>&1 || true; rm -rf '$cfg'" EXIT
   cred=$DESKS_STATE/secrets/registry/$host.env
@@ -1403,8 +1409,10 @@ case "${1:-}" in
     case "${2:-}" in
       login) registry_login "${3:-}" "${4:-}"; exit $? ;;
       show) registry_show; exit 0 ;;
-      logout) [[ ${3:-} =~ ^[a-z0-9.-]+(:[0-9]+)?$ ]] || die "usage: sudo ekka desk registry logout <host>"
-              rm -f "$DESKS_STATE/secrets/registry/${3}.env" && ok "no credential kept for ${3}"; exit 0 ;;
+      logout) [[ ${3:-} =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ ]] || die "usage: sudo ekka desk registry logout <host>"
+              # the half-written copy a login killed before its rename would leave holds the same credential
+              rm -f "$DESKS_STATE/secrets/registry/${3}.env" "$DESKS_STATE/secrets/registry/${3}.env.new" \
+                && ok "no credential kept for ${3}"; exit 0 ;;
       *) die "usage: <token> | sudo ekka desk registry login <host> <user>   |   sudo ekka desk registry show | logout <host>" ;;
     esac ;;
   image)  # a project image onto this machine, by digest: sudo ekka desk image pull <registry>/<name>@sha256:<64 hex> [--signed-by <identity> --issuer <url>]
