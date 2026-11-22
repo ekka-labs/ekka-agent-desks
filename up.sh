@@ -521,7 +521,16 @@ install_cli() {  # always NVIDIA's pinned CLI at our own path: a different opens
   local t; t=$(mktemp -d)
   [[ -n $OPENSHELL_CLI_SHA ]] || die "no openshell CLI is pinned for this machine's processor type ($MACHINE)"
   fetch_pinned "https://github.com/NVIDIA/OpenShell/releases/download/$OPENSHELL_TAG/$OPENSHELL_CLI_FILE" "$t/os.tgz" "$OPENSHELL_CLI_SHA" 0644
-  tar -xzf "$t/os.tgz" -C "$t"; install -D -m 0755 "$(find "$t" -type f -name openshell | head -1)" "$OS"; rm -rf "$t"
+  # Each step is checked by hand (a caller may run this under `||`, which switches set -e off), and the installed
+  # CLI must then name the pinned version, so an older one is never used in its place.
+  local bin
+  tar -xzf "$t/os.tgz" -C "$t" || { rm -rf "$t"; die "NVIDIA's openshell CLI could not be unpacked; nothing was installed"; }
+  bin=$(find "$t" -type f -name openshell | head -1)
+  [[ -n $bin ]] && install -D -m 0755 "$bin" "$OS" \
+    || { rm -rf "$t"; die "NVIDIA's openshell CLI could not be installed at $OS"; }
+  rm -rf "$t"
+  "$OS" --version 2>/dev/null | grep -q " ${OPENSHELL_TAG#v}\$" \
+    || die "the openshell CLI at $OS does not report version ${OPENSHELL_TAG#v}; nothing else was changed"
   ok "installed NVIDIA's openshell CLI $OPENSHELL_TAG ($MACHINE, pinned sha256) at $OS"
 }
 
@@ -796,6 +805,14 @@ sync_profiles() {  # the gateway's profiles = providers/, or this install's own;
 admin_setup() {
   "$OS" -g ekka-agent-desks workspace create --name desks 2>&1 | grep -v -i "already exists" || true
   "$OS" -g ekka-agent-desks workspace member add --workspace desks --subject "$1" --role user 2>&1 | grep -v -i "already" || true
+  # Either may have answered "already", or failed: what counts is the state read back. The workspace must answer
+  # and name the Enclave as a member before the profiles are synced and the setup is marked done.
+  local found
+  found=$("$OS" -g ekka-agent-desks workspace member list --workspace desks --page-size 10000 -o json \
+    | python3 tools/workspace_member.py "$1") \
+    || { printf 'up: %s\n' "the desk workspace could not be read back; the setup is not done" >&2; return 1; }
+  [[ $found == named ]] \
+    || { printf 'up: %s\n' "the desk workspace does not hold the Enclave; the setup is not done" >&2; return 1; }
   sync_profiles
 }
 
