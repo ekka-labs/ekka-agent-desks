@@ -68,23 +68,25 @@ JOB_LOCK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 # time, each opened with O_NOFOLLOW | O_DIRECTORY. Where the system has O_PATH it first looks at the lock itself
 # without opening it for reading, and only a regular file with one link is then opened, through that same look
 # (/proc/self/fd), never by its name again; a look that cannot be reopened is unreadable, never absent. Either way
-# the file read must be a regular file with one link. It writes the lock's bytes unchanged. Exit 3: the lock file itself is absent (nothing holds the
-# desk). Any other non-zero exit (7: a folder on the way is missing or not a real folder) means it could not be read.
+# the file read must be a regular file with one link, and after the read the lock's name must still name that same
+# file: a lock replaced or moved while it was read is unreadable. It writes the lock's bytes unchanged. Exit 3: the
+# lock file itself is absent (nothing holds the desk). Any other non-zero exit (7: a folder on the way is missing or
+# not a real folder) means it could not be read.
 LOCK_READER = (
     "import os, stat, sys\n"
     "parts = sys.argv[1].split('/')\n"
     "if parts[0] != '' or any(p in ('', '.', '..') for p in parts[1:]):\n"
     "    sys.exit(8)\n"
-    "fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)\n"
+    "d = os.open('/', os.O_RDONLY | os.O_DIRECTORY)\n"
     "for part in parts[1:-1]:\n"
     "    try:\n"
-    "        fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)\n"
+    "        d = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=d)\n"
     "    except OSError:\n"
     "        sys.exit(7)\n"
     "seen = None\n"
     "if hasattr(os, 'O_PATH'):\n"
     "    try:\n"
-    "        look = os.open(parts[-1], os.O_PATH | os.O_NOFOLLOW, dir_fd=fd)\n"
+    "        look = os.open(parts[-1], os.O_PATH | os.O_NOFOLLOW, dir_fd=d)\n"
     "    except FileNotFoundError:\n"
     "        sys.exit(3)\n"
     "    except OSError:\n"
@@ -95,7 +97,7 @@ LOCK_READER = (
     "    name, at = '/proc/self/fd/%d' % look, None\n"
     "    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY\n"
     "else:\n"
-    "    name, at = parts[-1], fd\n"
+    "    name, at = parts[-1], d\n"
     "    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY\n"
     "try:\n"
     "    fd = os.open(name, flags, dir_fd=at)\n"
@@ -111,6 +113,12 @@ LOCK_READER = (
     f"data = os.read(fd, {LOCK_LIMIT + 1})\n"
     f"if len(data) > {LOCK_LIMIT}:\n"
     "    sys.exit(6)\n"
+    "try:\n"
+    "    now = os.stat(parts[-1], dir_fd=d, follow_symlinks=False)\n"
+    "except OSError:\n"
+    "    sys.exit(5)\n"
+    "if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):\n"
+    "    sys.exit(5)\n"
     "sys.stdout.buffer.write(data)\n")
 USAGE = ("usage: sudo ./up.sh desks settle <desk> --operation <request id> [--backend-id <uuid>]\n"
          "       sudo ./up.sh desks unhold <desk> --operation <request id>")

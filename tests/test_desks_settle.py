@@ -594,33 +594,73 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual(r.returncode, 5, r.stderr)
         self.assertEqual(r.stdout, b"")
 
-    @unittest.skipUnless(hasattr(os, "O_PATH"), "the look before the open needs O_PATH (Linux)")
-    def test_the_lock_read_is_the_one_looked_at_even_when_its_name_moves(self):
-        # Between the look and the read, the name is given to a FIFO. The reader reads the file it looked at, through
-        # that look; it never opens what the name now points to.
-        folder = os.path.realpath(tempfile.mkdtemp())
-        lock = os.path.join(folder, "code-desk.lock")
-        with open(lock, "wb") as f:
-            f.write(f"admin:{OP}".encode())
+    def reader_with_open_hook(self, lock, hook):
+        """The reader's own code, run in this process with os.open wrapped, so a step can be made to happen between
+        two of its own calls. Returns (exit code, bytes written)."""
         real_open = os.open
 
-        def swapping_open(path, flags, *args, **kwargs):
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_PATH:
-                os.rename(lock, lock + ".moved")
-                os.mkfifo(lock)
-            return fd
+        def hooked(path, flags, *args, **kwargs):
+            return hook(real_open, path, flags, *args, **kwargs)
 
         class Out:
             buffer = io.BytesIO()
         code = 0
-        with mock.patch.object(os, "open", swapping_open), mock.patch.object(sys, "argv", ["reader", lock]), \
+        with mock.patch.object(os, "open", hooked), mock.patch.object(sys, "argv", ["reader", lock]), \
                 mock.patch.object(sys, "stdout", Out()):
             try:
                 exec(ds.LOCK_READER, {"__name__": "reader"})
             except SystemExit as e:
                 code = e.code
-        self.assertEqual((code, Out.buffer.getvalue()), (0, f"admin:{OP}".encode()))
+        return code, Out.buffer.getvalue()
+
+    def test_a_lock_whose_name_changes_while_it_is_read_is_unreadable(self):
+        # What is read must still be what the lock's name names once the read is done; otherwise the bytes are no
+        # evidence about the desk's lock, and nothing is printed.
+        folder = os.path.realpath(tempfile.mkdtemp())
+        lock = os.path.join(folder, "code-desk.lock")
+        with open(lock, "wb") as f:
+            f.write(f"admin:{OP}".encode())
+
+        def renamed_after_open(real_open, path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if not flags & getattr(os, "O_PATH", 0) and not flags & os.O_DIRECTORY:
+                os.rename(lock, lock + ".old")
+                with open(lock, "wb") as f:
+                    f.write(f"admin:{OP}".encode())
+            return fd
+        self.assertEqual(self.reader_with_open_hook(lock, renamed_after_open), (5, b""))
+
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "the look before the open needs O_PATH (Linux)")
+    def test_a_look_that_cannot_be_reopened_is_unreadable_never_absent(self):
+        folder = os.path.realpath(tempfile.mkdtemp())
+        lock = os.path.join(folder, "code-desk.lock")
+        with open(lock, "wb") as f:
+            f.write(f"admin:{OP}".encode())
+
+        def no_proc(real_open, path, flags, *args, **kwargs):
+            if str(path).startswith("/proc/self/fd/"):
+                raise FileNotFoundError(path)
+            return real_open(path, flags, *args, **kwargs)
+        self.assertEqual(self.reader_with_open_hook(lock, no_proc), (4, b""))
+
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "the look before the open needs O_PATH (Linux)")
+    def test_the_lock_read_is_the_one_looked_at_never_what_its_name_points_to_next(self):
+        # The name is given to a FIFO between the look and the read: the FIFO is never opened.
+        folder = os.path.realpath(tempfile.mkdtemp())
+        lock = os.path.join(folder, "code-desk.lock")
+        with open(lock, "wb") as f:
+            f.write(f"admin:{OP}".encode())
+        opened = []
+
+        def swapping_open(real_open, path, flags, *args, **kwargs):
+            opened.append(str(path))
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_PATH:
+                os.rename(lock, lock + ".moved")
+                os.mkfifo(lock)
+            return fd
+        self.assertEqual(self.reader_with_open_hook(lock, swapping_open), (5, b""))
+        self.assertEqual(opened.count("code-desk.lock"), 1, "the name was opened again after the look")
 
     def lock_bytes_through_the_reader(self, data, argv, docker):
         """ds.main with its default reader, run for real as this user, on a lock file holding exactly `data`."""
@@ -657,12 +697,14 @@ class ReviewFixes(unittest.TestCase):
         # door, so it can never match a lock that carries the same line ending.
         for desk, op in (("code-desk", OP + "\n"), ("code-desk\n", OP)):
             with self.subTest(desk=desk, op=op):
+                self.lock_reads = 0
                 docker = FakeDocker([STOPPED], files={f"{OP}.hold": "{}"})
                 rc, out = self.lock_bytes_through_the_reader(f"admin:{OP}\n".encode(),
                                                              ["--unhold", desk, "--operation", op], docker)
                 self.assertEqual(rc, 1, out)
                 self.assertEqual(list(docker.files), [f"{OP}.hold"], "a hold was released for a malformed id")
                 self.assertEqual(docker.calls, [], "something ran before the arguments were checked")
+                self.assertEqual(self.lock_reads, 0, "a lock was read for arguments that are refused")
 
     def settle_reading_for_real(self, desks, argv=None, docker=None):
         """up.sh's own path: ds.main with its default reader, run for real as this user (runuser and its clean
@@ -670,6 +712,8 @@ class ReviewFixes(unittest.TestCase):
         real_run = subprocess.run
 
         def as_this_user(command, **kwargs):
+            if ds.LOCK_READER in command:
+                self.lock_reads = getattr(self, "lock_reads", 0) + 1
             if command[:1] == ["runuser"]:
                 command = list(command[command.index("LANG=C.UTF-8") + 1:])
                 command[0] = sys.executable if command[0] == "/usr/bin/python3" else command[0]
