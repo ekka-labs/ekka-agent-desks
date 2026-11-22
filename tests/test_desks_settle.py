@@ -635,6 +635,46 @@ class ReviewFixes(unittest.TestCase):
             go(None, locks=(f"admin:{OP}", "pending"), docker=docker)
         self.assertEqual(list(docker.files), [f"{OP}.hold"])
 
+    def test_a_reader_that_cannot_start_is_never_read_as_no_lock(self):
+        # The first read claims the change; on the second, runuser cannot start. That says nothing about the lock.
+        state = self.state()
+
+        class Docker(FakeDocker):
+            def __call__(self, args, stdin=None):
+                if args[0] == "restart":
+                    self.calls.append(args)
+                    return 0, ""
+                return super().__call__(args, stdin)
+        docker = Docker([STOPPED])
+        reads = []
+
+        def runuser(command, **kwargs):
+            reads.append(command)
+            if len(reads) == 1:
+                return subprocess.CompletedProcess(command, 0, f"admin:{OP}", "")
+            raise FileNotFoundError(2, "No such file or directory", "runuser")
+        clock, settle = Clock(), ds.settle
+        quick = lambda *a, **k: settle(*a, clock=clock, sleep=clock.sleep, **k)  # noqa: E731
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err), mock.patch.object(ds, "settle", quick), \
+             mock.patch.object(ds.subprocess, "run", runuser), mock.patch.dict(os.environ, {"DESKS_STATE": state}):
+            rc = ds.main(["code-desk", "--operation", OP], run=docker, ekka=enclave)
+        self.assertEqual(rc, 1, err.getvalue())
+        self.assertEqual(list(docker.files), [f"{OP}.hold"], "the hold was released without the lock being seen")
+
+    def test_a_claim_with_a_control_character_is_not_another_change(self):
+        docker = FakeDocker([STOPPED])
+        with self.assertRaisesRegex(ds.Refused, "The hold stays"):
+            go(None, locks=(f"admin:{OP}", f"admin:{self.OTHER}\x1c"), docker=docker)
+        self.assertEqual(list(docker.files), [f"{OP}.hold"])
+
+    def test_an_unmatched_hold_is_not_sent_to_an_unhold_that_cannot_match_it(self):
+        docker = FakeDocker([STOPPED])
+        with self.assertRaises(ds.Refused) as refused:
+            go(None, locks=(f"admin:{OP}", "pending"), docker=docker)
+        self.assertIn("by hand", str(refused.exception))
+        self.assertNotIn("desks unhold", str(refused.exception))
+
     def test_the_restart_says_every_running_desk_stops(self):
         marker, docker, said, restarts = go([STOPPED])
         self.assertTrue(any("running desks on this machine stop" in line for line in said), said)

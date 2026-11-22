@@ -366,5 +366,67 @@ class TheSetupClientIsReadStrictly(unittest.TestCase):
         self.assertIs(keycloak.writes[-1][2]["enabled"], False)
 
 
+class SetupKeycloak:
+    """The admin API calls `setup-client on` makes. `client` may start as a desks-setup client an interrupted `on`
+    left behind: created, but without its scope or its role."""
+
+    def __init__(self, client=None):
+        self.scopes = [{"id": "s-all", "name": "openshell:all"}]
+        self.client = client
+        self.defaults = set()
+        self.roles = []
+        self.created = None
+
+    def get(self, path):
+        if path == REALM + "/client-scopes":
+            return list(self.scopes)
+        if path == REALM + "/clients?clientId=desks-setup":
+            return [copy.deepcopy(self.client)] if self.client else []
+        if path == REALM + "/clients/c-setup/default-client-scopes":
+            return [s for s in self.scopes if s["id"] in self.defaults]
+        if path == REALM + "/clients/c-setup/service-account-user":
+            return {"id": "u-setup"}
+        if path == REALM + "/roles/openshell-admin":
+            return {"name": "openshell-admin"}
+        if path == REALM + "/users/u-setup/role-mappings/realm":
+            return [{"name": r} for r in self.roles]
+        if path == REALM + "/clients/c-setup/client-secret":
+            return {"value": SECRET}
+        raise AssertionError("unexpected GET " + path)
+
+    def write(self, method, path, body):
+        if path == REALM + "/clients" and method == "POST":
+            self.created = dict(body)
+            self.client = {"id": "c-setup", **body}
+        elif path == REALM + "/clients/c-setup" and method == "PUT":
+            self.client = {**self.client, **body}
+        elif path == REALM + "/clients/c-setup/default-client-scopes/s-all" and method == "PUT":
+            self.defaults.add("s-all")
+        elif path == REALM + "/users/u-setup/role-mappings/realm" and method == "POST":
+            self.roles += [r["name"] for r in body]
+        else:
+            raise AssertionError(f"unexpected {method} {path}")
+
+
+class TheSetupClientIsWholeBeforeItIsEnabled(unittest.TestCase):
+    def test_a_client_an_interrupted_on_left_gets_its_scope_and_role(self):
+        kc = SetupKeycloak({"id": "c-setup", "clientId": "desks-setup", "enabled": False})
+        code, out = run(["setup-client", "on"], kc)
+        self.assertEqual((code, out), (0, SECRET))
+        self.assertEqual(kc.roles, ["openshell-admin"], "enabled without the administrator role")
+        self.assertEqual(kc.defaults, {"s-all"})
+        self.assertIs(kc.client["enabled"], True)
+
+    def test_a_new_client_is_created_disabled_and_enabled_once_whole(self):
+        kc = SetupKeycloak()
+        code, _ = run(["setup-client", "on"], kc)
+        self.assertEqual(code, 0)
+        self.assertIs(kc.created["enabled"], False, "created enabled, before its role was assigned")
+        self.assertEqual(kc.roles, ["openshell-admin"])
+        self.assertIs(kc.client["enabled"], True)
+        run(["setup-client", "on"], kc)
+        self.assertEqual(kc.roles, ["openshell-admin"], "the role was assigned twice")
+
+
 if __name__ == "__main__":
     unittest.main()

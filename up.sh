@@ -558,22 +558,27 @@ except BlockingIOError:
   # A fresh sign-in folder every time: a folder an interrupted session left can hold a registration of its own.
   rm -rf "$home"; [[ ! -e $home && ! -L $home ]] \
     || { exec 87>&-; die "the gateway's old sign-in folder ($home) could not be removed; nothing was changed"; }
-  # Ctrl-C, SIGTERM and SIGHUP are noted (bash runs this once the command in progress has ended): the session then
-  # switches access off, reads it back and returns 130 to its caller, so the caller's own cleanup still runs.
+  # Ctrl-C, SIGTERM and SIGHUP are noted, for the whole session (bash runs this once the command in progress has
+  # ended). Keycloak's own commands run shielded: signals are ignored in their subshell, and they inherit that.
+  # A session interrupted before its call returns 130; a call that already ran keeps its own result, so the caller
+  # never reports as undone what was done. Either way access is switched off first, and the caller's own cleanup runs.
+  local called=0 closed=1
   trap 'interrupted=1' INT TERM HUP
   # `on` enables the client before it reads the secret, so a failed `on` may have left it enabled: it is switched off
   # again and read back, and a failure there too is said, never "nothing was changed".
-  setup_client_secret=$(kc setup-client on) && [[ -n $setup_client_secret ]] || {
-    trap '' INT TERM HUP
-    kc setup-client off >/dev/null 2>&1 && st=$(kc setup-client status 2>/dev/null) && [[ $st == disabled ]] \
+  setup_client_secret=$(trap '' INT TERM HUP; kc setup-client on) && [[ -n $setup_client_secret ]] || {
+    ( trap '' INT TERM HUP; kc setup-client off >/dev/null 2>&1 ) && st=$(trap '' INT TERM HUP; kc setup-client status 2>/dev/null) \
+      && [[ $st == disabled ]] \
       || die "Keycloak did not switch the gateway's setup client on, and it may still be switched on; run the same command again"
     trap - INT TERM HUP; exec 87>&-
+    (( interrupted == 0 )) || return 130
     die "Keycloak did not switch the gateway's setup client on; nothing was changed"; }
   # NVIDIA's gateway flags read these too; one kept by `sudo -E` would send the calls, and this sign-in, elsewhere.
   # NVIDIA's CLI falls back to /etc/openshell for a registration its own home lacks, as it does after a `gateway add`
   # whose sign-in failed (it removes its registration and still exits 0). An empty system folder of this session's own
   # leaves no registration but the one just added, and that one is read back before the secret signs in anywhere.
-  (( interrupted == 0 )) && (
+  # Sign-in and the call run in two steps, so an interruption during sign-in stops the call from starting.
+  if (( interrupted == 0 )); then (
     unset OPENSHELL_GATEWAY OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_INSECURE XDG_CONFIG_HOME
     export OPENSHELL_OIDC_CLIENT_SECRET=$setup_client_secret SSL_CERT_FILE=$DESKS_STATE/tls/ca.crt HOME=$home
     export OPENSHELL_SYSTEM_GATEWAY_DIR=$HOME/system
@@ -591,20 +596,31 @@ sys.exit(0 if isinstance(kept, dict) and all(kept.get(k) == v for k, v in want.i
       "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json" "https://$NAME:8080" \
       "https://$NAME/realms/ekka-desks" 2>/dev/null || exit 97
     "$OS" gateway login ekka-agent-desks >/dev/null || exit 97  # 97: never an answer of the call it guards
-    "$@"
-  ) || rc=$?
-  # The switch-off and its read-back run to the end: signals are ignored here, and the children inherit that.
-  trap '' INT TERM HUP
+  ) || rc=$?; fi
+  if (( rc == 0 && interrupted == 0 )); then
+    called=1
+    ( unset OPENSHELL_GATEWAY OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_INSECURE XDG_CONFIG_HOME
+      export OPENSHELL_OIDC_CLIENT_SECRET=$setup_client_secret SSL_CERT_FILE=$DESKS_STATE/tls/ca.crt HOME=$home
+      export OPENSHELL_SYSTEM_GATEWAY_DIR=$HOME/system
+      "$@"
+    ) || rc=$?
+  fi
   unset setup_client_secret
-  kc setup-client off >/dev/null || die "the gateway's setup client may still be switched on; run the same command again"
-  # A successful switch-off alone is not proof: it is read back, by its exit status and its answer.
-  st=$(kc setup-client status) && [[ $st == disabled ]] \
-    || die "the gateway's setup client is not confirmed switched off; run the same command again"
+  # The switch-off, its read-back (exit status and answer) and the folder's removal are each attempted whatever the
+  # others did; the caller always gets control back, so its own cleanup (the download safety pass) still runs.
+  ( trap '' INT TERM HUP; kc setup-client off >/dev/null ) \
+    || { closed=0; printf 'up: %s\n' "the gateway's setup client may still be switched on; run the same command again" >&2; }
+  st=$(trap '' INT TERM HUP; kc setup-client status) && [[ $st == disabled ]] \
+    || { closed=0; printf 'up: %s\n' "the gateway's setup client is not confirmed switched off; run the same command again" >&2; }
   rm -rf "$home"; [[ ! -e $home && ! -L $home ]] \
-    || die "the gateway's sign-in folder ($home) could not be removed; remove it before anything else"
+    || { closed=0; printf 'up: %s\n' "the gateway's sign-in folder ($home) could not be removed; remove it before anything else" >&2; }
   trap - INT TERM HUP
   exec 87>&-
-  (( interrupted == 0 )) || { say "interrupted: the gateway's setup client is switched off again"; return 130; }
+  (( closed == 1 )) || return 70   # 70: the session did not close; never an answer of the call it guards
+  if (( interrupted == 1 )); then
+    (( called == 1 )) || { say "interrupted: the call did not run, and the gateway's setup client is switched off again"; return 130; }
+    say "interrupted: the call had already finished; its result stands, and the setup client is switched off again"
+  fi
   (( rc != 97 )) || die "could not sign in to NVIDIA's gateway as its administrator; nothing was changed there"
   return $rc
 }
@@ -799,7 +815,7 @@ step_admin() {
   fi
   say "the gateway's one-time setup (workspace, the Enclave's membership, provider profiles)"
   local sub; sub=$(cd deploy && bash setup.sh enclave-subject)
-  as_gateway_admin admin_setup "$sub" || die "the gateway's setup did not finish; desks-setup is disabled again. Re-run to retry"
+  as_gateway_admin admin_setup "$sub" || die "the gateway's setup did not finish (any line above says whether desks-setup is off). Re-run to retry"
   done_ admin
   done_ "profiles-$OPENSHELL_TAG"
   ok "workspace desks, the Enclave as a member, the profiles in providers/; desks-setup disabled again"
@@ -1240,6 +1256,14 @@ image_pull() {  # image_pull <ref@sha256:…> [--signed-by <identity> --issuer <
   # shellcheck disable=SC2064
   trap "docker --config '$cfg/docker' logout '$host' >/dev/null 2>&1 || true; rm -rf '$cfg'" EXIT
   cred=$DESKS_STATE/secrets/registry/$host.env
+  local name=${host%:*}
+  if [[ -f $cred && $name != "$host" && ( $name == ghcr.io || $name == *.pkg.github.com ) ]]; then
+    # Kept before the GitHub scope check covered a port (ghcr.io:443): checked now, before it is used.
+    printf 'header = "Authorization: token %s"\n' "$(sed -n 's/^REGISTRY_TOKEN=//p' "$cred")" > "$cfg/curl.cfg"; chmod 0600 "$cfg/curl.cfg"
+    [[ $(curl -fsS -K "$cfg/curl.cfg" -o /dev/null -D - https://api.github.com/user 2>/dev/null | tr -d '\r' \
+         | sed -n 's/^x-oauth-scopes: *//Ip' | head -1) == "read:packages" ]] \
+      || die "the credential kept for $host is not limited to read:packages; log in again: <token> | sudo ekka desk registry login $host <user>"
+  fi
   if [[ -f $cred ]]; then
     sed -n 's/^REGISTRY_TOKEN=//p' "$cred" | docker --config "$cfg/docker" login "$host" -u "$(sed -n 's/^REGISTRY_USER=//p' "$cred")" --password-stdin >/dev/null 2>&1 \
       || die "$host refused the kept credential; renew it: <token> | sudo ekka desk registry login $host <user>"
@@ -1409,10 +1433,12 @@ case "${1:-}" in
     case "${2:-}" in
       login) registry_login "${3:-}" "${4:-}"; exit $? ;;
       show) registry_show; exit 0 ;;
-      logout) [[ ${3:-} =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ ]] || die "usage: sudo ekka desk registry logout <host>"
+      # Logout accepts every name an earlier login could have kept (ghcr.io. included), never a path.
+      logout) [[ ${3:-} =~ ^[a-z0-9.-]+(:[0-9]+)?$ && ${3%%:*} != . && ${3%%:*} != .. ]] || die "usage: sudo ekka desk registry logout <host>"
               # the half-written copy a login killed before its rename would leave holds the same credential
               rm -f "$DESKS_STATE/secrets/registry/${3}.env" "$DESKS_STATE/secrets/registry/${3}.env.new" \
-                && ok "no credential kept for ${3}"; exit 0 ;;
+                || die "the credential for ${3} could not be removed"
+              ok "no credential kept for ${3}"; exit 0 ;;
       *) die "usage: <token> | sudo ekka desk registry login <host> <user>   |   sudo ekka desk registry show | logout <host>" ;;
     esac ;;
   image)  # a project image onto this machine, by digest: sudo ekka desk image pull <registry>/<name>@sha256:<64 hex> [--signed-by <identity> --issuer <url>]

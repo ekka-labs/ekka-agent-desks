@@ -593,6 +593,12 @@ sudo ./up.sh desks unhold <desk> --operation <request id>
 
 Unhold removes the hold only while that desk's lock still names the change: the hold itself names no desk, so a request id from another desk is refused and nothing is removed. A hold whose change has ended (the desk's lock no longer names it) is inert: the adapter never re-issues an ended change. One settle or unhold runs at a time on the machine, and a desk lock that is empty, unreadable or behind a linked folder keeps the hold in place. After that the adapter may re-issue the change, or you settle it again.
 
+If the settle says the desk's lock names neither this change nor another one, unhold cannot match the hold to the desk. Check the desk with `ekka desk status <desk>`; only once you know the change has ended, remove the hold by hand, with the alpine image pinned as `WRITER_IMAGE` in `tools/desks_settle.py`:
+
+```sh
+sudo docker run --rm --network none --user 2000:1000 -v ekka-desks_ekka-backend-state:/s <WRITER_IMAGE> rm -f /s/settle/<request id>.hold
+```
+
 Then run `ekka desk status code-desk` again. The adapter reads the marker once, settles the change and frees the desk.
 
 ## When something fails

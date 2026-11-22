@@ -100,6 +100,10 @@ class Refused(Exception):
     """A reason to stop with nothing written."""
 
 
+class Unmatched(Refused):
+    """The desk's lock names neither this change nor another one: the hold stays, and unhold cannot match it."""
+
+
 def docker(args, stdin=None):
     r = subprocess.run(["docker", *args], input=stdin, capture_output=True, text=True,
                        stdin=None if stdin is not None else subprocess.DEVNULL)
@@ -117,9 +121,13 @@ def enclave_ekka(args):
 
 def read_as_enclave(path):
     """The desk's lock, read as the native Enclave's user (never as root) through LOCK_READER."""
-    r = subprocess.run(["runuser", "-u", ENCLAVE_USER, "--", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
-                        "HOME=/var/lib/ekka", "LANG=C.UTF-8", "/usr/bin/python3", "-I", "-c", LOCK_READER, path],
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    try:
+        r = subprocess.run(["runuser", "-u", ENCLAVE_USER, "--", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
+                            "HOME=/var/lib/ekka", "LANG=C.UTF-8", "/usr/bin/python3", "-I", "-c", LOCK_READER, path],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except OSError:
+        # The reader did not start: that says nothing about the lock, and must never read as "no lock".
+        raise OSError("the desk lock reader could not be started") from None
     if r.returncode == 3:
         raise FileNotFoundError(path)
     if r.returncode != 0:
@@ -168,16 +176,22 @@ def stop_timeout(gateway_toml_text):
     return DEFAULT_STOP_TIMEOUT
 
 
+def claim(lock_text):
+    """The lock's text as the Enclave wrote it: at most one trailing newline is dropped, nothing else. (str.strip()
+    would also drop control characters such as \\x1c, turning a damaged lock into a valid claim.)"""
+    text = lock_text or ""
+    return text[:-1] if text.endswith("\n") else text
+
+
 def holds(lock_text, operation_id):
     """True when the lock is this change's claim: exactly `admin:<id>`, or `admin:<id> unknown`."""
-    held = (lock_text or "").strip()
-    return held in (f"admin:{operation_id}", f"admin:{operation_id} unknown")
+    return claim(lock_text) in (f"admin:{operation_id}", f"admin:{operation_id} unknown")
 
 
 def holder(lock_text):
     """Who the lock names, for the operator: a job's attempt, another change, or nobody. Only a lock in one of the
     two shapes the Enclave writes is quoted; anything else is described, never printed."""
-    held = (lock_text or "").strip()
+    held = claim(lock_text)
     if not held:
         return "nothing holds it"
     if ADMIN_LOCK.fullmatch(held):
@@ -296,6 +310,11 @@ def settle(desk, operation_id, backend_id=None, run=docker, clock=now, sleep=tim
     try:
         return _settle_held(desk, operation_id, backend_id, run, clock, sleep, restart, read_lock, window, give_up,
                             poll, out, identity)
+    except Unmatched as e:
+        raise Refused(f"{e}. The hold stays, so change {operation_id} is not re-issued. The desk's lock does not name "
+                      f"this change, so unhold cannot match the hold to desk '{desk}': check the desk with "
+                      f"`ekka desk status {desk}`, and only once you know the change has ended remove the hold by "
+                      "hand (docs/OPERATIONS.md, \"The hold\")") from e
     except Refused as e:
         raise Refused(f"{e}. The hold stays, so change {operation_id} is not re-issued. Check the desk with "
                       f"`ekka desk status {desk}`, then: {unhold_command} {desk} --operation {operation_id}") from e
@@ -313,9 +332,9 @@ def _settle_held(desk, operation_id, backend_id, run, clock, sleep, restart, rea
     if not holds(lock, operation_id):
         # Only positive evidence lets the hold go: the lock file is gone (None), or another change's claim replaced
         # it. Anything else, a job's attempt id included (one word proves nothing on its own), keeps the hold.
-        if lock is not None and not ADMIN_LOCK.fullmatch(lock.strip()):
-            raise Refused("the desk lock no longer names this change, but it names no other change either; "
-                          "no marker was written")
+        if lock is not None and not ADMIN_LOCK.fullmatch(claim(lock)):
+            raise Unmatched("the desk lock no longer names this change, but it names no other change either; "
+                            "no marker was written")
         remove_hold(operation_id, run)
         out(f"change {operation_id} no longer holds desk '{desk}': it was settled meanwhile. No marker was written, "
             "and the hold is removed.")

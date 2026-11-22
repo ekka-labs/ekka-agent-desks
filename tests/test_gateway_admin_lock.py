@@ -101,7 +101,8 @@ class OnlyThisSessionsRegistration(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "openshell-admin")), "the session's folder was kept")
 
 
-def run_session(d, action="echo did-the-call", status="disabled", add="keeps", on_hook=":", rm_fails=False):
+def run_session(d, action="echo did-the-call", status="disabled", add="keeps", on_hook=":", rm_fails=False,
+                login_hook=":", off_hook=":", caller='rc=0; as_gateway_admin action || rc=$?; echo "rc=$rc"'):
     """as_gateway_admin with NVIDIA's CLI behaving as 0.1.9 does: `gateway add` refuses a name whose user registration
     already exists (commands/gateway.rs), and `login` signs in with whatever registration its home holds."""
     log = os.path.join(d, "log")
@@ -121,6 +122,7 @@ case "$1 $2" in
                  printf '{{"gateway_endpoint":"%s","auth_mode":"oidc","oidc_issuer":"https://elsewhere.example/r","oidc_client_id":"desks-setup"}}' "$3" > "{meta}" ;;
     esac ;;
   "gateway login") [ -e "{meta}" ] || exit 1
+    eval "$LOGIN_HOOK"
     echo "login $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["oidc_issuer"])' "{meta}")" >> "{log}" ;;
 esac
 exit 0
@@ -130,20 +132,20 @@ exit 0
     open(log, "a").close()
     script = f"""
 set -euo pipefail
-DESKS_STATE={d}; OS={stubs}/os; NAME=desks.example.com
+DESKS_STATE={d}; OS={stubs}/os; NAME=desks.example.com; export MAIN_PID=$$
 die() {{ echo "die: $*" >&2; exit 1; }}
 install_cli() {{ :; }}
 getent() {{ return 0; }}
 say() {{ echo "say: $*"; }}
 kc() {{ echo "kc $*" >> {log}; case "$1 $2" in "setup-client on") {on_hook}; printf the-secret ;;
+  "setup-client off") {off_hook} ;;
   "setup-client status") echo "$STATUS" ;; esac; }}
 {"rm() { return 1; }" if rm_fails else ""}
 action() {{ {action}; }}
 {function()}
-rc=0; as_gateway_admin action || rc=$?
-echo "rc=$rc"
+{caller}
 """
-    env = dict(os.environ, PATH=stubs + os.pathsep + os.environ["PATH"], STATUS=status, ADD=add)
+    env = dict(os.environ, PATH=stubs + os.pathsep + os.environ["PATH"], STATUS=status, ADD=add, LOGIN_HOOK=login_hook)
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
     with open(log) as f:
         return r, f.read().splitlines()
@@ -180,12 +182,42 @@ class TheLegacySessionIsRecoverable(unittest.TestCase):
 
     def test_sigterm_during_the_call_switches_access_off_and_returns_to_the_caller(self):
         # The caller must get control back: `up.sh openshell sandbox download` makes the downloaded folder safe after
-        # the call, whatever the call's result.
+        # the call, whatever the call's result. A call that already ran keeps its own result.
         with tempfile.TemporaryDirectory() as d:
-            r, calls = run_session(d, action="kill -TERM $$; sleep 1")
-            self.assertIn("rc=130", r.stdout, r.stderr)
+            r, calls = run_session(d, action="kill -TERM $$; sleep 1; return 0")
+            self.assertIn("rc=0", r.stdout, r.stderr)
+            self.assertIn("its result stands", r.stdout)
             self.assertEqual(calls[-2:], ["kc setup-client off", "kc setup-client status"], calls)
             self.assertFalse(os.path.exists(os.path.join(d, "openshell-admin")), "the sign-in stayed on disk")
+
+    def test_a_signal_during_sign_in_stops_the_call_from_starting(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, calls = run_session(d, login_hook="kill -TERM $MAIN_PID")   # the session's own shell, not the sign-in step
+            self.assertIn("rc=130", r.stdout, r.stderr)
+            self.assertNotIn("did-the-call", r.stdout, "the call started after the signal")
+            self.assertEqual(calls[-2:], ["kc setup-client off", "kc setup-client status"], calls)
+
+    def test_a_signal_during_the_switch_off_is_not_lost(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, calls = run_session(d, action=":", off_hook="kill -TERM $$")
+            self.assertIn("rc=0", r.stdout, r.stderr)   # the call had already run; its result stands
+            self.assertIn("interrupted", r.stdout, "the signal during the switch-off was lost")
+            self.assertEqual(calls[-2:], ["kc setup-client off", "kc setup-client status"], calls)
+
+    def test_a_switch_off_that_fails_still_hands_back_for_the_download_safety_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, calls = run_session(d, status="enabled",
+                                   caller='rc=0; as_gateway_admin action || rc=$?; echo "safety-pass rc=$rc"')
+            self.assertIn("safety-pass rc=70", r.stdout, r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(d, "openshell-admin")), "the sign-in stayed on disk")
+
+    def test_no_other_session_starts_while_the_call_runs(self):
+        contender = ("python3 -c 'import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+                     "try:\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); print(\"contender got the lock\")\n"
+                     "except BlockingIOError:\n    print(\"contender refused\")' \"$DESKS_STATE/gateway-admin.lock\"")
+        with tempfile.TemporaryDirectory() as d:
+            r, calls = run_session(d, action=contender)
+            self.assertIn("contender refused", r.stdout, r.stdout + r.stderr)
 
     def test_a_signal_before_the_sign_in_skips_the_call(self):
         with tempfile.TemporaryDirectory() as d:

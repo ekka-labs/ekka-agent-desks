@@ -436,9 +436,9 @@ def main(argv):
         if c is None:
             if argv[1] == "off":
                 return 0
-            scopes = {s["name"]: s["id"] for s in api.get(realm_path(spec, "/client-scopes")) or []}
+            # Created disabled: it is enabled below, only once its scope and role are confirmed.
             api.write("POST", realm_path(spec, "/clients"), {
-                "clientId": "desks-setup", "name": "up.sh: the gateway's one-time setup", "enabled": True,
+                "clientId": "desks-setup", "name": "up.sh: the gateway's one-time setup", "enabled": False,
                 "publicClient": False, "serviceAccountsEnabled": True, "standardFlowEnabled": False,
                 "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "protocol": "openid-connect",
                 "protocolMappers": [{"name": AUDIENCE_MAPPER, "protocol": "openid-connect",
@@ -448,11 +448,22 @@ def main(argv):
             c = setup_client(api, spec)
             if c is None:
                 raise SystemExit("keycloak: the setup client was created but is not readable; nothing more was changed")
+        if argv[1] == "on":
+            # Its scope and its role, checked on every `on`, not only when it is created: an `on` stopped between
+            # creating the client and assigning them left a client that signs in but cannot do the setup.
+            scopes = {s["name"]: s["id"] for s in api.get(realm_path(spec, "/client-scopes")) or []}
             if "openshell:all" in scopes:
-                api.write("PUT", realm_path(spec, f"/clients/{c['id']}/default-client-scopes/{scopes['openshell:all']}"), {})
+                defaults = {s.get("name") for s in api.get(realm_path(spec, f"/clients/{c['id']}/default-client-scopes")) or []}
+                if "openshell:all" not in defaults:
+                    api.write("PUT", realm_path(spec, f"/clients/{c['id']}/default-client-scopes/{scopes['openshell:all']}"), {})
             user = api.get(realm_path(spec, f"/clients/{c['id']}/service-account-user"))
-            api.write("POST", realm_path(spec, f"/users/{user['id']}/role-mappings/realm"),
-                      [api.get(realm_path(spec, "/roles/openshell-admin"))])
+            role = api.get(realm_path(spec, "/roles/openshell-admin"))
+            if not isinstance(user, dict) or not user.get("id") or not isinstance(role, dict):
+                raise SystemExit("keycloak: the setup client's service account or the openshell-admin role is missing; "
+                                 "it was left disabled")
+            held = api.get(realm_path(spec, f"/users/{user['id']}/role-mappings/realm")) or []
+            if not any(isinstance(r, dict) and r.get("name") == "openshell-admin" for r in held):
+                api.write("POST", realm_path(spec, f"/users/{user['id']}/role-mappings/realm"), [role])
         c["enabled"] = argv[1] == "on"
         api.write("PUT", realm_path(spec, f"/clients/{c['id']}"), c)
         if argv[1] == "on":

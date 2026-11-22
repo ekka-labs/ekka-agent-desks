@@ -93,14 +93,16 @@ class EachStepIsChecked(unittest.TestCase):
         self.assertNotIn("nothing was changed", r.stderr)
 
     def test_a_setup_client_left_on_is_never_reported_as_done(self):
+        # The caller gets control back (its own cleanup still runs), with 70: never an answer of the call it guards.
         r, _ = run(off="fails")
         self.assertIn("did-the-call", r.stdout)
-        self.assertNotIn("rc=", r.stdout)
+        self.assertIn("rc=70", r.stdout)
         self.assertIn("may still be switched on", r.stderr)
 
     def test_planted_the_unchecked_steps_pass_a_failed_sign_in_and_a_client_left_on(self):
         old = function().replace(' || exit 97  # 97: never an answer of the call it guards', '') \
-                        .replace(' || die "the gateway\'s setup client may still be switched on; run the same command again"', '')
+                        .replace('if (( rc == 0 && interrupted == 0 )); then', 'if (( interrupted == 0 )); then') \
+                        .replace('(( closed == 1 )) || return 70', ':')
         self.assertNotEqual(old, function())
         r, _ = run(login="fails", fn=old)
         self.assertIn("did-the-call", r.stdout, "PLANTED: without the check the call ran with no sign-in")

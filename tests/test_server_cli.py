@@ -360,7 +360,38 @@ esac
             (folder / "ghcr.io.env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=planted-token\n")
             r = self.run_verb(d, "image", "pull", self.REF)
             self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("docker login file", log.read_text(), "the kept credential was not used at all")
             self.assertNotIn("helper", log.read_text())
+
+    def test_an_older_github_credential_kept_under_a_port_is_checked_before_use(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d, scopes="repo, read:packages")
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io:443.env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=ghp_" + "a" * 36 + "\n")
+            r = self.run_verb(d, "image", "pull", "ghcr.io:443/x/y@sha256:" + "a" * 64)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertNotIn("docker", log.read_text(), "a wider token was used before its scope was checked")
+
+    def test_logout_removes_every_spelling_an_earlier_login_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.box(d)
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io..env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=planted-token\n")
+            r = self.run_verb(d, "registry", "logout", "ghcr.io.")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(list(folder.iterdir()), [])
+            for path in ("..", ".", "../x"):
+                self.assertEqual(self.run_verb(d, "registry", "logout", path).returncode, 1, path)
+
+    def test_a_logout_that_cannot_remove_the_credential_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.box(d)
+            Path(d, "rm").write_text("#!/bin/sh\nexit 1\n"); os.chmod(Path(d, "rm"), 0o755)
+            r = self.run_verb(d, "registry", "logout", "registry.example.test")
+            self.assertEqual(r.returncode, 1, "a failed removal was reported as done")
+            self.assertNotIn("no credential kept", r.stdout)
 
     def test_logout_also_removes_a_half_written_credential(self):
         # A login killed between writing <host>.env.new and renaming it leaves the token in the .new file.

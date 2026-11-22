@@ -144,12 +144,17 @@ class UpSh(unittest.TestCase):
         with open(os.path.join(ROOT, "up.sh"), encoding="utf-8") as f:
             text = f.read()
         body = re.search(r"^as_gateway_admin\(\) \{.*?^\}\n", text, re.S | re.M).group(0)
-        unset = re.search(r"unset ([A-Z_ ]+)\n", body)
-        self.assertTrue(unset, "as_gateway_admin clears NVIDIA's gateway environment")
-        self.assertEqual(set(unset.group(1).split()),
-                         {"OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
-                          "XDG_CONFIG_HOME"})
-        self.assertLess(unset.start(), body.find('\n    "$@"\n'), "cleared before the call runs")
+        call = re.search(r'\n\s+"\$@"\n', body)
+        self.assertTrue(call, "as_gateway_admin runs its call")
+        # Every step that reaches NVIDIA's CLI (sign-in, and the call) starts from a cleared environment.
+        unsets = list(re.finditer(r"unset ([A-Z_ ]+)\n", body))
+        self.assertTrue(unsets, "as_gateway_admin clears NVIDIA's gateway environment")
+        for unset in unsets:
+            self.assertEqual(set(unset.group(1).split()),
+                             {"OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
+                              "XDG_CONFIG_HOME"})
+        self.assertLess(unsets[-1].start(), call.start(), "cleared before the call runs")
+        self.assertLess(unsets[0].start(), body.find('gateway login'), "cleared before the sign-in")
 
 
 if __name__ == "__main__":
