@@ -87,7 +87,7 @@ class NativeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.invoke(), 1)
         self.assertIn(OP + ".hold", self.host.docker.files)
         self.assertNotIn(OP + ".json", self.host.docker.files)
-        self.assertIn("sudo ekka-desk-host unhold", self.errors)
+        self.assertIn("ekka-desk-host unhold", self.errors)
         self.assertNotIn("up.sh", self.errors)
         self.assertEqual(self.host.records[-1][1], "not_verified")
         self.assertFalse(any("procedure completed" in line for line in self.host.lines))

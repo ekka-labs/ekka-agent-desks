@@ -1,5 +1,6 @@
 """Native host recovery uses the existing settle procedure, without up.sh."""
 import os
+import shlex
 from pathlib import Path
 import stat
 
@@ -83,7 +84,7 @@ def recover(runtime, verb, desk, operation, backend_id=None):
     runtime.audit(action, "requested")
     try:
         result = procedure.main(args, run=docker, ekka=ekka, read=read_lock, state=str(STATE),
-                                unhold_command="sudo ekka-desk-host unhold")
+                                unhold_command="sudo " + shlex.quote(str(Path(__file__).resolve().parents[2] / "ekka-desk-host")) + " unhold")
         if result != 0:
             raise HostError("recovery did not complete; inspect the desk and any retained hold")
     except Exception:
