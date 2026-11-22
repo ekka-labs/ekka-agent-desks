@@ -1251,6 +1251,10 @@ image_pull() {  # image_pull <ref@sha256:…> [--signed-by <identity> --issuer <
   # Asked for, even with empty values, a signature check is never skipped.
   (( asked == 0 )) || [[ -n $identity ]] || die "--signed-by and --issuer must both name a value; nothing was pulled"
   local host=${ref%%/*} digest=${ref##*@} cfg cred
+  # The same registry names a login accepts, checked before any kept credential is looked up. A credential kept under
+  # any other name is not used by a pull: it is removed with registry logout, and the registry logged in again.
+  [[ $host =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ ]] \
+    || die "$host is not a registry name a login accepts; nothing was pulled. If a credential is kept under it: sudo ekka desk registry logout $host, then log in again"
   cfg=$(mktemp -d "$DESKS_STATE/secrets/.image-pull.XXXXXX"); chmod 0700 "$cfg"; mkdir -p "$cfg/docker"
   ( umask 077; printf '{"auths":{"%s":{}}}\n' "$host" > "$cfg/docker/config.json" )   # no host credential helper
   # shellcheck disable=SC2064
@@ -1258,7 +1262,7 @@ image_pull() {  # image_pull <ref@sha256:…> [--signed-by <identity> --issuer <
   cred=$DESKS_STATE/secrets/registry/$host.env
   local name=${host%:*}
   if [[ -f $cred && $name != "$host" && ( $name == ghcr.io || $name == *.pkg.github.com ) ]]; then
-    # Kept before the GitHub scope check covered a port (ghcr.io:443): checked now, before it is used.
+    # A GitHub Packages credential kept under a port is checked for exactly read:packages before it is used.
     printf 'header = "Authorization: token %s"\n' "$(sed -n 's/^REGISTRY_TOKEN=//p' "$cred")" > "$cfg/curl.cfg"; chmod 0600 "$cfg/curl.cfg"
     [[ $(curl -fsS -K "$cfg/curl.cfg" -o /dev/null -D - https://api.github.com/user 2>/dev/null | tr -d '\r' \
          | sed -n 's/^x-oauth-scopes: *//Ip' | head -1) == "read:packages" ]] \

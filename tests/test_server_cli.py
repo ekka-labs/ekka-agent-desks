@@ -373,7 +373,8 @@ esac
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertNotIn("docker", log.read_text(), "a wider token was used before its scope was checked")
 
-    def test_logout_removes_every_spelling_an_earlier_login_kept(self):
+    def test_logout_removes_a_name_an_earlier_login_kept(self):
+        # Compatibility: a name an older login accepted (here with a trailing dot) can still be logged out.
         with tempfile.TemporaryDirectory() as d:
             self.box(d)
             folder = Path(d, "state", "secrets", "registry")
@@ -382,8 +383,23 @@ esac
             r = self.run_verb(d, "registry", "logout", "ghcr.io.")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(list(folder.iterdir()), [])
+
+    def test_logout_refuses_a_name_that_is_a_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.box(d)
             for path in ("..", ".", "../x"):
                 self.assertEqual(self.run_verb(d, "registry", "logout", path).returncode, 1, path)
+
+    def test_a_pull_never_uses_a_credential_kept_under_an_outer_dot(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io..env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=ghp_" + "a" * 36 + "\n")
+            r = self.run_verb(d, "image", "pull", "ghcr.io./x/y@sha256:" + "a" * 64)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertNotIn("docker", log.read_text(), "a credential kept under that name reached docker")
+            self.assertIn("log in again", r.stderr)
 
     def test_a_logout_that_cannot_remove_the_credential_says_so(self):
         with tempfile.TemporaryDirectory() as d:

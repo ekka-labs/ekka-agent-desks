@@ -255,6 +255,8 @@ sudo ekka desk grant show               # the window: its image, its providers, 
 sudo ekka desk grant restore
 ```
 
+A registry name is a host name with an optional port, with no leading or trailing dot. For GitHub Packages (`ghcr.io`, `*.pkg.github.com`, with or without a port) the token must have exactly the `read:packages` scope, and a pull checks that again for a GitHub credential kept under a port. A pull uses only credentials kept under such a name. If a pull refuses a kept credential, remove it with `sudo ekka desk registry logout <the name it was kept under>` (logout accepts any name a credential was kept under), then log in again.
+
 The CLI commands are `ekka desk grant discovery --image <ref> --providers <a,b> [--minutes 60] [--yes] [--json]`
 and `ekka desk grant restore [--yes] [--json]`. Both preview the change and require the literal word `yes`,
 unless `--yes` is supplied. Without a terminal, pass `--yes`. The image must be
