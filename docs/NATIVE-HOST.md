@@ -48,7 +48,9 @@ root-owned state directory, in the existing registry-file format. Docker login u
 is removed after each command. That configuration names the registry, so Docker keeps the credential in it and never
 in a host credential helper (`pass` or `secretservice`), which Docker otherwise selects for an empty configuration.
 
-`registry show` prints host and username only. `registry logout <host>` removes that host's local credential; it does
+`registry show` prints host and username only. `registry logout <host>` removes that host's local credential, and
+any temporary Docker configuration an interrupted login or pull left behind. It refuses while a login or pull is
+running, so it never removes a live one's folder; it does
 not revoke the token at its issuer. All changes require a writable root audit log before execution.
 
 ## Pulling an image
@@ -56,8 +58,8 @@ not revoke the token at its issuer. All changes require a writable root audit lo
 `image pull <registry>/<repository>@sha256:<digest>` pulls one immutable image and checks that Docker reports its
 digest. Tags are refused. `--signed-by <certificate-identity> --issuer <https-issuer>` optionally checks the signature
 before pulling; both options are required together, each with a value. Either option given, even empty, means a
-signature check is required. cosign is used from `/usr/local/bin/cosign`, else `/usr/bin/cosign`, and must be
-root-owned; PATH is never searched. A configured registry credential is read only from its private
+signature check is required. cosign is used from `/usr/local/bin/cosign`, else `/usr/bin/cosign`; it must be
+the root-owned binary itself, not a link, in a root-owned folder chain. PATH is never searched. A configured registry credential is read only from its private
 root-owned file and reaches Docker login through stdin. Each command uses a fresh private Docker configuration,
 removed before success is reported. An unsuccessful signature check prevents the pull. A pull acknowledgement
 without the requested digest is an unverified result. No EKKA desk grant is created or changed by pulling an image.
@@ -74,7 +76,9 @@ procedure alone does not establish that outcome.
 
 If settlement stops, the hold stays. Inspect the desk before using `unhold <desk> --operation <request-uuid>`:
 removing a hold can permit the backend to reissue that operation. Unhold removes a hold only while that desk's lock
-still names the operation, and one settle or unhold runs at a time on the host. A missing desk lock means nothing
+still names the operation, or when the settle that wrote the hold recorded this desk for it (a host file beside the
+installation's state) and the desk's lock no longer names the operation; one settle or unhold runs at a time on the
+host. A lock that is empty, unrecognized or behind a linked folder keeps the hold in place. A missing desk lock means nothing
 holds the desk; a lock that is a link, a special file or more than one short line is refused, never printed. Neither command retries automatically. Settings
 come from fixed root-owned files and the existing state folder. The host command reads desk locks as the Enclave
 user and sends neither a caller's environment nor a shell expression to the host tools. Both commands audit before
@@ -88,11 +92,17 @@ so a desk of the same name in another workspace is never the one stopped. It req
 takes the same lock as `up.sh`'s gateway administrator sessions, audits before enabling its temporary setup client,
 and keeps that client's credential out of arguments and printed output. Its private sign-in folder carries an empty
 system registry folder, and the registration NVIDIA's CLI kept is read back (endpoint, issuer, client) before the
-secret is used to sign in. The folder is removed after the call. Failures, keyboard interrupts, SIGTERM, SIGHUP and a
-closed console still disable the client and read its state back; the disable itself ignores those signals and prints
-nothing. A failed or unapplied disable is reported explicitly. If the process is killed outright, the next
-emergency stop first switches the client off and removes the old sign-in, and `status` reports the unfinished
-session until then. Disabling the client and deleting the local sign-in do not promise immediate revocation of every
+secret is used to sign in. The folder is removed after the call. Ctrl-C, SIGTERM and SIGHUP are noted, never raised: the session
+stops after the step it is in, then disables the client and reads its state back, ignoring those signals and printing
+nothing while it does. A closed console cannot stop it either. Every child of the session inherits the session lock,
+so a child still running after the command was killed keeps the next session out until it finishes. A failed or
+unapplied disable is reported explicitly. Before access is enabled a marker records the session's one sign-in folder
+(synced to disk). If the process is killed outright, the next emergency stop first switches the client off, even if
+the audit log cannot be written, and removes only the folder that marker names; anything else with a similar name is
+reported and left alone. `status` reports such an unfinished session, and not a session that is still running.
+`up.sh`'s own administrator sessions follow the same steps: a fresh sign-in folder each time, the kept registration
+read back before sign-in, the same marker and lock, a switch-off that is read back, and a trap for Ctrl-C, SIGTERM
+and SIGHUP. Disabling the client and deleting the local sign-in do not promise immediate revocation of every
 previously issued token. The stop acknowledgement alone does not prove that the desk has stopped: confirm its state.
 Ordinary desk and provider changes remain governed EKKA commands. This preview does not expose arbitrary NVIDIA
 commands or replace the old recovery entry point yet.
