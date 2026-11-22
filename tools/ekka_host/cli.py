@@ -7,6 +7,7 @@ from .runtime import HostError, Runtime, stack_change, status
 from .settlement import recover
 from .images import pull
 from . import registry
+from .gateway import emergency_stop
 
 DESK_COMMANDS = {"connect": "ekka desk connect", "invite": "ekka desk people invite",
                  "revoke": "ekka desk people revoke", "grant": "ekka desk grant",
@@ -20,6 +21,8 @@ def parser():
         "Installation, upgrades and named instances are not implemented yet."))
     commands = cli.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="check the Enclave, desks service and interceptor socket")
+    emergency = commands.add_parser("emergency-stop", help="request one named desk stop when governed control is unreachable")
+    emergency.add_argument("desk")
     stack = commands.add_parser("stack", help="start or stop the host's desks service")
     actions = stack.add_subparsers(dest="verb", required=True)
     actions.add_parser("start", help="start the desks service")
@@ -61,6 +64,8 @@ def main(argv=None, runtime=None, uid=None):
     try:
         if options.command == "status":
             status(runtime)
+        elif options.command == "emergency-stop":
+            emergency_stop(runtime, options.desk)
         elif options.command == "stack":
             stack_change(runtime, options.verb)
         elif options.command == "image":

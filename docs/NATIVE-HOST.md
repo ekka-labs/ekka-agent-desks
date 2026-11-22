@@ -10,6 +10,7 @@ From a trusted checkout on the installed Linux host:
 sudo ./ekka-desk-host status
 sudo ./ekka-desk-host stack start
 sudo ./ekka-desk-host stack stop
+sudo ./ekka-desk-host emergency-stop code-desk
 sudo ./ekka-desk-host image pull registry.example/team/desk@sha256:<64-hex-digest>
 sudo ./ekka-desk-host settle code-desk --operation <request-uuid>
 sudo ./ekka-desk-host unhold code-desk --operation <request-uuid>
@@ -69,6 +70,18 @@ removing a hold can permit the backend to reissue that operation. Neither comman
 come from fixed root-owned files and the existing state folder. The host command reads desk locks as the Enclave
 user and sends neither a caller's environment nor a shell expression to the host tools. Both commands audit before
 execution and after completion or failure. They do not invoke `up.sh`.
+
+## Emergency stop
+
+`emergency-stop <desk>` is the named kill switch when governed control is unreachable. It uses the installed,
+version-matched NVIDIA CLI against this installation's gateway. It requires root-owned settings and code, serializes
+native recovery sessions, audits before enabling its temporary setup client, and keeps that client's credential out
+of arguments and printed output. A fresh private sign-in folder is removed after the call. Failures and keyboard
+interrupts still attempt to disable the client and read its state back. A failed or unapplied disable is reported
+explicitly. Disabling the client and deleting the local sign-in do not promise immediate revocation of every
+previously issued token. The stop acknowledgement alone does not prove that the desk has stopped: confirm its state.
+Ordinary desk and provider changes remain governed EKKA commands. This preview does not expose arbitrary NVIDIA
+commands or replace the old recovery entry point yet.
 
 ## Remaining migration
 

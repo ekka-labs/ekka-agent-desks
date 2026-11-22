@@ -25,6 +25,9 @@
 Environment: KC_URL (the admin listener, default https://127.0.0.1:8443), KC_CA (CA file for KC_URL),
 KC_ADMIN_USER and KC_ADMIN_PASSWORD_FILE (the bootstrap admin, written by setup, mode 0600).
 Standard library only. Prints names and differences, never a secret, except enclave-secret into a pipe.
+
+`setup-client status` reads whether the temporary gateway setup client is enabled;
+it returns only enabled/disabled, performs no write and never retrieves a secret.
 """
 import getpass
 import json
@@ -407,12 +410,21 @@ def main(argv):
             raise SystemExit("keycloak: the ekka-enclave client does not exist; run apply first")
         sys.stdout.write(api.get(realm_path(spec, f"/clients/{c['id']}/client-secret"))["value"])
         return 0
-    if cmd == "setup-client" and len(argv) == 2 and argv[1] in ("on", "off"):
+    if cmd == "setup-client" and len(argv) == 2 and argv[1] in ("on", "off", "status"):
         # up.sh's own administrator for its one-time gateway steps: a confidential client whose service account holds
         # openshell-admin. `on` enables it and writes its secret into a pipe; `off` disables it. Not in realm.json on
         # purpose: it exists only while up.sh needs it, and stays disabled otherwise.
         api = Api()
         c = find_client(api, spec, "desks-setup")
+        if argv[1] == "status":
+            # Missing is disabled; malformed/ambiguous state never claims so.
+            if c is None or c.get("enabled") is False:
+                print("disabled")
+                return 0
+            if c.get("enabled") is True:
+                print("enabled")
+                return 0
+            raise SystemExit("keycloak: setup client returned no boolean enabled state")
         if c is None:
             if argv[1] == "off":
                 return 0

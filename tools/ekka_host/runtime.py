@@ -27,12 +27,12 @@ class Runtime:
     def __init__(self, output=print):
         self.output = output
 
-    def run(self, args, allowed=(0,), stdin=None, timeout=90):
+    def run(self, args, allowed=(0,), stdin=None, timeout=90, environment=None):
         self.output("→ " + shlex.join(args))
         try:
             result = subprocess.run(args, input=stdin,
                                     stdin=subprocess.DEVNULL if stdin is None else None,
-                                    capture_output=True, text=True, env=ENV,
+                                    capture_output=True, text=True, env={**ENV, **(environment or {})},
                                     timeout=timeout, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             # A timeout is an unknown result; do not automatically retry a change.
