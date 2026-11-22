@@ -12,6 +12,10 @@ import tempfile
 import unittest
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+META = ".config/openshell/gateways/ekka-agent-desks/metadata.json"   # where 0.1.9 reads a registration
+# A `gateway add` keeps what it was given under $HOME/.config/openshell, as NVIDIA's CLI does (metadata.rs), so a
+# version of up.sh that still calls it is measured on what it then does, not on a stub that refuses it.
+META_SH = 'mkdir -p "$HOME/.config/openshell/gateways/ekka-agent-desks"; printf \'{"gateway_endpoint":"%s","auth_mode":"oidc","oidc_issuer":"%s","oidc_client_id":"%s"}\' "$3" "$7" "$9" > "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json"'
 
 
 def function(text=None):
@@ -30,7 +34,8 @@ def run(action="echo did-the-call; return 0", on="ok", login="ok", off="ok", fn=
         f.write("#!/bin/sh\nexit 0\n")   # the gateway answers on 8080 at once
     with open(os.path.join(stubs, "os"), "w") as f:
         f.write(f'#!/bin/sh\necho "os $*" >> "{log}"\n'
-                f'case "$1 $2" in "gateway login") [ "$LOGIN" = ok ] || exit 1 ;; esac\nexit 0\n')
+                f'case "$1 $2" in "gateway login") [ -e "$HOME/{META}" ] && [ "$LOGIN" = ok ] || exit 1 ;;\n'
+                f'  "gateway add") {META_SH} ;; esac\nexit 0\n')   # login needs a registration in its home
     for name in ("openssl", "os"):
         os.chmod(os.path.join(stubs, name), 0o755)
     script = f"""
@@ -41,8 +46,10 @@ install_cli() {{ :; }}
 getent() {{ return 0; }}
 kc() {{ echo "kc $*" >> {log}
   case "$1 $2" in
-    "setup-client on") [ "$ON" = ok ] && printf the-secret || return 1 ;;
+    "setup-client on") case "$ON" in ok) printf 'c-setup\nthe-secret' ;; named) printf 'c-setup\n'; return 1 ;;
+                                     whole-then-failed) printf 'c-setup\nthe-secret'; return 1 ;; *) return 1 ;; esac ;;
     "setup-client off") [ "$OFF" = ok ] || return 1 ;;
+    "setup-client status") echo disabled ;;
   esac; }}
 action() {{ {action}; }}
 {fn if fn is not None else function()}
@@ -61,7 +68,8 @@ class EachStepIsChecked(unittest.TestCase):
         r, calls = run()
         self.assertIn("did-the-call", r.stdout)
         self.assertIn("rc=0", r.stdout)
-        self.assertEqual(calls[-1], "kc setup-client off")
+        self.assertEqual(calls[-2:], ["kc setup-client off c-setup", "kc setup-client status c-setup"],
+                         "this very client switched off, then read back by its id")
 
     def test_the_calls_own_answer_comes_back(self):
         r, _ = run(action="return 1")
@@ -70,9 +78,10 @@ class EachStepIsChecked(unittest.TestCase):
     def test_a_failed_sign_in_never_runs_the_call(self):
         r, calls = run(login="fails")
         self.assertNotIn("did-the-call", r.stdout)
-        self.assertNotIn("rc=", r.stdout, "it stops: never an rc a caller could read as an answer")
+        # 69 goes back to the caller (whose own cleanup runs): never an answer of the call, which did not run.
+        self.assertIn("rc=69", r.stdout)
         self.assertIn("could not sign in to NVIDIA's gateway", r.stderr)
-        self.assertIn("kc setup-client off", calls, "switched off even then")
+        self.assertIn("kc setup-client off c-setup", calls, "switched off even then")
 
     def test_a_setup_client_that_is_not_switched_on_runs_nothing(self):
         r, calls = run(on="fails")
@@ -88,15 +97,47 @@ class EachStepIsChecked(unittest.TestCase):
         self.assertIn("may still be switched on", r.stderr)
         self.assertNotIn("nothing was changed", r.stderr)
 
+    def test_a_failed_switch_on_is_still_read_back_when_the_switch_off_fails(self):
+        r, calls = run(on="fails", off="fails")
+        self.assertIn("kc setup-client status", calls, "the read-back was skipped because the switch-off failed")
+        self.assertIn("may still be switched on", r.stderr)
+
+    def test_a_switch_on_that_failed_after_naming_its_client_switches_off_that_client(self):
+        # `on` wrote the id line, then failed before the secret: the switch-off and its read-back use that id.
+        r, calls = run(on="named")
+        self.assertIn("kc setup-client off c-setup", calls)
+        self.assertIn("kc setup-client status c-setup", calls)
+        self.assertNotIn("did-the-call", r.stdout)
+        self.assertIn("nothing was changed", r.stderr)
+
+    def test_a_switch_on_that_failed_after_writing_both_lines_never_signs_in(self):
+        # `on` exits 0 only once the client is enabled whole: its exit status counts, not only what it wrote.
+        r, calls = run(on="whole-then-failed")
+        self.assertFalse([c for c in calls if c.startswith("os gateway login")], "it signed in after a failed switch-on")
+        self.assertNotIn("did-the-call", r.stdout)
+        self.assertIn("kc setup-client off c-setup", calls)
+        self.assertIn("kc setup-client status c-setup", calls)
+
+    def test_a_failed_switch_on_hands_control_back_to_its_caller(self):
+        # A caller's own cleanup (the download safety pass) still runs: 70 while the client may still be on, 69 when
+        # it is read back off.
+        r, calls = run(on="fails", off="fails")
+        self.assertIn("rc=70", r.stdout, r.stderr)
+        self.assertIn("may still be switched on", r.stderr)
+        r, calls = run(on="fails")
+        self.assertIn("rc=69", r.stdout, r.stderr)
+        self.assertIn("nothing was changed", r.stderr)
+
     def test_a_setup_client_left_on_is_never_reported_as_done(self):
+        # The caller gets control back (its own cleanup still runs), with 70: never an answer of the call it guards.
         r, _ = run(off="fails")
         self.assertIn("did-the-call", r.stdout)
-        self.assertNotIn("rc=", r.stdout)
+        self.assertIn("rc=70", r.stdout)
         self.assertIn("may still be switched on", r.stderr)
 
     def test_planted_the_unchecked_steps_pass_a_failed_sign_in_and_a_client_left_on(self):
-        old = function().replace(' || exit 97  # 97: never an answer of the call it guards', '') \
-                        .replace(' || die "the gateway\'s setup client may still be switched on; run the same command again"', '')
+        old = function().replace('if (( signin == 1 && interrupted == 0 )); then', 'if (( interrupted == 0 )); then') \
+                        .replace('(( ${admin_open:-0} == 0 )) || return 70', ':')
         self.assertNotEqual(old, function())
         r, _ = run(login="fails", fn=old)
         self.assertIn("did-the-call", r.stdout, "PLANTED: without the check the call ran with no sign-in")

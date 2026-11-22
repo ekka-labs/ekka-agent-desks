@@ -86,6 +86,18 @@ def given(rest, name):
 
 
 GATEWAY_FLAGS = ("--gateway", "--gateway-endpoint", "--gateway-insecure")
+# Variables of this setup's own: the administrator session's sign-in among them. None is ever read into a provider.
+RESERVED_SOURCE = "OPENSHELL_"
+
+
+def env_sources(rest):
+    """Every environment variable a provider call reads a value from: `--credential KEY` and
+    `--secret-material-env KEY[=ENVVAR]`, trimmed as NVIDIA's CLI trims them (OpenShell 0.1.9 commands/common.rs)."""
+    out = [v.strip() for v in flag_values(rest, "--credential") if "=" not in v]
+    for v in flag_values(rest, "--secret-material-env"):
+        key, sep, env = v.partition("=")
+        out.append((env if sep else key).strip())
+    return out
 
 
 def short_g(a):
@@ -107,6 +119,10 @@ def check(argv):
     if any("=" in v for v in flag_values(rest, "--credential")):
         raise Refused("openshell --credential KEY=VALUE: a secret is never an argument; name the key and pass it in the "
                       "environment: sudo --preserve-env=KEY ./up.sh openshell ... --credential KEY")
+    for source in env_sources(rest):
+        if source.startswith(RESERVED_SOURCE):
+            raise Refused(f"openshell: {source} belongs to this setup and is never read into a provider; "
+                          "name the variable that holds the provider's own key")
     for name in ("--material", "--secret-material-key"):
         if given(rest, name):
             raise Refused(f"openshell {name}: refresh material is never an argument; pass each value in the "

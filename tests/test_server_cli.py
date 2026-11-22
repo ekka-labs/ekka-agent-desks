@@ -291,6 +291,143 @@ class TheRegistryAndImageVerbs(unittest.TestCase):
             r = self.run_verb(d, "registry", "logout", "ghcr.io"); self.assertEqual(r.returncode, 0, r.stderr)
 
 
+class TheRegistryAndImageReviewFixes(unittest.TestCase):
+    """The up.sh side: a registry port keeps the GitHub scope check, no host helper keeps a credential, and an
+    asked-for signature check always runs. docker, curl and cosign are stubs that log;
+    docker behaves as Docker CLI does with a host credential helper installed: a login whose --config folder has no
+    auth entry goes to the helper (configfile ContainsAuth, credentials.DetectDefaultStore)."""
+    run_verb = TheRegistryAndImageVerbs.run_verb   # the same fixture, without running TheRegistryAndImageVerbs's cases again
+
+    REF = "ghcr.io/x/y@sha256:" + "a" * 64
+
+    def box(self, d, scopes="read:packages"):
+        log = Path(d, "log")
+        log.write_text("")
+        stubs = {
+            "id": "#!/bin/bash\necho 0\n",
+            "curl": f"#!/bin/bash\necho curl >> {log}\nprintf 'HTTP/2 200\\r\\nx-oauth-scopes: {scopes}\\r\\n\\r\\n'\n",
+            "cosign": f"#!/bin/bash\necho cosign >> {log}\n",
+            "install": "#!/bin/bash\nargs=(); while (($#)); do case $1 in -o|-g) shift 2 ;; *) args+=(\"$1\"); shift ;; esac; done\n"
+                       "exec /usr/bin/install \"${args[@]}\"\n",
+            "docker": f"""#!/bin/bash
+cfg=""; [[ $1 == --config ]] && {{ cfg=$2; shift 2; }}
+case $1 in
+  login) if [[ -n $cfg ]] && grep -q '"auths": *{{ *"' "$cfg/config.json" 2>/dev/null; then echo "docker login file" >> {log}
+         else echo "docker login helper $(cat)" >> {log}; fi ;;
+  pull) echo "docker pull $*" >> {log} ;;
+  image) echo "{self.REF}" ;;
+  *) : ;;
+esac
+""",
+        }
+        for name, text in stubs.items():
+            Path(d, name).write_text(text)
+            os.chmod(Path(d, name), 0o755)
+        state = Path(d, "state")
+        (state / "secrets").mkdir(parents=True)
+        (state / "up.env").write_text("DESKS_NAME=desks.example.test\n")
+        return log
+
+    def test_the_github_scope_check_covers_a_name_with_a_port(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d, scopes="repo, read:packages")
+            r = self.run_verb(d, "registry", "login", "ghcr.io:443", "someone", stdin="ghp_" + "a" * 36)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("curl", log.read_text().split())
+            self.assertNotIn("docker login", log.read_text(), "a token with more than read:packages was accepted")
+
+    def test_a_name_with_an_outer_dot_is_not_a_registry_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d, scopes="repo, read:packages")
+            for host in ("ghcr.io.", ".ghcr.io", "ghcr.io.:443"):
+                r = self.run_verb(d, "registry", "login", host, "someone", stdin="ghp_" + "a" * 36)
+                self.assertEqual(r.returncode, 1, host)
+            self.assertNotIn("docker login", log.read_text(), "a name with an outer dot was accepted")
+
+    def test_a_login_never_reaches_a_host_credential_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            r = self.run_verb(d, "registry", "login", "registry.example.test", "someone", stdin="planted-token")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("helper", log.read_text(), "the token went to the host's credential helper")
+            self.assertIn("docker login file", log.read_text())
+
+    def test_a_pull_with_a_kept_credential_never_reaches_a_host_credential_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io.env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=planted-token\n")
+            r = self.run_verb(d, "image", "pull", self.REF)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("docker login file", log.read_text(), "the kept credential was not used at all")
+            self.assertNotIn("helper", log.read_text())
+
+    def test_an_older_github_credential_kept_under_a_port_is_checked_before_use(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d, scopes="repo, read:packages")
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io:443.env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=ghp_" + "a" * 36 + "\n")
+            r = self.run_verb(d, "image", "pull", "ghcr.io:443/x/y@sha256:" + "a" * 64)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertNotIn("docker", log.read_text(), "a wider token was used before its scope was checked")
+
+    def test_logout_removes_a_name_an_earlier_login_kept(self):
+        # Compatibility: a name an older login accepted (here with a trailing dot) can still be logged out.
+        with tempfile.TemporaryDirectory() as d:
+            self.box(d)
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io..env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=planted-token\n")
+            r = self.run_verb(d, "registry", "logout", "ghcr.io.")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(list(folder.iterdir()), [])
+
+    def test_logout_refuses_a_name_that_is_a_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.box(d)
+            for path in ("..", ".", "../x"):
+                self.assertEqual(self.run_verb(d, "registry", "logout", path).returncode, 1, path)
+
+    def test_a_pull_accepts_only_the_registry_names_a_login_accepts(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io..env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=ghp_" + "a" * 36 + "\n")
+            r = self.run_verb(d, "image", "pull", "ghcr.io./x/y@sha256:" + "a" * 64)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertNotIn("docker", log.read_text(), "the pull went ahead for a name a login refuses")
+            self.assertIn("log in again", r.stderr)
+
+    def test_a_logout_that_cannot_remove_the_credential_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.box(d)
+            Path(d, "rm").write_text("#!/bin/sh\nexit 1\n"); os.chmod(Path(d, "rm"), 0o755)
+            r = self.run_verb(d, "registry", "logout", "registry.example.test")
+            self.assertEqual(r.returncode, 1, "a failed removal was reported as done")
+            self.assertNotIn("no credential kept", r.stdout)
+
+    def test_logout_also_removes_a_half_written_credential(self):
+        # A login killed between writing <host>.env.new and renaming it leaves the token in the .new file.
+        with tempfile.TemporaryDirectory() as d:
+            self.box(d)
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "registry.example.test.env.new").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=planted-token\n")
+            r = self.run_verb(d, "registry", "logout", "registry.example.test")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(list(folder.iterdir()), [], "a credential stayed behind after logout")
+
+    def test_empty_signing_options_never_skip_the_signature_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            r = self.run_verb(d, "image", "pull", self.REF, "--signed-by", "", "--issuer", "")
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertNotIn("docker pull", log.read_text(), "pulled without the signature check it was asked for")
+
+
 class TheRootOwnedCopy(unittest.TestCase):
     """`sudo ekka desk connect|invite|revoke|plans|grant|registry|image` run up.sh from the root-owned copy the installer
     makes (snapshot_stack), never the checkout. Every repository folder the tools read by ROOT must be in that copy.

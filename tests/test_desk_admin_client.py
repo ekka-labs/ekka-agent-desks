@@ -316,5 +316,202 @@ connect_desk_admin
         self.assertIn("did not connect again", r.stderr)
 
 
+class SetupKeycloak:
+    """The admin API calls `setup-client` makes, as Keycloak answers them. `listed` False is a client the list leaves
+    out (the list returns only clients the reader may see), while a read by its id still finds it. `answer` replaces
+    the list's answer outright; `sticky` ignores writes, as a client that will not change does. `scope_read_id` and
+    `role_read_id` give the assignments back under another id, as a record that only shares the name would."""
+
+    def __init__(self, client=None, listed=True, answer=None, scope=True, sticky=False, scope_read_id=None,
+                 role_read_id=None):
+        self.scopes = [{"id": "s-all", "name": "openshell:all"}] if scope else []
+        self.scope_read_id = scope_read_id
+        self.role_read_id = role_read_id
+        self.reads = []
+        self.client = client
+        self.listed = listed
+        self.answer = answer
+        self.sticky = sticky
+        self.defaults = set()
+        self.roles = []
+        self.created = None
+        self.writes = []
+        self.calls = 0
+
+    def get(self, path):
+        self.calls += 1
+        self.reads.append(path)
+        if path == REALM + "/client-scopes":
+            return list(self.scopes)
+        if path == REALM + "/clients?clientId=desks-setup":
+            if self.answer is not None:
+                return self.answer
+            return [copy.deepcopy(self.client)] if self.client and self.listed else []
+        if path == REALM + "/clients/c-setup":
+            return copy.deepcopy(self.client) if self.client else None    # 404: no such client
+        if path == REALM + "/clients/c-setup/default-client-scopes":
+            return [{**s, "id": self.scope_read_id or s["id"]} for s in self.scopes if s["id"] in self.defaults]
+        if path == REALM + "/clients/c-setup/service-account-user":
+            return {"id": "u-setup"}
+        if path == REALM + "/roles/openshell-admin":
+            return {"id": "r-admin", "name": "openshell-admin"}
+        if path == REALM + "/users/u-setup/role-mappings/realm":
+            return [{"id": self.role_read_id or "r-admin", "name": r} for r in self.roles]
+        if path == REALM + "/clients/c-setup/client-secret":
+            return {"value": SECRET}
+        raise AssertionError("unexpected GET " + path)
+
+    def write(self, method, path, body):
+        self.writes.append((method, path, body))
+        if self.sticky:
+            return None
+        if path == REALM + "/clients" and method == "POST":
+            self.created = dict(body)
+            self.client = {"id": "c-setup", **body}
+        elif path == REALM + "/clients/c-setup" and method == "PUT":
+            self.client = {**self.client, **body}
+        elif path == REALM + "/clients/c-setup/default-client-scopes/s-all" and method == "PUT":
+            self.defaults.add("s-all")
+        elif path == REALM + "/users/u-setup/role-mappings/realm" and method == "POST":
+            self.roles += [r["name"] for r in body]
+        else:
+            raise AssertionError(f"unexpected {method} {path}")
+
+
+# The sign-in settings up.sh creates the client with, written here from the Keycloak client representation.
+SIGN_IN = {"publicClient": False, "serviceAccountsEnabled": True, "standardFlowEnabled": False,
+           "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "protocol": "openid-connect"}
+RECORD = {"id": "c-setup", "clientId": "desks-setup", **SIGN_IN}
+
+
+class TheSetupClientIsReadStrictly(unittest.TestCase):
+    """up.sh switches its temporary gateway administrator off with `setup-client off <id>` and reads it back with
+    `setup-client status <id>`: by the client's own id, never by an empty list, which proves nothing."""
+
+    def test_an_unreadable_list_is_never_disabled_and_never_skips_the_switch_off(self):
+        for answer in ({}, "", [{"id": "x", "clientId": "other", "enabled": False}],
+                       [{**RECORD, "enabled": False}] * 2, [{"clientId": "desks-setup", "enabled": False}],
+                       [{**RECORD, "enabled": "false"}]):
+            for verb in ("status", "off"):
+                with self.subTest(answer=answer, verb=verb):
+                    kc = SetupKeycloak(answer=answer)
+                    with self.assertRaises(SystemExit):
+                        run(["setup-client", verb], kc)
+                    self.assertEqual(kc.writes, [])
+
+    def test_a_client_the_list_leaves_out_is_read_switched_off_and_read_back_by_its_id(self):
+        kc = SetupKeycloak({**RECORD, "enabled": True}, listed=False)
+        self.assertNotEqual(run(["setup-client", "status"], kc)[1].strip(), "disabled",
+                            "an empty list was read as switched off")
+        self.assertEqual(run(["setup-client", "status", "c-setup"], kc), (0, "enabled\n"))
+        with self.assertRaises(SystemExit):
+            run(["setup-client", "off"], kc)          # no id: it cannot be found, so it cannot be confirmed off
+        self.assertIs(kc.client["enabled"], True)
+        self.assertEqual(run(["setup-client", "off", "c-setup"], kc)[0], 0)
+        self.assertIs(kc.client["enabled"], False)
+        self.assertEqual(run(["setup-client", "status", "c-setup"], kc), (0, "disabled\n"))
+
+    def test_a_switch_off_that_does_not_read_back_is_refused(self):
+        kc = SetupKeycloak({**RECORD, "enabled": True}, sticky=True)
+        with self.assertRaises(SystemExit):
+            run(["setup-client", "off", "c-setup"], kc)
+
+    def test_a_client_that_cannot_be_read_by_its_id_has_no_state(self):
+        for verb in ("off", "status"):
+            with self.subTest(verb=verb):
+                kc = SetupKeycloak(None)
+                with self.assertRaises(SystemExit):
+                    run(["setup-client", verb, "c-setup"], kc)
+                # The refusal comes from the direct read of that id, not from an earlier step.
+                self.assertEqual(kc.reads, [REALM + "/clients/c-setup"])
+                self.assertEqual(kc.writes, [])
+
+    def test_a_client_id_up_sh_would_drop_is_never_used_or_written(self):
+        # up.sh keeps an id only of [0-9A-Za-z-]: a client it could not switch off by its id is refused first.
+        for verb in ("on", "off"):
+            with self.subTest(verb=verb):
+                kc, out = SetupKeycloak(answer=[{"id": "c/../x", "clientId": "desks-setup", "enabled": False}]), Piped()
+                real = apply_realm.Api
+                apply_realm.Api = lambda: kc
+                try:
+                    with self.assertRaises(SystemExit), redirect_stdout(out):
+                        apply_realm.main(["setup-client", verb])
+                finally:
+                    apply_realm.Api = real
+                self.assertEqual(kc.writes, [])
+                self.assertNotIn("c/../x", out.getvalue())
+
+
+class TheSetupClientIsWholeBeforeItIsEnabled(unittest.TestCase):
+    def test_on_reports_the_id_then_the_secret(self):
+        kc = SetupKeycloak({**RECORD, "enabled": False})
+        self.assertEqual(run(["setup-client", "on"], kc), (0, "c-setup\n" + SECRET))
+
+    def test_a_client_an_interrupted_on_left_gets_its_scope_and_role(self):
+        kc = SetupKeycloak({**RECORD, "enabled": False})
+        code, _ = run(["setup-client", "on"], kc)
+        self.assertEqual(code, 0)
+        self.assertEqual(kc.roles, ["openshell-admin"], "enabled without the administrator role")
+        self.assertEqual(kc.defaults, {"s-all"})
+        self.assertIs(kc.client["enabled"], True)
+
+    def test_a_new_client_is_created_disabled_and_enabled_once_whole(self):
+        kc = SetupKeycloak()
+        self.assertEqual(run(["setup-client", "on"], kc)[0], 0)
+        self.assertIs(kc.created["enabled"], False, "created enabled, before its role was assigned")
+        self.assertEqual(kc.roles, ["openshell-admin"])
+        self.assertIs(kc.client["enabled"], True)
+        run(["setup-client", "on"], kc)
+        self.assertEqual(kc.roles, ["openshell-admin"], "the role was assigned twice")
+
+    def test_a_realm_without_its_scope_never_enables_it(self):
+        kc = SetupKeycloak({**RECORD, "enabled": False}, scope=False)
+        with self.assertRaises(SystemExit):
+            run(["setup-client", "on"], kc)
+        self.assertIs(kc.client["enabled"], False)
+
+    def test_assignments_that_do_not_read_back_never_enable_it(self):
+        kc = SetupKeycloak({**RECORD, "enabled": False}, sticky=True)
+        with self.assertRaises(SystemExit):
+            run(["setup-client", "on"], kc)
+        self.assertFalse(any(w[0] == "PUT" and w[1].endswith("/clients/c-setup") for w in kc.writes),
+                         "it was enabled before its scope and role read back")
+
+    def test_a_scope_or_role_that_reads_back_under_another_id_never_enables_it(self):
+        for kw in ({"scope_read_id": "s-other"}, {"role_read_id": "r-other"}):
+            with self.subTest(**kw):
+                kc = SetupKeycloak({**RECORD, "enabled": False}, **kw)
+                with self.assertRaises(SystemExit):
+                    run(["setup-client", "on"], kc)
+                self.assertFalse(any(w[0] == "PUT" and w[1].endswith("/clients/c-setup") for w in kc.writes),
+                                 "it was enabled on an assignment that only shares the name")
+
+    def test_an_existing_client_whose_sign_in_settings_changed_is_never_given_its_role_or_enabled(self):
+        for setting, value in (("directAccessGrantsEnabled", True), ("publicClient", True),
+                               ("standardFlowEnabled", True), ("serviceAccountsEnabled", False)):
+            with self.subTest(setting=setting):
+                kc = SetupKeycloak({**RECORD, setting: value, "enabled": False})
+                with self.assertRaises(SystemExit):
+                    run(["setup-client", "on"], kc)
+                self.assertEqual(kc.writes, [], "a client with other sign-in settings was changed")
+
+    def test_a_terminal_is_refused_before_anything_changes(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        kc, err = SetupKeycloak({**RECORD, "enabled": False}), io.StringIO()
+        real = apply_realm.Api
+        apply_realm.Api = lambda: kc
+        real_out, real_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = Tty(), err
+        try:
+            self.assertEqual(apply_realm.main(["setup-client", "on"]), 2)
+        finally:
+            sys.stdout, sys.stderr = real_out, real_err
+            apply_realm.Api = real
+        self.assertEqual(kc.writes, [])
+        self.assertIs(kc.client["enabled"], False)
+
+
 if __name__ == "__main__":
     unittest.main()

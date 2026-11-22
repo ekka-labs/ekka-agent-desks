@@ -26,6 +26,9 @@ setup's own settings are only loaded that way.
 (`sudo WALK_PERSON_HOME=~/.ekka-walk-person ./up.sh walk`). Its person legs call the gateway directly with
 that person's own sign-in: starting a desk, running a command in it, and opening an SSH session into it.
 All three must stay refused. A new OpenShell version can change what a method requires.
+Also check that the new version still reads the gateway registration `up.sh` writes for its administrator session
+(`as_gateway_admin`, in the shape of OpenShell 0.1.9's `gateway add --oidc-issuer`): `sudo ./up.sh openshell
+provider list` must sign in and answer.
 
 ## The Enclave as a service, and restart recovery
 
@@ -254,6 +257,8 @@ sudo ekka desk grant show               # the window: its image, its providers, 
 # reads what OpenShell recorded, turns auto mode off and deletes the desk; then:
 sudo ekka desk grant restore
 ```
+
+A registry name is a host name with an optional port, with no leading or trailing dot. For GitHub Packages (`ghcr.io`, `*.pkg.github.com`, with or without a port) the token must have exactly the `read:packages` scope, and a pull checks that again for a GitHub credential kept under a port. A pull uses only credentials kept under such a name. If a pull refuses a kept credential, remove it with `sudo ekka desk registry logout <the name it was kept under>` (logout accepts any name a credential was kept under), then log in again.
 
 The CLI commands are `ekka desk grant discovery --image <ref> --providers <a,b> [--minutes 60] [--yes] [--json]`
 and `ekka desk grant restore [--yes] [--json]`. Both preview the change and require the literal word `yes`,
@@ -583,7 +588,7 @@ Usually the next `ekka desk status <desk>` settles it on its own. When status sa
 sudo ./up.sh desks settle code-desk --operation 3f1c2a9e-5b7d-4e2a-9c1b-7d6e5f4a3b2c
 ```
 
-It checks that the desk's lock names exactly this change and does nothing otherwise. Then it restarts the gateway, and watches the desk's containers until none is starting, restarting or being removed and nothing has changed for 40 seconds (NVIDIA OpenShell's 10-second stop timeout plus 30). Only then does it write one settle marker for this change, `settle/<request id>.json`, into the adapter's state. It gives up after 10 minutes and writes nothing. For a deleted desk, whose containers are gone, add `--backend-id <id>` from `ekka desk status`. For a create that never reached the desk, no container carries its labels: the procedure writes the marker with no backend id and no containers, and the adapter accepts that only for a create it cannot find either. It then answers `NOT_APPLIED`: nothing was created.
+It checks that the desk's lock names exactly this change and does nothing otherwise. Then it restarts the gateway. **That restart stops every running desk on this machine, not only this one, and interrupts their jobs**: NVIDIA's gateway stops the desks it manages when it shuts down. Then it watches the desk's containers until none is starting, restarting or being removed and nothing has changed for 40 seconds (NVIDIA OpenShell's 10-second stop timeout plus 30). Only then does it write one settle marker for this change, `settle/<request id>.json`, into the adapter's state. It gives up after 10 minutes and writes nothing. For a deleted desk, whose containers are gone, add `--backend-id <id>` from `ekka desk status`. For a create that never reached the desk, no container carries its labels: the procedure writes the marker with no backend id and no containers, and the adapter accepts that only for a create it cannot find either. It then answers `NOT_APPLIED`: nothing was created.
 
 **The hold.** Before it restarts the gateway, the procedure writes a hold for the change, `settle/<request id>.hold` in the adapter's state. While the hold exists, the adapter never re-issues that change, so a `status` during the quiet window cannot send it again after the restart. The procedure removes the hold when it writes the marker. If the procedure stops without a marker (the desk kept changing, the gateway did not restart, or it was interrupted), the hold stays, and the message says so. Check the desk with `ekka desk status <desk>`, then remove the hold:
 
@@ -591,7 +596,13 @@ It checks that the desk's lock names exactly this change and does nothing otherw
 sudo ./up.sh desks unhold <desk> --operation <request id>
 ```
 
-After that the adapter may re-issue the change, or you settle it again.
+Unhold removes the hold only while that desk's lock still names the change: the hold itself names no desk, so a request id from another desk is refused and nothing is removed. A hold whose change has ended (the desk's lock no longer names it) is inert: the adapter never re-issues an ended change. One settle or unhold runs at a time on the machine, and a desk lock that is empty, unreadable or behind a linked folder keeps the hold in place. After that the adapter may re-issue the change, or you settle it again.
+
+If the settle says the desk's lock names neither this change nor another one, unhold cannot match the hold to the desk. Check the desk with `ekka desk status <desk>`; only once you know the change has ended, remove the hold by hand, with the alpine image pinned as `WRITER_IMAGE` in `tools/desks_settle.py`:
+
+```sh
+sudo docker run --rm --network none --user 2000:1000 -v ekka-desks_ekka-backend-state:/s <WRITER_IMAGE> rm -f /s/settle/<request id>.hold
+```
 
 Then run `ekka desk status code-desk` again. The adapter reads the marker once, settles the change and frees the desk.
 

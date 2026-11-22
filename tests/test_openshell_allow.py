@@ -115,6 +115,19 @@ class Refused(unittest.TestCase):
             self.assertRefused(["provider", "list", *args], f"openshell {flag}: the call always goes to this machine's gateway")
         self.assertRefused(["sandbox", "stop", "code-desk", "-g", "other"], "name exactly one desk")
 
+    def test_planted_this_setups_own_variables_are_never_read_into_a_provider(self):
+        # The gateway administrator session holds its sign-in in an OPENSHELL_ variable while a call runs.
+        for args in (["provider", "create", "--name", "g", "--type", "github", "--credential", "OPENSHELL_OIDC_CLIENT_SECRET"],
+                     ["provider", "update", "g", "--credential=OPENSHELL_OIDC_CLIENT_SECRET"],
+                     ["provider", "update", "g", "--credential", " OPENSHELL_OIDC_CLIENT_SECRET "],
+                     ["provider", "refresh", "configure", "aws", "--credential-key", "K", "--strategy",
+                      "aws-sts-assume-role", "--secret-material-env", "k=OPENSHELL_OIDC_CLIENT_SECRET"],
+                     ["provider", "refresh", "rotate", "aws", "--secret-material-env", "OPENSHELL_OIDC_CLIENT_SECRET"],
+                     ["provider", "refresh", "configure", "aws", "--credential-key", "K", "--strategy",
+                      "aws-sts-assume-role", "--secret-material-env=k= OPENSHELL_GATEWAY"]):
+            with self.subTest(args=args):
+                self.assertRefused(args, "belongs to this setup and is never read into a provider")
+
     def test_planted_the_administrators_own_sign_in_never_becomes_a_key(self):
         self.assertRefused(["provider", "update", "g", "--from-oidc-token"], "never becomes a desk's key")
 
@@ -144,11 +157,16 @@ class UpSh(unittest.TestCase):
         with open(os.path.join(ROOT, "up.sh"), encoding="utf-8") as f:
             text = f.read()
         body = re.search(r"^as_gateway_admin\(\) \{.*?^\}\n", text, re.S | re.M).group(0)
-        unset = re.search(r"unset ([A-Z_ ]+)\n", body)
-        self.assertTrue(unset, "as_gateway_admin clears NVIDIA's gateway environment")
-        self.assertEqual(set(unset.group(1).split()),
-                         {"OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE"})
-        self.assertLess(unset.start(), body.find('\n    "$@"\n'), "cleared before the call runs")
+        call = re.search(r'\n\s+"\$@"\n', body)
+        self.assertTrue(call, "as_gateway_admin runs its call")
+        # Every step that reaches NVIDIA's CLI (sign-in, and the call) starts from a cleared environment.
+        unsets = list(re.finditer(r"unset ([A-Z_ ]+)\n", body))
+        self.assertTrue(unsets, "as_gateway_admin clears NVIDIA's gateway environment")
+        for unset in unsets:
+            self.assertLessEqual({"OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
+                                  "XDG_CONFIG_HOME"}, set(unset.group(1).split()))
+        self.assertLess(unsets[-1].start(), call.start(), "cleared before the call runs")
+        self.assertLess(unsets[0].start(), body.find('"$OS" gateway login'), "cleared before the sign-in")
 
 
 if __name__ == "__main__":
@@ -300,9 +318,12 @@ class TheFolderIsMadeSafe(unittest.TestCase):
             up = f.read()
         block = up[up.index('if [[ "${1:-} ${2:-}" == "sandbox download" ]]; then'):]
         block = block[:block.index("\n    fi\n")]
-        self.assertIn('as_gateway_admin "$OS" -g ekka-agent-desks "$@" || rc=$?', block, "a failed copy does not skip the next line")
-        self.assertIn('python3 tools/openshell_allow.py --settle-download "${@: -1}" || rc=1', block)
-        self.assertLess(block.index("as_gateway_admin"), block.index("--settle-download"))
+        self.assertIn('download_settled "$@"', block, "a download goes through the function that always settles it")
+        fn = up[up.index("download_settled() {"):]
+        fn = fn[:fn.index("\n}\n")]
+        self.assertIn('as_gateway_admin "$OS" -g ekka-agent-desks "$@" || rc=$?', fn, "a failed copy does not skip the pass")
+        self.assertIn("--settle-download", fn)
+        self.assertLess(fn.index("as_gateway_admin"), fn.index("--settle-download"))
 
 
 def stat_mode(path):

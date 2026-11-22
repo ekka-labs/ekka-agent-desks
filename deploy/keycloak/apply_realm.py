@@ -21,6 +21,10 @@
                                                  finish; reads only. Never an administrator; never a revoked person
     apply_realm.py revoke <username>            that person taken off (ekka desk revoke): sign-in disabled, every
                                                  session ended. Never an administrator; never a name not here
+    apply_realm.py setup-client on | off [<id>] | status [<id>]
+                                                 up.sh's temporary gateway administrator: `on` writes its id and
+                                                 secret into a pipe, `off <id>` disables it and reads it back by
+                                                 its id, `status <id>` prints only enabled or disabled.
 
 Environment: KC_URL (the admin listener, default https://127.0.0.1:8443), KC_CA (CA file for KC_URL),
 KC_ADMIN_USER and KC_ADMIN_PASSWORD_FILE (the bootstrap admin, written by setup, mode 0600).
@@ -100,6 +104,40 @@ def realm_path(spec, rest=""):
 def find_client(api, spec, client_id):
     found = api.get(realm_path(spec, "/clients?clientId=" + urllib.parse.quote(client_id))) or []
     return found[0] if found else None
+
+
+SETUP_ID = re.compile(r"[0-9A-Za-z-]{1,64}")
+# How the setup client signs in: confidential, its own service account only, no person's sign-in flow. Created with
+# these, and an existing client must still have them before it is given its scope and role.
+SETUP_SETTINGS = {"publicClient": False, "serviceAccountsEnabled": True, "standardFlowEnabled": False,
+                  "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "protocol": "openid-connect"}
+
+
+def setup_client_by_id(api, spec, client_id):
+    """The desks-setup client read directly by its internal id: the only read that can prove its state. A list can
+    leave out a client the reader is not allowed to see; a direct read of a known id cannot."""
+    if not SETUP_ID.fullmatch(client_id or ""):
+        raise SystemExit("keycloak: that is not a client id")
+    c = api.get(realm_path(spec, f"/clients/{client_id}"))
+    if not isinstance(c, dict) or c.get("id") != client_id or c.get("clientId") != "desks-setup" \
+            or not isinstance(c.get("enabled"), bool):
+        raise SystemExit("keycloak: the setup client could not be read by its id; its state is unknown")
+    return c
+
+
+def setup_client(api, spec):
+    """The desks-setup client, read strictly: None only for an answered empty list. Anything else that is not one
+    exact desks-setup record with a boolean `enabled` is an unknown state, never "disabled" or "absent"."""
+    found = api.get(realm_path(spec, "/clients?clientId=desks-setup"))
+    if not isinstance(found, list):
+        raise SystemExit("keycloak: the client list did not answer as a list; the setup client's state is unknown")
+    if not found:
+        return None
+    c = found[0]
+    if len(found) != 1 or not isinstance(c, dict) or c.get("clientId") != "desks-setup" \
+            or not isinstance(c.get("id"), str) or not c["id"] or not isinstance(c.get("enabled"), bool):
+        raise SystemExit("keycloak: the client list did not return one exact desks-setup record; its state is unknown")
+    return c
 
 
 def plan(api, spec):
@@ -404,39 +442,98 @@ def main(argv):
             raise SystemExit("keycloak: the ekka-enclave client does not exist; run apply first")
         sys.stdout.write(api.get(realm_path(spec, f"/clients/{c['id']}/client-secret"))["value"])
         return 0
-    if cmd == "setup-client" and len(argv) == 2 and argv[1] in ("on", "off"):
+    if cmd == "setup-client" and (len(argv) == 2 and argv[1] in ("on", "off", "status")
+                                  or len(argv) == 3 and argv[1] in ("off", "status")):
         # up.sh's own administrator for its one-time gateway steps: a confidential client whose service account holds
-        # openshell-admin. `on` enables it and writes its secret into a pipe; `off` disables it. Not in realm.json on
-        # purpose: it exists only while up.sh needs it, and stays disabled otherwise.
+        # openshell-admin. `on` enables it and writes, into a pipe, its internal id on one line and its secret after;
+        # `off <id>` disables that client and reads it back by its id; `status <id>` reads it by its id. Without an
+        # id, `off` and `status` find it in the client list, which only an `on` that never reported an id needs: a
+        # list can leave out a client, so an empty list proves nothing there. Not in realm.json on purpose: it exists
+        # only while up.sh needs it, and stays disabled otherwise.
+        if argv[1] == "on" and sys.stdout.isatty():
+            print("keycloak: refusing to print a secret to a terminal; nothing was changed", file=sys.stderr)
+            return 2
         api = Api()
-        c = find_client(api, spec, "desks-setup")
-        if c is None:
-            if argv[1] == "off":
+        known = argv[2] if len(argv) == 3 else None
+        if argv[1] == "status":
+            if known is not None:
+                print("enabled" if setup_client_by_id(api, spec, known)["enabled"] else "disabled")
                 return 0
-            scopes = {s["name"]: s["id"] for s in api.get(realm_path(spec, "/client-scopes")) or []}
+            c = setup_client(api, spec)
+            print("absent" if c is None else "enabled" if c["enabled"] else "disabled")
+            return 0
+        if argv[1] == "off":
+            c = setup_client_by_id(api, spec, known) if known is not None else setup_client(api, spec)
+            if c is None:
+                raise SystemExit("keycloak: the setup client is not in the client list, so it cannot be confirmed off; "
+                                 "check desks-setup in Keycloak")
+            if not SETUP_ID.fullmatch(str(c.get("id", ""))):
+                raise SystemExit("keycloak: the setup client's id is not one up.sh can read back; check desks-setup in "
+                                 "Keycloak")
+            c["enabled"] = False
+            api.write("PUT", realm_path(spec, f"/clients/{c['id']}"), c)
+            if setup_client_by_id(api, spec, c["id"])["enabled"] is not False:
+                raise SystemExit("keycloak: the setup client is still enabled after it was switched off")
+            print("keycloak: desks-setup disabled")
+            return 0
+        # on. The client list serves only to find the client, or to learn it must be created.
+        c = setup_client(api, spec)
+        if c is None:
+            # Created disabled: it is enabled below, only once its scope and role are in place.
             api.write("POST", realm_path(spec, "/clients"), {
-                "clientId": "desks-setup", "name": "up.sh: the gateway's one-time setup", "enabled": True,
-                "publicClient": False, "serviceAccountsEnabled": True, "standardFlowEnabled": False,
-                "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "protocol": "openid-connect",
+                "clientId": "desks-setup", "name": "up.sh: the gateway's one-time setup", "enabled": False,
+                **SETUP_SETTINGS,
                 "protocolMappers": [{"name": AUDIENCE_MAPPER, "protocol": "openid-connect",
                                      "protocolMapper": "oidc-audience-mapper",
                                      "config": {"included.custom.audience": "ekka-desks",
                                                 "access.token.claim": "true", "id.token.claim": "false"}}]})
-            c = find_client(api, spec, "desks-setup")
-            if "openshell:all" in scopes:
-                api.write("PUT", realm_path(spec, f"/clients/{c['id']}/default-client-scopes/{scopes['openshell:all']}"), {})
-            user = api.get(realm_path(spec, f"/clients/{c['id']}/service-account-user"))
-            api.write("POST", realm_path(spec, f"/users/{user['id']}/role-mappings/realm"),
-                      [api.get(realm_path(spec, "/roles/openshell-admin"))])
-        c["enabled"] = argv[1] == "on"
+            c = setup_client(api, spec)
+            if c is None:
+                raise SystemExit("keycloak: the setup client was created but is not readable; it was left disabled")
+        # Its id first, so a caller can switch off and read back this very client whatever happens next. Only an id
+        # up.sh accepts is used or written: one it would drop could not be switched off by its id.
+        if not SETUP_ID.fullmatch(str(c.get("id", ""))):
+            raise SystemExit("keycloak: the setup client's id is not one up.sh can read back; it was not switched on")
+        sys.stdout.write(c["id"] + "\n")
+        sys.stdout.flush()
+        # Read by its id, its sign-in settings must be the ones it was created with.
+        c = setup_client_by_id(api, spec, c["id"])
+        drifted = sorted(k for k, v in SETUP_SETTINGS.items() if c.get(k) != v)
+        if drifted:
+            raise SystemExit("keycloak: the setup client's sign-in settings are not the ones up.sh creates ("
+                             + ", ".join(drifted) + "); it was not switched on")
+        # Its scope and its role, checked on every `on` and read back before it is enabled: an `on` stopped between
+        # creating the client and assigning them left a client that signs in but cannot do the setup.
+        # Each is matched by its id as well as its name: a record that only shares the name is not the one meant.
+        named = [s for s in api.get(realm_path(spec, "/client-scopes")) or []
+                 if isinstance(s, dict) and s.get("name") == "openshell:all"]
+        scope_id = named[0].get("id") if len(named) == 1 else None
+        if not isinstance(scope_id, str) or not SETUP_ID.fullmatch(scope_id):
+            raise SystemExit("keycloak: the realm has no single openshell:all scope; the setup client was not switched on")
+
+        def defaults():
+            return any(isinstance(s, dict) and s.get("id") == scope_id and s.get("name") == "openshell:all"
+                       for s in api.get(realm_path(spec, f"/clients/{c['id']}/default-client-scopes")) or [])
+        if not defaults():
+            api.write("PUT", realm_path(spec, f"/clients/{c['id']}/default-client-scopes/{scope_id}"), {})
+        user = api.get(realm_path(spec, f"/clients/{c['id']}/service-account-user"))
+        role = api.get(realm_path(spec, "/roles/openshell-admin"))
+        if not isinstance(user, dict) or not isinstance(user.get("id"), str) or not SETUP_ID.fullmatch(user["id"]) \
+                or not isinstance(role, dict) or role.get("name") != "openshell-admin" \
+                or not isinstance(role.get("id"), str) or not SETUP_ID.fullmatch(role["id"]):
+            raise SystemExit("keycloak: the setup client's service account or the openshell-admin role is missing; "
+                             "the setup client was not switched on")
+
+        def held():
+            return any(isinstance(r, dict) and r.get("id") == role["id"] and r.get("name") == "openshell-admin"
+                       for r in api.get(realm_path(spec, f"/users/{user['id']}/role-mappings/realm")) or [])
+        if not held():
+            api.write("POST", realm_path(spec, f"/users/{user['id']}/role-mappings/realm"), [role])
+        if not defaults() or not held():
+            raise SystemExit("keycloak: the setup client's scope or role did not read back; it was not switched on")
+        c["enabled"] = True
         api.write("PUT", realm_path(spec, f"/clients/{c['id']}"), c)
-        if argv[1] == "on":
-            if sys.stdout.isatty():
-                print("keycloak: refusing to print a secret to a terminal", file=sys.stderr)
-                return 2
-            sys.stdout.write(api.get(realm_path(spec, f"/clients/{c['id']}/client-secret"))["value"])
-        else:
-            print("keycloak: desks-setup disabled")
+        sys.stdout.write(api.get(realm_path(spec, f"/clients/{c['id']}/client-secret"))["value"])
         return 0
     if cmd == "scopes" and len(argv) in (2, 3):
         client_id = argv[1]
