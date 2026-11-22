@@ -28,7 +28,10 @@ def parser():
     actions.add_parser("start", help="start the desks service")
     actions.add_parser("stop", help="stop the desks service")
     for verb in ("settle", "unhold"):
-        recovery = commands.add_parser(verb, help="recover one unfinished desk change (restarts the default gateway)" if verb == "settle" else "remove one recovery hold after checking the desk")
+        recovery = commands.add_parser(verb, help=(
+            "recover one unfinished desk change; restarts the default gateway, which stops every running desk "
+            "on this host and interrupts their jobs") if verb == "settle" else
+            "remove one recovery hold, only while that desk's lock still names the change")
         recovery.add_argument("desk")
         recovery.add_argument("--operation", required=True)
         if verb == "settle":

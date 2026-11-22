@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -76,6 +77,11 @@ class FakeDocker:
                     self.files.pop(removed.group(1), None)
             return self.write_rc, "exists\n" if self.write_rc == 3 else ""
         raise AssertionError(f"unexpected docker call {args}")
+
+
+def enclave(args):
+    """`ekka desk list` as the native Enclave answers it: names its desks folder."""
+    return 0, "code-desk  /var/lib/ekka/.ekka/home/desks/code-desk\n"
 
 
 def go(listings, locks=(f"admin:{OP}",), op=OP, backend_id=None, write_rc=0, give_up=600, toml="", docker=None):
@@ -352,14 +358,17 @@ class Hold(unittest.TestCase):
 
     def test_unhold_removes_the_one_hold_and_says_so(self):
         docker = FakeDocker([STOPPED], files={f"{OP}.hold": "{}", "other.hold": "{}"})
+        state = tempfile.mkdtemp()
         out = io.StringIO()
         with redirect_stdout(out):
-            self.assertEqual(ds.main(["--unhold", "code-desk", "--operation", OP], run=docker), 0)
+            self.assertEqual(ds.main(["--unhold", "code-desk", "--operation", OP], run=docker, ekka=enclave,
+                                     read=lambda path: f"admin:{OP}", state=state), 0)
         self.assertEqual(list(docker.files), ["other.hold"])
         self.assertIn("removed the hold", out.getvalue())
         out = io.StringIO()
         with redirect_stdout(out):
-            self.assertEqual(ds.main(["--unhold", "code-desk", "--operation", OP], run=docker), 0)
+            self.assertEqual(ds.main(["--unhold", "code-desk", "--operation", OP], run=docker, ekka=enclave,
+                                     read=lambda path: f"admin:{OP}", state=state), 0)
         self.assertIn("had no hold", out.getvalue())
 
     def test_planted_unhold_with_a_path_or_a_bad_id_never_reaches_docker(self):
@@ -496,6 +505,106 @@ class NoAdapterConfig(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("the backend adapter's configuration is missing", err.getvalue())
         self.assertFalse(any(c[0] in ("restart", "run") for c in calls), "no hold, no restart")
+
+
+class ReviewFixes(unittest.TestCase):
+    """Unhold is bound to its desk and never runs during a settle; a lock is read without following a link,
+    bounded, and only a recognized holder is ever printed."""
+
+    OTHER = "9d4c2b1a-8e7f-4a6b-9c5d-3e2f1a0b9c8d"
+
+    def state(self):
+        state = tempfile.mkdtemp()
+        os.makedirs(os.path.join(state, "backend"))
+        with open(os.path.join(state, "backend", "config.json"), "w") as f:
+            json.dump({"backend_gateway": {"url": "https://host.openshell.internal:8080", "workspace": "desks"}}, f)
+        return state
+
+    def test_unhold_refuses_a_change_another_desk_holds(self):
+        docker = FakeDocker([STOPPED], files={f"{OP}.hold": "{}"})
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            rc = ds.main(["--unhold", "code-desk", "--operation", OP], run=docker, ekka=enclave,
+                         read=lambda path: f"admin:{self.OTHER}", state=self.state())
+        self.assertEqual(rc, 1)
+        self.assertEqual(list(docker.files), [f"{OP}.hold"], "another desk's hold was released")
+        self.assertIn("does not hold desk 'code-desk'", err.getvalue())
+
+    def test_unhold_never_runs_while_a_settle_is_using_the_hold(self):
+        state = self.state()
+        seen = {}
+
+        class DockerThatUnholdsDuringTheRestart(FakeDocker):
+            def __call__(self, args, stdin=None):
+                if args[0] == "restart":
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        seen["rc"] = ds.main(["--unhold", "code-desk", "--operation", OP], run=self, ekka=enclave,
+                                             read=lambda path: f"admin:{OP}", state=state)
+                    seen["files"] = sorted(self.files)
+                    self.calls.append(args)
+                    return 0, ""
+                return super().__call__(args, stdin)
+        docker = DockerThatUnholdsDuringTheRestart([STOPPED])
+        clock, settle = Clock(), ds.settle
+        quick = lambda *a, **k: settle(*a, clock=clock, sleep=clock.sleep, **k)  # noqa: E731  no real waiting
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), mock.patch.object(ds, "settle", quick):
+            rc = ds.main(["code-desk", "--operation", OP], run=docker, ekka=enclave,
+                         read=lambda path: f"admin:{OP}", state=state)
+        self.assertEqual(seen["rc"], 1, "an unhold ran while the settle was using the hold")
+        self.assertEqual(seen["files"], [f"{OP}.hold"])
+        self.assertEqual(rc, 0)
+
+    def test_a_lock_that_is_a_link_is_never_followed_or_printed(self):
+        folder = tempfile.mkdtemp()
+        secret = os.path.join(folder, "credential")
+        with open(secret, "w") as f:
+            f.write("TOKEN=planted-credential-value\n")
+        desks = os.path.join(folder, "desks")
+        os.makedirs(os.path.join(desks, ".state"))
+        os.symlink(secret, os.path.join(desks, ".state", "code-desk.lock"))
+        rc, out = self.settle_reading_for_real(desks)
+        self.assertNotIn("planted-credential-value", out)
+        self.assertEqual(rc, 1)
+
+    def test_an_oversized_lock_is_refused_not_read(self):
+        folder = tempfile.mkdtemp()
+        desks = os.path.join(folder, "desks")
+        os.makedirs(os.path.join(desks, ".state"))
+        with open(os.path.join(desks, ".state", "code-desk.lock"), "w") as f:
+            f.write("a" * 1_000_000)
+        rc, out = self.settle_reading_for_real(desks)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("a" * 100, out)
+
+    def settle_reading_for_real(self, desks):
+        """up.sh's own path: ds.main with its default reader, run for real as this user (runuser and its clean
+        environment taken off), against the folder standing in for the Enclave's desks."""
+        real_run = subprocess.run
+
+        def as_this_user(command, **kwargs):
+            if command[:1] == ["runuser"]:
+                command = list(command[command.index("LANG=C.UTF-8") + 1:])
+                command[0] = sys.executable if command[0] == "/usr/bin/python3" else command[0]
+                command[-1] = command[-1].replace("/var/lib/ekka/.ekka/home/desks", desks, 1)
+            return real_run(command, **kwargs)
+        out, err = io.StringIO(), io.StringIO()
+        real_open = open
+
+        def opened(path, *args, **kwargs):   # the unfixed reader opens the lock itself, as root
+            if isinstance(path, str):
+                path = path.replace("/var/lib/ekka/.ekka/home/desks", desks, 1)
+            return real_open(path, *args, **kwargs)
+        with redirect_stdout(out), redirect_stderr(err), mock.patch.object(ds.subprocess, "run", as_this_user), \
+             mock.patch("builtins.open", opened):
+            rc = ds.main(["code-desk", "--operation", OP], run=FakeDocker([STOPPED]), ekka=enclave,
+                         state=self.state())
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_only_a_recognized_holder_is_printed(self):
+        self.assertEqual(ds.holder(f"admin:{self.OTHER}"), f"another change holds it (admin:{self.OTHER})")
+        self.assertEqual(ds.holder("attempt-7f2c"), "a job holds it (attempt attempt-7f2c)")
+        for text in ("TOKEN=planted-credential-value", "-----BEGIN PRIVATE KEY-----", "admin:not-a-uuid secret"):
+            self.assertNotIn(text.split("=")[-1].split()[-1], ds.holder(text), text)
 
 
 class UpSh(unittest.TestCase):

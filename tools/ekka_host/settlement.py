@@ -47,8 +47,12 @@ def recover(runtime, verb, desk, operation, backend_id=None):
         return result.returncode, result.stdout
 
     def read_lock(path):
-        # A path in the Enclave's home is read as that user, never as root.
-        result = runtime.run([*identity, "/usr/bin/cat", "--", path], allowed=range(256))
+        # A path in the Enclave's home is read as that user, never as root, by a bounded reader that follows no
+        # link. A missing lock stays "nothing holds it", distinct from a lock that cannot be read.
+        result = runtime.run([*identity, "/usr/bin/python3", "-I", "-c", procedure.LOCK_READER, path],
+                             allowed=range(256))
+        if result.returncode == 3:
+            raise FileNotFoundError(path)
         if result.returncode != 0:
             raise OSError("the Enclave lock could not be read")
         return result.stdout

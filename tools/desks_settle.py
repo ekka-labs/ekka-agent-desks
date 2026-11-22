@@ -26,14 +26,22 @@ prints, that a `running` answer carries, and that the desk's lock holds. In orde
      at the next `ekka desk status`.
 
 If it stops anywhere after step 2, the hold STAYS and the change stays held. A person checks the desk, then removes
-the hold with `up.sh desks unhold`; the adapter may then re-issue the change, or it is settled again.
+the hold with `up.sh desks unhold`; the adapter may then re-issue the change, or it is settled again. Unhold removes a
+hold only while the named desk's lock still names that change, so a hold is never released through another desk.
+One settle or unhold runs at a time on a machine (`settle.lock` in the installation's state folder).
+
+The gateway restart in step 3 stops every running desk on this machine, not only this one: NVIDIA OpenShell's
+gateway stops the sandboxes it manages when it shuts down. Jobs running on other desks are interrupted too.
 
 Standard library only. Every Docker call goes through one function, so the tests replace it.
 """
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -53,6 +61,26 @@ DEFAULT_STOP_TIMEOUT = 10        # NVIDIA OpenShell's Docker driver, the same in
 QUIET_EXTRA = 30
 GIVE_UP_AFTER = 600
 POLL = 2
+LOCK_LIMIT = 512                 # a lock holds one short line: `admin:<uuid>[ unknown]` or a job's attempt id
+ADMIN_LOCK = re.compile(r"admin:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?: unknown)?")
+JOB_LOCK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Read as the Enclave's user, by a bounded reader that follows no link and opens no special file. Exit 3: there is
+# no lock; any other non-zero exit: the lock could not be read safely.
+LOCK_READER = (
+    "import os, stat, sys\n"
+    "try:\n"
+    "    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY)\n"
+    "except FileNotFoundError:\n"
+    "    sys.exit(3)\n"
+    "except OSError:\n"
+    "    sys.exit(4)\n"
+    "info = os.fstat(fd)\n"
+    "if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:\n"
+    "    sys.exit(5)\n"
+    f"data = os.read(fd, {LOCK_LIMIT + 1})\n"
+    f"if len(data) > {LOCK_LIMIT}:\n"
+    "    sys.exit(6)\n"
+    "sys.stdout.write(data.decode('ascii'))\n")
 USAGE = ("usage: sudo ./up.sh desks settle <desk> --operation <request id> [--backend-id <uuid>]\n"
          "       sudo ./up.sh desks unhold <desk> --operation <request id>")
 
@@ -74,6 +102,41 @@ def enclave_ekka(args):
                         "HOME=/var/lib/ekka", f"EKKA_HOME={ENCLAVE_HOME}", f"EKKA_ENV={env}", "LANG=C.UTF-8",
                         "/usr/local/bin/ekka", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     return r.returncode, r.stdout
+
+
+def read_as_enclave(path):
+    """The desk's lock, read as the native Enclave's user (never as root) through LOCK_READER."""
+    r = subprocess.run(["runuser", "-u", ENCLAVE_USER, "--", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
+                        "HOME=/var/lib/ekka", "LANG=C.UTF-8", "/usr/bin/python3", "-I", "-c", LOCK_READER, path],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode == 3:
+        raise FileNotFoundError(path)
+    if r.returncode != 0:
+        raise OSError("the desk lock could not be read")
+    return r.stdout
+
+
+@contextlib.contextmanager
+def one_at_a_time(state):
+    """One settle or unhold at a time on this machine, so an unhold never removes a hold a settle is still using."""
+    try:
+        fd = os.open(os.path.join(state, "settle.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        raise Refused("the settle lock in the installation's state folder could not be opened; nothing was "
+                      "changed") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+            raise Refused("the settle lock in the installation's state folder is not a private regular file; "
+                          "nothing was changed")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("another settle or unhold is running on this machine; nothing was changed. "
+                          "Run this again when it finishes") from None
+        yield
+    finally:
+        os.close(fd)
 
 
 def now():
@@ -101,13 +164,16 @@ def holds(lock_text, operation_id):
 
 
 def holder(lock_text):
-    """Who the lock names, for the operator: a job's attempt, another change, or nobody."""
+    """Who the lock names, for the operator: a job's attempt, another change, or nobody. Only a lock in one of the
+    two shapes the Enclave writes is quoted; anything else is described, never printed."""
     held = (lock_text or "").strip()
     if not held:
         return "nothing holds it"
-    if held.startswith("admin:"):
-        return f"another change holds it ({held[:120]})"
-    return f"a job holds it (attempt {held[:120]})"
+    if ADMIN_LOCK.fullmatch(held):
+        return f"another change holds it ({held})"
+    if JOB_LOCK.fullmatch(held):
+        return f"a job holds it (attempt {held})"
+    return "the lock holds something this procedure does not recognize"
 
 
 def containers(desk, run=docker):
@@ -227,7 +293,7 @@ def settle(desk, operation_id, backend_id=None, run=docker, clock=now, sleep=tim
 def _settle_held(desk, operation_id, backend_id, run, clock, sleep, restart, read_lock, window, give_up, poll, out,
                  identity):
     """Steps 3 to 6, with the hold in place."""
-    out("restarting the gateway, so no handler of the change is alive")
+    out("restarting the gateway, so no handler of the change is alive; running desks on this machine stop with it")
     restart()
     restarted_at = clock()
     out(f"watching desk '{desk}' until it has not changed for {window} s (at most {give_up // 60} minutes)")
@@ -282,46 +348,33 @@ def parse(argv):
     return argv[0], argv[2], argv[4] if len(argv) == 5 else None
 
 
-def unhold(argv, run=docker):
-    """`up.sh desks unhold <desk> --operation <request id>`: a person removes a hold a stopped settle left."""
-    args = parse(argv)
-    if args is None or args[2] is not None:
-        print(USAGE, file=sys.stderr)
-        return 2
-    desk, op, _ = args
-    try:
-        if not DESK.match(desk):
-            raise Refused(f"'{desk}' is not a desk name")
-        if not UUID.match(op):
-            raise Refused("the operation is its request id, a lowercase UUID, as `ekka desk status` prints it")
-        if remove_hold(op, run):
-            print(f"removed the hold on change {op} (desk '{desk}'): the adapter may re-issue it, or settle it again")
-        else:
-            print(f"change {op} had no hold; nothing changed")
-        return 0
-    except Refused as e:
-        print(f"REFUSED: {e}", file=sys.stderr)
-        return 1
+def unhold(desk, op, read_lock, run=docker):
+    """`up.sh desks unhold <desk> --operation <request id>`: a person removes a hold a stopped settle left. Only while
+    that desk's lock still names the change: the hold file names no desk, so the lock is what binds the two."""
+    lock = read_lock()
+    if not holds(lock, op):
+        raise Refused(f"change {op} does not hold desk '{desk}': {holder(lock)}. Its hold, if there is one, belongs to "
+                      "another desk or to a change that has ended; nothing was removed")
+    if remove_hold(op, run):
+        print(f"removed the hold on change {op} (desk '{desk}'): the adapter may re-issue it, or settle it again")
+    else:
+        print(f"change {op} had no hold; nothing changed")
 
 
-def read_text(path):
-    with open(path, encoding="utf-8") as f:   # the Enclave's folder, read as root
-        return f.read()
-
-
-def main(argv, run=docker, ekka=enclave_ekka, read=read_text, state=None,
+def main(argv, run=docker, ekka=enclave_ekka, read=read_as_enclave, state=None,
          unhold_command="sudo ./up.sh desks unhold"):
-    if argv[:1] == ["--unhold"]:
-        return unhold(argv[1:], run)
-    args = parse(argv)
-    if args is None:
+    releasing = argv[:1] == ["--unhold"]
+    args = parse(argv[1:] if releasing else argv)
+    if args is None or (releasing and args[2] is not None):
         print(USAGE, file=sys.stderr)
         return 2
     desk, op, backend_id = args
     try:
-        # The desk name is checked before it is part of any path.
+        # The desk name and the change are checked before either is part of any path.
         if not DESK.match(desk):
             raise Refused(f"'{desk}' is not a desk name")
+        if not UUID.match(op):
+            raise Refused("the operation is its request id, a lowercase UUID, as `ekka desk status` prints it")
         rc, listing = ekka(["desk", "list"])
         m = re.search(r"/var/lib/ekka/\S*/desks", listing) if rc == 0 else None
         if not m:
@@ -334,9 +387,13 @@ def main(argv, run=docker, ekka=enclave_ekka, read=read_text, state=None,
             except FileNotFoundError:
                 return ""
             except OSError:
-                raise Refused("the desk lock could not be read; nothing was settled") from None
+                raise Refused("the desk lock could not be read; nothing was changed") from None
 
         state = state if state is not None else os.environ.get("DESKS_STATE", "/var/lib/ekka-agent-desks")
+        if releasing:
+            with one_at_a_time(state):
+                unhold(desk, op, read_lock, run)
+            return 0
         # The gateway's identity as the adapter itself has it, read before anything is held or restarted.
         config = os.path.join(state, "backend", "config.json")
         try:
@@ -357,8 +414,9 @@ def main(argv, run=docker, ekka=enclave_ekka, read=read_text, state=None,
             if rc != 0:
                 raise Refused("the gateway did not restart; no marker was written")
 
-        settle(desk, op, backend_id, run=run, read_lock=read_lock, gateway_toml=toml, restart=restart,
-               identity=identity, unhold_command=unhold_command)
+        with one_at_a_time(state):
+            settle(desk, op, backend_id, run=run, read_lock=read_lock, gateway_toml=toml, restart=restart,
+                   identity=identity, unhold_command=unhold_command)
         return 0
     except Refused as e:
         print(f"REFUSED: {e}", file=sys.stderr)
