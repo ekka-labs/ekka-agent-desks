@@ -328,21 +328,21 @@ esac
         (state / "up.env").write_text("DESKS_NAME=desks.example.test\n")
         return log
 
-    def test_a_registry_port_does_not_skip_the_github_scope_check(self):
+    def test_the_github_scope_check_covers_a_name_with_a_port(self):
         with tempfile.TemporaryDirectory() as d:
             log = self.box(d, scopes="repo, read:packages")
             r = self.run_verb(d, "registry", "login", "ghcr.io:443", "someone", stdin="ghp_" + "a" * 36)
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertIn("curl", log.read_text().split())
-            self.assertNotIn("docker login", log.read_text(), "a token wider than read:packages reached docker")
+            self.assertNotIn("docker login", log.read_text(), "a token with more than read:packages was accepted")
 
-    def test_a_trailing_dot_cannot_skip_the_github_scope_check(self):
+    def test_a_name_with_an_outer_dot_is_not_a_registry_name(self):
         with tempfile.TemporaryDirectory() as d:
             log = self.box(d, scopes="repo, read:packages")
             for host in ("ghcr.io.", ".ghcr.io", "ghcr.io.:443"):
                 r = self.run_verb(d, "registry", "login", host, "someone", stdin="ghp_" + "a" * 36)
                 self.assertEqual(r.returncode, 1, host)
-            self.assertNotIn("docker login", log.read_text(), "a token reached docker without the scope check")
+            self.assertNotIn("docker login", log.read_text(), "a name with an outer dot was accepted")
 
     def test_a_login_never_reaches_a_host_credential_helper(self):
         with tempfile.TemporaryDirectory() as d:
@@ -390,7 +390,7 @@ esac
             for path in ("..", ".", "../x"):
                 self.assertEqual(self.run_verb(d, "registry", "logout", path).returncode, 1, path)
 
-    def test_a_pull_never_uses_a_credential_kept_under_an_outer_dot(self):
+    def test_a_pull_accepts_only_the_registry_names_a_login_accepts(self):
         with tempfile.TemporaryDirectory() as d:
             log = self.box(d)
             folder = Path(d, "state", "secrets", "registry")
@@ -398,7 +398,7 @@ esac
             (folder / "ghcr.io..env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=ghp_" + "a" * 36 + "\n")
             r = self.run_verb(d, "image", "pull", "ghcr.io./x/y@sha256:" + "a" * 64)
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-            self.assertNotIn("docker", log.read_text(), "a credential kept under that name reached docker")
+            self.assertNotIn("docker", log.read_text(), "the pull went ahead for a name a login refuses")
             self.assertIn("log in again", r.stderr)
 
     def test_a_logout_that_cannot_remove_the_credential_says_so(self):
