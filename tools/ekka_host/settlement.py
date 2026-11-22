@@ -1,34 +1,12 @@
 """Native host recovery uses the existing settle procedure, without up.sh."""
-import os
 import shlex
 from pathlib import Path
-import stat
 
 import desks_settle as procedure
 from .runtime import HostError, STATE, STACK
+from .files import root_file
 
 ENV_FILE = Path("/etc/ekka/desks.env")
-
-
-def root_file(path):
-    """Read fixed root-owned settings; reject links and writable ancestors."""
-    path = Path(path)
-    for part in [*reversed(path.parents), path]:
-        info = part.lstat()
-        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-            raise HostError("host recovery settings must be root-owned and not writable by others")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-            raise HostError("host recovery settings must be regular root-owned files")
-        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as stream:
-            text = stream.read(65537)
-        if len(text) > 65536:
-            raise HostError("host recovery settings are too large")
-        return text
-    finally:
-        os.close(fd)
 
 
 def environment():

@@ -10,6 +10,7 @@ From a trusted checkout on the installed Linux host:
 sudo ./ekka-desk-host status
 sudo ./ekka-desk-host stack start
 sudo ./ekka-desk-host stack stop
+sudo ./ekka-desk-host image pull registry.example/team/desk@sha256:<64-hex-digest>
 sudo ./ekka-desk-host settle code-desk --operation <request-uuid>
 sudo ./ekka-desk-host unhold code-desk --operation <request-uuid>
 ```
@@ -34,6 +35,15 @@ Exit codes: 0 means the requested check or service change passed, 1 means refuse
 invalid arguments or a desk action requested through the host command. Desk actions are refused with their intended
 native EKKA command; that message does not enable commands absent from the installed runner.
 
+## Pulling an image
+
+`image pull <registry>/<repository>@sha256:<digest>` pulls one immutable image and checks that Docker reports its
+digest. Tags are refused. `--signed-by <certificate-identity> --issuer <https-issuer>` optionally checks the signature
+before pulling; both options are required together. A configured registry credential is read only from its private
+root-owned file and reaches Docker login through stdin. Each command uses a fresh private Docker configuration,
+removed before success is reported. An unsuccessful signature check prevents the pull. A pull acknowledgement
+without the requested digest is an unverified result. No EKKA desk grant is created or changed by pulling an image.
+
 ## Recovering one unfinished change
 
 `settle <desk> --operation <request-uuid> [--backend-id <sandbox-uuid>]` invokes the existing Python settlement
@@ -50,7 +60,7 @@ execution and after completion or failure. They do not invoke `up.sh`.
 
 ## Remaining migration
 
-Installation, upgrades, named instances, registry/image management, the full walk and the allow-listed
+Installation, upgrades, named instances, registry credential management, the full walk and the allow-listed
 NVIDIA recovery CLI still need native host implementations. Provider keys, people and grants belong in governed
 `ekka desk` commands. The old script and shadowing wrapper can be retired once all their actions have working
 replacements and the upgrade path preserves installed state. Do not use this preview to provision a second

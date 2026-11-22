@@ -5,6 +5,7 @@ import sys
 
 from .runtime import HostError, Runtime, stack_change, status
 from .settlement import recover
+from .images import pull
 
 DESK_COMMANDS = {"connect": "ekka desk connect", "invite": "ekka desk people invite",
                  "revoke": "ekka desk people revoke", "grant": "ekka desk grant",
@@ -28,6 +29,12 @@ def parser():
         recovery.add_argument("--operation", required=True)
         if verb == "settle":
             recovery.add_argument("--backend-id")
+    image = commands.add_parser("image", help="pull an immutable desk image onto the host")
+    image_actions = image.add_subparsers(dest="verb", required=True)
+    image_pull = image_actions.add_parser("pull", help="pull by digest, optionally checking a signing identity")
+    image_pull.add_argument("reference")
+    image_pull.add_argument("--signed-by")
+    image_pull.add_argument("--issuer")
     return cli
 
 
@@ -47,6 +54,8 @@ def main(argv=None, runtime=None, uid=None):
             status(runtime)
         elif options.command == "stack":
             stack_change(runtime, options.verb)
+        elif options.command == "image":
+            pull(runtime, options.reference, options.signed_by, options.issuer)
         else:
             recover(runtime, options.command, options.desk, options.operation,
                     getattr(options, "backend_id", None))
