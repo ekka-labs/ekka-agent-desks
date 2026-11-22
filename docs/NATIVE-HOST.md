@@ -55,3 +55,12 @@ NVIDIA recovery CLI still need native host implementations. Provider keys, peopl
 `ekka desk` commands. The old script and shadowing wrapper can be retired once all their actions have working
 replacements and the upgrade path preserves installed state. Do not use this preview to provision a second
 organization on an existing host.
+
+## Provider adapter permission during migration
+
+The new governed provider adapter requires the gateway permission `provider:write` on its dedicated
+`ekka-desk-admin` service account. The provisioning helper accepts `admin-client on --provider-writes` for that
+matching adapter. Default provisioning retains the legacy scope set, and person and Enclave clients do not receive
+this permission. Native installation/upgrade must select this option only with a compatible adapter and must keep
+selecting it on later reconciliations. Running legacy `admin-client on` reconciles back to the old scope set.
+No installed realm is changed by this source update, and the existing installer does not enable the option yet.

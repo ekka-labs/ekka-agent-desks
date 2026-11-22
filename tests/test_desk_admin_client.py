@@ -138,6 +138,26 @@ class TheAdminClient(unittest.TestCase):
         for wider in ("provider:write", "workspace:read", "workspace:write", "openshell:all"):
             self.assertNotIn(wider, kc.defaults, f"{wider}: more than the adapter's calls need")
 
+    def test_provider_writes_are_explicit_and_scoped_only_to_the_adapter(self):
+        kc = FakeKeycloak()
+        code, out = run(["admin-client", "on", "--provider-writes"], kc)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, SECRET)
+        self.assertEqual(sorted(kc.defaults), ["config:read", "config:write", "provider:read",
+                                               "provider:write", "sandbox:read", "sandbox:write"])
+        self.assertEqual(kc.roles, ["openshell-admin"])
+        self.assertIn("provider:write", {s["name"] for s in kc.scopes})
+        self.assertNotIn("openshell:all", kc.defaults)
+        # The realm's person and Enclave clients keep their existing scopes.
+        for client in SPEC["clients"]:
+            self.assertNotIn("provider:write", client.get("defaultScopes", []))
+        run(["admin-client", "on", "--provider-writes"], kc)
+        self.assertEqual(sorted(kc.defaults), ["config:read", "config:write", "provider:read",
+                                               "provider:write", "sandbox:read", "sandbox:write"])
+        # Running the legacy configuration explicitly reconciles it back.
+        run(["admin-client", "on"], kc)
+        self.assertNotIn("provider:write", kc.defaults)
+
     def test_refuses_to_print_its_secret_to_a_terminal(self):
         class Tty(io.StringIO):
             def isatty(self):
