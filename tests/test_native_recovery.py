@@ -64,8 +64,11 @@ class NativeRecoveryTests(unittest.TestCase):
              patch("ekka_host.settlement.root_file", side_effect=lambda p: Path(p).read_text()), \
              patch("desks_settle.settle", side_effect=settle), \
              patch.dict(os.environ, {"DESKS_STATE":"/wrong-state", "EKKA_ENV":"wrong-env"}), \
-             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            return main([verb, "code-desk", "--operation", OP], runtime=self.host, uid=0)
+             contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            result = main([verb, "code-desk", "--operation", OP], runtime=self.host, uid=0)
+        self.errors = errors.getvalue()
+        self.output = output.getvalue()
+        return result
 
     def test_settle_writes_the_marker_and_reads_locks_as_the_enclave_user(self):
         self.assertEqual(self.invoke(), 0)
@@ -84,6 +87,8 @@ class NativeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.invoke(), 1)
         self.assertIn(OP + ".hold", self.host.docker.files)
         self.assertNotIn(OP + ".json", self.host.docker.files)
+        self.assertIn("sudo ekka-desk-host unhold", self.errors)
+        self.assertNotIn("up.sh", self.errors)
         self.assertEqual(self.host.records[-1][1], "not_verified")
         self.assertFalse(any("procedure completed" in line for line in self.host.lines))
 

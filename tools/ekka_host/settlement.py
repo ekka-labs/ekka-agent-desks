@@ -82,7 +82,8 @@ def recover(runtime, verb, desk, operation, backend_id=None):
     action = " ".join([verb, desk, operation])
     runtime.audit(action, "requested")
     try:
-        result = procedure.main(args, run=docker, ekka=ekka, read=read_lock, state=str(STATE))
+        result = procedure.main(args, run=docker, ekka=ekka, read=read_lock, state=str(STATE),
+                                unhold_command="sudo ekka-desk-host unhold")
         if result != 0:
             raise HostError("recovery did not complete; inspect the desk and any retained hold")
     except Exception:
