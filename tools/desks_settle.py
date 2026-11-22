@@ -65,9 +65,10 @@ LOCK_LIMIT = 512                 # a lock holds one short line: `admin:<uuid>[ u
 ADMIN_LOCK = re.compile(r"admin:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?: unknown)?")
 JOB_LOCK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 # Read as the Enclave's user, by a bounded reader that follows no link at ANY level: it walks from / one folder at a
-# time, each opened with O_NOFOLLOW | O_DIRECTORY, then opens the lock itself with O_NOFOLLOW and refuses anything but
-# a regular file with one link. Exit 3: the lock file itself is absent (nothing holds the desk). Any other non-zero
-# exit (7: a folder on the way is missing or not a real folder) means the lock could not be read safely.
+# time, each opened with O_NOFOLLOW | O_DIRECTORY. Where the system has O_PATH it first looks at the lock itself
+# without opening it for reading, so only a regular file with one link is ever opened; the file opened must then be
+# that same file. It writes the lock's bytes unchanged. Exit 3: the lock file itself is absent (nothing holds the
+# desk). Any other non-zero exit (7: a folder on the way is missing or not a real folder) means it could not be read.
 LOCK_READER = (
     "import os, stat, sys\n"
     "parts = sys.argv[1].split('/')\n"
@@ -79,6 +80,17 @@ LOCK_READER = (
     "        fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)\n"
     "    except OSError:\n"
     "        sys.exit(7)\n"
+    "seen = None\n"
+    "if hasattr(os, 'O_PATH'):\n"
+    "    try:\n"
+    "        look = os.open(parts[-1], os.O_PATH | os.O_NOFOLLOW, dir_fd=fd)\n"
+    "    except FileNotFoundError:\n"
+    "        sys.exit(3)\n"
+    "    except OSError:\n"
+    "        sys.exit(4)\n"
+    "    seen = os.fstat(look)\n"
+    "    if not stat.S_ISREG(seen.st_mode) or seen.st_nlink != 1:\n"
+    "        sys.exit(5)\n"
     "try:\n"
     "    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY, dir_fd=fd)\n"
     "except FileNotFoundError:\n"
@@ -88,10 +100,12 @@ LOCK_READER = (
     "info = os.fstat(fd)\n"
     "if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:\n"
     "    sys.exit(5)\n"
+    "if seen is not None and (seen.st_dev, seen.st_ino) != (info.st_dev, info.st_ino):\n"
+    "    sys.exit(5)\n"
     f"data = os.read(fd, {LOCK_LIMIT + 1})\n"
     f"if len(data) > {LOCK_LIMIT}:\n"
     "    sys.exit(6)\n"
-    "sys.stdout.write(data.decode('ascii'))\n")
+    "sys.stdout.buffer.write(data)\n")
 USAGE = ("usage: sudo ./up.sh desks settle <desk> --operation <request id> [--backend-id <uuid>]\n"
          "       sudo ./up.sh desks unhold <desk> --operation <request id>")
 
@@ -124,7 +138,7 @@ def read_as_enclave(path):
     try:
         r = subprocess.run(["runuser", "-u", ENCLAVE_USER, "--", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
                             "HOME=/var/lib/ekka", "LANG=C.UTF-8", "/usr/bin/python3", "-I", "-c", LOCK_READER, path],
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                           capture_output=True, stdin=subprocess.DEVNULL)
     except OSError:
         # The reader did not start: that says nothing about the lock, and must never read as "no lock".
         raise OSError("the desk lock reader could not be started") from None
@@ -132,7 +146,11 @@ def read_as_enclave(path):
         raise FileNotFoundError(path)
     if r.returncode != 0:
         raise OSError("the desk lock could not be read")
-    return r.stdout
+    try:
+        # The bytes as written: no newline translation, and nothing but ASCII.
+        return r.stdout.decode("ascii")
+    except UnicodeDecodeError:
+        raise OSError("the desk lock is not ASCII text") from None
 
 
 @contextlib.contextmanager
@@ -177,10 +195,9 @@ def stop_timeout(gateway_toml_text):
 
 
 def claim(lock_text):
-    """The lock's text as the Enclave wrote it: at most one trailing newline is dropped, nothing else. (str.strip()
-    would also drop control characters such as \\x1c, turning a damaged lock into a valid claim.)"""
-    text = lock_text or ""
-    return text[:-1] if text.endswith("\n") else text
+    """The lock's text exactly as the Enclave writes it: `admin:<id>` or `admin:<id> unknown`, with no terminator.
+    Nothing is stripped, so a lock with any added character, a line ending included, matches no claim."""
+    return lock_text or ""
 
 
 def holds(lock_text, operation_id):

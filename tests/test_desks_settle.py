@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import unittest
@@ -557,15 +558,15 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual(rc, 0)
 
     def test_a_lock_that_is_a_link_is_never_followed_or_printed(self):
-        folder = os.path.realpath(tempfile.mkdtemp())   # the reader follows no link, /var on macOS included
-        secret = os.path.join(folder, "credential")
-        with open(secret, "w") as f:
-            f.write("TOKEN=planted-credential-value\n")
+        folder = os.path.realpath(tempfile.mkdtemp())   # a path with no link in it, /var on macOS included
+        other = os.path.join(folder, "other-file")
+        with open(other, "w") as f:
+            f.write("text-from-another-file\n")
         desks = os.path.join(folder, "desks")
         os.makedirs(os.path.join(desks, ".state"))
-        os.symlink(secret, os.path.join(desks, ".state", "code-desk.lock"))
+        os.symlink(other, os.path.join(desks, ".state", "code-desk.lock"))
         rc, out = self.settle_reading_for_real(desks)
-        self.assertNotIn("planted-credential-value", out)
+        self.assertNotIn("text-from-another-file", out)
         self.assertEqual(rc, 1)
 
     def test_an_oversized_lock_is_refused_not_read(self):
@@ -578,7 +579,52 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertNotIn("a" * 100, out)
 
-    def settle_reading_for_real(self, desks):
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "the look before the open needs O_PATH (Linux)")
+    def test_a_lock_that_is_not_a_file_is_looked_at_before_it_is_opened(self):
+        # The reader first looks at the lock without opening it. A socket cannot be opened at all, so a reader that
+        # opens first ends on the failed open (4); one that looks first refuses it as not a regular file (5).
+        folder = os.path.realpath(tempfile.mkdtemp())
+        lock = os.path.join(folder, "code-desk.lock")
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.bind(lock)
+            r = subprocess.run([sys.executable, "-c", ds.LOCK_READER, lock], capture_output=True, timeout=30)
+        finally:
+            s.close()
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self.assertEqual(r.stdout, b"")
+
+    def lock_bytes_through_the_reader(self, data, argv, docker):
+        """ds.main with its default reader, run for real as this user, on a lock file holding exactly `data`."""
+        folder = os.path.realpath(tempfile.mkdtemp())
+        desks = os.path.join(folder, "desks")
+        os.makedirs(os.path.join(desks, ".state"))
+        with open(os.path.join(desks, ".state", "code-desk.lock"), "wb") as f:
+            f.write(data)
+        return self.settle_reading_for_real(desks, argv=argv, docker=docker)
+
+    def test_a_line_ending_the_enclave_never_writes_is_not_a_claim(self):
+        # The Enclave writes `admin:<id>` with no terminator. Read through the real reader process, a lock with a
+        # carriage return or CRLF added is not this change's claim: unhold keeps the hold, settle starts nothing.
+        for data in (f"admin:{OP}\r\n".encode(), f"admin:{OP}\r".encode(), f"admin:{OP}\n".encode()):
+            with self.subTest(data=data):
+                docker = FakeDocker([STOPPED], files={f"{OP}.hold": "{}"})
+                rc, out = self.lock_bytes_through_the_reader(data, ["--unhold", "code-desk", "--operation", OP], docker)
+                self.assertEqual(rc, 1, out)
+                self.assertEqual(list(docker.files), [f"{OP}.hold"], "a hold was released on a damaged claim")
+
+                class Docker(FakeDocker):
+                    def __call__(self, args, stdin=None):
+                        if args[0] == "restart":
+                            self.calls.append(args)
+                            return 0, ""
+                        return super().__call__(args, stdin)
+                docker = Docker([STOPPED])
+                rc, out = self.lock_bytes_through_the_reader(data, ["code-desk", "--operation", OP], docker)
+                self.assertEqual(docker.files, {}, "a settle started on a damaged claim")
+                self.assertFalse(any(c[0] == "restart" for c in docker.calls))
+
+    def settle_reading_for_real(self, desks, argv=None, docker=None):
         """up.sh's own path: ds.main with its default reader, run for real as this user (runuser and its clean
         environment taken off), against the folder standing in for the Enclave's desks."""
         real_run = subprocess.run
@@ -598,7 +644,7 @@ class ReviewFixes(unittest.TestCase):
             return real_open(path, *args, **kwargs)
         with redirect_stdout(out), redirect_stderr(err), mock.patch.object(ds.subprocess, "run", as_this_user), \
              mock.patch("builtins.open", opened), mock.patch.dict(os.environ, {"DESKS_STATE": self.state()}):
-            rc = ds.main(["code-desk", "--operation", OP], run=FakeDocker([STOPPED]), ekka=enclave)
+            rc = ds.main(argv or ["code-desk", "--operation", OP], run=docker or FakeDocker([STOPPED]), ekka=enclave)
         return rc, out.getvalue() + err.getvalue()
 
     def test_an_emptied_or_unrecognized_lock_keeps_the_hold(self):
@@ -651,7 +697,7 @@ class ReviewFixes(unittest.TestCase):
         def runuser(command, **kwargs):
             reads.append(command)
             if len(reads) == 1:
-                return subprocess.CompletedProcess(command, 0, f"admin:{OP}", "")
+                return subprocess.CompletedProcess(command, 0, f"admin:{OP}".encode(), b"")
             raise FileNotFoundError(2, "No such file or directory", "runuser")
         clock, settle = Clock(), ds.settle
         quick = lambda *a, **k: settle(*a, clock=clock, sleep=clock.sleep, **k)  # noqa: E731
@@ -659,6 +705,7 @@ class ReviewFixes(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(err), mock.patch.object(ds, "settle", quick), \
              mock.patch.object(ds.subprocess, "run", runuser), mock.patch.dict(os.environ, {"DESKS_STATE": state}):
             rc = ds.main(["code-desk", "--operation", OP], run=docker, ekka=enclave)
+        self.assertEqual(len(reads), 2, "the second read, whose start fails, was never reached")
         self.assertEqual(rc, 1, err.getvalue())
         self.assertEqual(list(docker.files), [f"{OP}.hold"], "the hold was released without the lock being seen")
 
