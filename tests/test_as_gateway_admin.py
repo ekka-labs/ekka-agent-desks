@@ -12,6 +12,8 @@ import tempfile
 import unittest
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+# NVIDIA's CLI keeps what `gateway add` was given under $HOME/.config/openshell (bootstrap paths.rs, metadata.rs).
+META_SH = 'mkdir -p "$HOME/.config/openshell/gateways/ekka-agent-desks"; printf \'{"gateway_endpoint":"%s","auth_mode":"oidc","oidc_issuer":"%s","oidc_client_id":"%s"}\' "$3" "$7" "$9" > "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json"'
 
 
 def function(text=None):
@@ -30,7 +32,8 @@ def run(action="echo did-the-call; return 0", on="ok", login="ok", off="ok", fn=
         f.write("#!/bin/sh\nexit 0\n")   # the gateway answers on 8080 at once
     with open(os.path.join(stubs, "os"), "w") as f:
         f.write(f'#!/bin/sh\necho "os $*" >> "{log}"\n'
-                f'case "$1 $2" in "gateway login") [ "$LOGIN" = ok ] || exit 1 ;; esac\nexit 0\n')
+                f'case "$1 $2" in "gateway login") [ "$LOGIN" = ok ] || exit 1 ;;\n'
+                f'  "gateway add") {META_SH} ;; esac\nexit 0\n')   # keeps the registration it was given
     for name in ("openssl", "os"):
         os.chmod(os.path.join(stubs, name), 0o755)
     script = f"""
@@ -43,6 +46,7 @@ kc() {{ echo "kc $*" >> {log}
   case "$1 $2" in
     "setup-client on") [ "$ON" = ok ] && printf the-secret || return 1 ;;
     "setup-client off") [ "$OFF" = ok ] || return 1 ;;
+    "setup-client status") echo disabled ;;
   esac; }}
 action() {{ {action}; }}
 {fn if fn is not None else function()}
@@ -61,7 +65,7 @@ class EachStepIsChecked(unittest.TestCase):
         r, calls = run()
         self.assertIn("did-the-call", r.stdout)
         self.assertIn("rc=0", r.stdout)
-        self.assertEqual(calls[-1], "kc setup-client off")
+        self.assertEqual(calls[-2:], ["kc setup-client off", "kc setup-client status"], "switched off, then read back")
 
     def test_the_calls_own_answer_comes_back(self):
         r, _ = run(action="return 1")

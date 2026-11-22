@@ -316,5 +316,55 @@ connect_desk_admin
         self.assertIn("did not connect again", r.stderr)
 
 
+class KeycloakAnswers:
+    """The client list as Keycloak's admin API might answer it, including answers that are not one exact record."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.writes = []
+
+    def get(self, path):
+        if not path.endswith("/clients?clientId=desks-setup"):
+            raise AssertionError("read outside the setup client: " + path)
+        return self.answer
+
+    def write(self, *args):
+        self.writes.append(args)
+
+
+class TheSetupClientIsReadStrictly(unittest.TestCase):
+    """up.sh switches its temporary gateway administrator off with `setup-client off` and reads it back with
+    `setup-client status`. An empty body, null, {} or anything but one exact desks-setup record is an unknown state:
+    never "disabled", and never a reason to skip the switch-off."""
+
+    RECORD = {"id": "c0ffee", "clientId": "desks-setup"}
+
+    def test_an_unreadable_answer_is_never_disabled_and_never_skips_the_switch_off(self):
+        for answer in (None, {}, "", [{"id": "x", "clientId": "other", "enabled": False}],
+                       [{**self.RECORD, "enabled": False}] * 2, [{"clientId": "desks-setup", "enabled": False}],
+                       [{**self.RECORD, "enabled": "false"}]):
+            for verb in ("status", "off"):
+                with self.subTest(answer=answer, verb=verb):
+                    keycloak = KeycloakAnswers(answer)
+                    with self.assertRaises(SystemExit):
+                        run(["setup-client", verb], keycloak)
+                    self.assertEqual(keycloak.writes, [])
+
+    def test_status_reads_without_writing(self):
+        for answer, expected in (([], "disabled"), ([{**self.RECORD, "enabled": False}], "disabled"),
+                                 ([{**self.RECORD, "enabled": True}], "enabled")):
+            keycloak = KeycloakAnswers(answer)
+            code, output = run(["setup-client", "status"], keycloak)
+            self.assertEqual((code, output.strip()), (0, expected))
+            self.assertEqual(keycloak.writes, [])
+
+    def test_off_disables_the_one_exact_record(self):
+        keycloak = KeycloakAnswers([{**self.RECORD, "enabled": True}])
+        code, _ = run(["setup-client", "off"], keycloak)
+        self.assertEqual(code, 0)
+        self.assertEqual(keycloak.writes[-1][0], "PUT")
+        self.assertIs(keycloak.writes[-1][2]["enabled"], False)
+
+
 if __name__ == "__main__":
     unittest.main()

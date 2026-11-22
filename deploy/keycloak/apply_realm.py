@@ -21,6 +21,9 @@
                                                  finish; reads only. Never an administrator; never a revoked person
     apply_realm.py revoke <username>            that person taken off (ekka desk revoke): sign-in disabled, every
                                                  session ended. Never an administrator; never a name not here
+    apply_realm.py setup-client on|off|status    up.sh's temporary gateway administrator: `on` writes its secret
+                                                 into a pipe, `off` disables it, `status` prints only enabled or
+                                                 disabled. An unreadable client list is never read as disabled.
 
 Environment: KC_URL (the admin listener, default https://127.0.0.1:8443), KC_CA (CA file for KC_URL),
 KC_ADMIN_USER and KC_ADMIN_PASSWORD_FILE (the bootstrap admin, written by setup, mode 0600).
@@ -100,6 +103,21 @@ def realm_path(spec, rest=""):
 def find_client(api, spec, client_id):
     found = api.get(realm_path(spec, "/clients?clientId=" + urllib.parse.quote(client_id))) or []
     return found[0] if found else None
+
+
+def setup_client(api, spec):
+    """The desks-setup client, read strictly: None only for an answered empty list. Anything else that is not one
+    exact desks-setup record with a boolean `enabled` is an unknown state, never "disabled" or "absent"."""
+    found = api.get(realm_path(spec, "/clients?clientId=desks-setup"))
+    if not isinstance(found, list):
+        raise SystemExit("keycloak: the client list did not answer as a list; the setup client's state is unknown")
+    if not found:
+        return None
+    c = found[0]
+    if len(found) != 1 or not isinstance(c, dict) or c.get("clientId") != "desks-setup" \
+            or not isinstance(c.get("id"), str) or not c["id"] or not isinstance(c.get("enabled"), bool):
+        raise SystemExit("keycloak: the client list did not return one exact desks-setup record; its state is unknown")
+    return c
 
 
 def plan(api, spec):
@@ -404,12 +422,17 @@ def main(argv):
             raise SystemExit("keycloak: the ekka-enclave client does not exist; run apply first")
         sys.stdout.write(api.get(realm_path(spec, f"/clients/{c['id']}/client-secret"))["value"])
         return 0
-    if cmd == "setup-client" and len(argv) == 2 and argv[1] in ("on", "off"):
+    if cmd == "setup-client" and len(argv) == 2 and argv[1] in ("on", "off", "status"):
         # up.sh's own administrator for its one-time gateway steps: a confidential client whose service account holds
-        # openshell-admin. `on` enables it and writes its secret into a pipe; `off` disables it. Not in realm.json on
-        # purpose: it exists only while up.sh needs it, and stays disabled otherwise.
+        # openshell-admin. `on` enables it and writes its secret into a pipe; `off` disables it; `status` reads it
+        # back (enabled or disabled, no write, no secret). Not in realm.json on purpose: it exists only while up.sh
+        # needs it, and stays disabled otherwise.
         api = Api()
-        c = find_client(api, spec, "desks-setup")
+        c = setup_client(api, spec)
+        if argv[1] == "status":
+            # Missing (an answered empty list) is disabled; a malformed or unanswered read never claims so.
+            print("enabled" if c is not None and c["enabled"] else "disabled")
+            return 0
         if c is None:
             if argv[1] == "off":
                 return 0
@@ -422,7 +445,9 @@ def main(argv):
                                      "protocolMapper": "oidc-audience-mapper",
                                      "config": {"included.custom.audience": "ekka-desks",
                                                 "access.token.claim": "true", "id.token.claim": "false"}}]})
-            c = find_client(api, spec, "desks-setup")
+            c = setup_client(api, spec)
+            if c is None:
+                raise SystemExit("keycloak: the setup client was created but is not readable; nothing more was changed")
             if "openshell:all" in scopes:
                 api.write("PUT", realm_path(spec, f"/clients/{c['id']}/default-client-scopes/{scopes['openshell:all']}"), {})
             user = api.get(realm_path(spec, f"/clients/{c['id']}/service-account-user"))

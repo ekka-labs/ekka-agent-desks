@@ -20,13 +20,14 @@ class ProviderCredentials(unittest.TestCase):
                 script = 'set -uo pipefail\n' + '\n'.join(functions) + r'''
 install_cli() { :; }
 openssl() { return 0; }
-kc() { if [[ $2 == on ]]; then printf %s gateway-login-test-value; fi; }
+kc() { if [[ $2 == on ]]; then printf %s gateway-login-test-value; elif [[ $2 == status ]]; then echo disabled; fi; }
 profile_names() { printf 'claude-code\n'; }
 profile_source() { printf profile; }
 python3() {
   case $1 in
     tools/provider_connect.py) [[ $2 == keyless ]] && return 1; printf '%s\n' "$CREDENTIAL_ENV" ;;
     tools/openshell_allow.py) return 0 ;;
+    -c) command python3 "$@" ;;   # as_gateway_admin's lock, run for real
     *) return 99 ;;
   esac
 }
@@ -36,7 +37,8 @@ ok() { :; }
 fake_cli() {
   if [[ ${1:-} == -g ]]; then shift 2; fi
   case "$*" in
-    'gateway add '*|'gateway login '*) return 0 ;;
+    'gateway add '*) mkdir -p "$HOME/.config/openshell/gateways/ekka-agent-desks"; printf '{"gateway_endpoint":"%s","auth_mode":"oidc","oidc_issuer":"%s","oidc_client_id":"%s"}' "$3" "$7" "$9" > "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json" ;;
+    'gateway login '*) return 0 ;;
     'provider get '*) return 1 ;;
     'provider create '*)
       [[ $OPENSHELL_OIDC_CLIENT_SECRET == gateway-login-test-value ]] || return 98
