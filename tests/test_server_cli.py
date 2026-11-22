@@ -387,6 +387,25 @@ class TheRootOwnedCopy(unittest.TestCase):
         self.assertEqual(sorted(read - copied), [], "folders the tools read that the root-owned copy leaves out")
         self.assertTrue({"tools", "up.sh"} <= copied)
 
+    def test_the_copy_carries_no_bytecode_from_the_checkout(self):
+        # snapshot_stack as written in up.sh, run in a stand-in checkout; chown is a no-op, install only makes folders.
+        import re as _re
+        fn = _re.search(r"^snapshot_stack\(\) \{.*?^\}\n", (ROOT/"up.sh").read_text(), _re.S | _re.M).group(0)
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d, "checkout")
+            for folder in ("deploy", "tools/__pycache__", "tools/ekka_host/__pycache__", "providers", "desk", "ekka", "vendor"):
+                Path(src, folder).mkdir(parents=True, exist_ok=True)
+            for name in ("up.sh", "ekka-desk-host", "tools/x.py", "tools/__pycache__/x.cpython-39.pyc",
+                         "tools/ekka_host/__pycache__/gateway.cpython-39.pyc"):
+                Path(src, name).write_text("x")
+            script = f"set -euo pipefail\nSNAPSHOT={d}/snap\nchown() {{ :; }}\ninstall() {{ [[ $1 == -d ]] && mkdir -p \"${{@: -1}}\"; return 0; }}\n{fn}\nsnapshot_stack\n"
+            r = subprocess.run(["bash", "-c", script], cwd=src, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            snap = Path(d, "snap")
+            self.assertTrue((snap / "ekka-desk-host").is_file())
+            self.assertTrue((snap / "tools" / "x.py").is_file())
+            self.assertEqual(sorted(str(p.relative_to(snap)) for p in snap.rglob("__pycache__")), [])
+
     def test_the_copy_holds_the_native_host_command(self):
         # ekka-desk-host refuses to run as root from anywhere but this copy (docs/NATIVE-HOST.md).
         up = (ROOT/"up.sh").read_text()

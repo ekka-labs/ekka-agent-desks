@@ -838,6 +838,7 @@ snapshot_stack() {  # a ROOT-OWNED copy of deploy/, tools/, providers/ and this 
   # wrapper's `ekka desk connect|invite|revoke|plans` run from it, never from a person's checkout
   rm -rf "$SNAPSHOT.new"; install -d -m 0755 "$SNAPSHOT.new"
   cp -a deploy tools providers desk ekka vendor up.sh ekka-desk-host "$SNAPSHOT.new/"   # every folder a routed verb reads (test_server_cli); ekka-desk-host runs only from here as root
+  find "$SNAPSHOT.new" -name __pycache__ -prune -exec rm -rf {} +   # no bytecode from the checkout becomes "root-owned"
   chown -R root:root "$SNAPSHOT.new"; chmod -R u+rwX,go+rX,go-w "$SNAPSHOT.new"
   rm -rf "$SNAPSHOT.old"; [[ -d $SNAPSHOT ]] && mv "$SNAPSHOT" "$SNAPSHOT.old"; mv "$SNAPSHOT.new" "$SNAPSHOT"; rm -rf "$SNAPSHOT.old"
   install -D -m 0755 -o root -g root deploy/host/libexec/wait-interceptor /usr/local/libexec/ekka-desks/wait-interceptor

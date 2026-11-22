@@ -172,7 +172,9 @@ class NativeHostTests(unittest.TestCase):
 
     def test_the_trust_check_accepts_only_a_tree_root_owns_and_nobody_else_can_change(self):
         command = Path(__file__).resolve().parents[1] / "ekka-desk-host"
-        launcher = __import__("runpy").run_path(str(command), run_name="ekka_desk_host_under_test")
+        with patch.object(sys, "pycache_prefix", sys.pycache_prefix), \
+             patch.object(sys, "dont_write_bytecode", sys.dont_write_bytecode):
+            launcher = __import__("runpy").run_path(str(command), run_name="ekka_desk_host_under_test")
         real = Path.lstat
 
         def as_installed(path, loose=None):
@@ -185,10 +187,18 @@ class NativeHostTests(unittest.TestCase):
         root = command.parent
         with patch.object(Path, "lstat", lambda path: as_installed(path)):
             self.assertTrue(launcher["trusted"](root))
-        loose = root / "tools" / "ekka_host" / "gateway.py"
-        with patch.object(Path, "lstat", lambda path: as_installed(path, loose)):
-            self.assertFalse(launcher["trusted"](root), "a file others can change was trusted")
+        for loose in (root / "tools" / "ekka_host" / "gateway.py", root / "tools", root / "deploy"):
+            with patch.object(Path, "lstat", lambda path: as_installed(path, loose)):
+                self.assertFalse(launcher["trusted"](root), f"{loose.name}, which others can change, was trusted")
         self.assertFalse(launcher["trusted"](root), "this checkout is not root-owned, yet it was trusted")
+
+    def test_cached_bytecode_is_never_read(self):
+        # A cache beside the sources is outside what the trust check inspects, so no cache is read at all.
+        command = Path(__file__).resolve().parents[1] / "ekka-desk-host"
+        child = ("import runpy, sys; runpy.run_path(sys.argv[1], run_name='not_main'); "
+                 "print(sys.pycache_prefix, sys.dont_write_bytecode)")
+        result = subprocess.run([sys.executable, "-c", child, str(command)], capture_output=True, text=True)
+        self.assertEqual(result.stdout.split(), ["/dev/null/ekka-desk-host", "True"], result.stderr)
 
     def test_entry_point_has_help_without_privilege(self):
         command = Path(__file__).resolve().parents[1] / "ekka-desk-host"

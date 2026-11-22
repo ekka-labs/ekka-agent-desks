@@ -6,6 +6,9 @@ import stat
 import sys
 
 sys.dont_write_bytecode = True
+# Never read cached bytecode either: a cache beside the sources is not part of what the trust check below inspects.
+# A prefix that cannot be a folder makes every cache lookup miss, so modules always compile from their source.
+sys.pycache_prefix = "/dev/null/ekka-desk-host"
 HERE = Path(__file__).resolve().parent
 INSTALLED = "/usr/local/lib/ekka-desks/ekka-desk-host"
 
@@ -18,9 +21,12 @@ def trusted(root):
             info = part.lstat()
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
                 return False
+        def unreadable(error):
+            raise error
         paths = [root / "ekka-desk-host"]
         for folder in ("tools", "deploy"):
-            for base, folders, files in os.walk(root / folder):
+            paths.append(root / folder)
+            for base, folders, files in os.walk(root / folder, onerror=unreadable):
                 paths.extend(Path(base) / name for name in folders + files)
         for path in paths:
             info = path.lstat()
