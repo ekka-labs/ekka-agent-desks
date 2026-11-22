@@ -115,6 +115,19 @@ class Refused(unittest.TestCase):
             self.assertRefused(["provider", "list", *args], f"openshell {flag}: the call always goes to this machine's gateway")
         self.assertRefused(["sandbox", "stop", "code-desk", "-g", "other"], "name exactly one desk")
 
+    def test_planted_this_setups_own_variables_are_never_read_into_a_provider(self):
+        # The gateway administrator session holds its sign-in in an OPENSHELL_ variable while a call runs.
+        for args in (["provider", "create", "--name", "g", "--type", "github", "--credential", "OPENSHELL_OIDC_CLIENT_SECRET"],
+                     ["provider", "update", "g", "--credential=OPENSHELL_OIDC_CLIENT_SECRET"],
+                     ["provider", "update", "g", "--credential", " OPENSHELL_OIDC_CLIENT_SECRET "],
+                     ["provider", "refresh", "configure", "aws", "--credential-key", "K", "--strategy",
+                      "aws-sts-assume-role", "--secret-material-env", "k=OPENSHELL_OIDC_CLIENT_SECRET"],
+                     ["provider", "refresh", "rotate", "aws", "--secret-material-env", "OPENSHELL_OIDC_CLIENT_SECRET"],
+                     ["provider", "refresh", "configure", "aws", "--credential-key", "K", "--strategy",
+                      "aws-sts-assume-role", "--secret-material-env=k= OPENSHELL_GATEWAY"]):
+            with self.subTest(args=args):
+                self.assertRefused(args, "belongs to this setup and is never read into a provider")
+
     def test_planted_the_administrators_own_sign_in_never_becomes_a_key(self):
         self.assertRefused(["provider", "update", "g", "--from-oidc-token"], "never becomes a desk's key")
 
