@@ -9,7 +9,7 @@
                                                  (default: what realm.json declares for it) and sign out its
                                                  sessions, so a token with the old scopes ends. Nothing to do when
                                                  the client does not exist yet, as on a new install.
-    apply_realm.py admin-client on | ekka api connect desks --stdin ...
+    apply_realm.py admin-client on [--provider-writes] | ekka api connect desks --stdin ...
                                                  the backend adapter's desk-admin client: its secret, into
                                                  a pipe only. `admin-client off` disables it.
     apply_realm.py first-admin <username> <email>
@@ -25,6 +25,9 @@
 Environment: KC_URL (the admin listener, default https://127.0.0.1:8443), KC_CA (CA file for KC_URL),
 KC_ADMIN_USER and KC_ADMIN_PASSWORD_FILE (the bootstrap admin, written by setup, mode 0600).
 Standard library only. Prints names and differences, never a secret, except enclave-secret into a pipe.
+
+`setup-client status` reads whether the temporary gateway setup client is enabled;
+it returns only enabled/disabled, performs no write and never retrieves a secret.
 """
 import getpass
 import json
@@ -100,6 +103,21 @@ def realm_path(spec, rest=""):
 def find_client(api, spec, client_id):
     found = api.get(realm_path(spec, "/clients?clientId=" + urllib.parse.quote(client_id))) or []
     return found[0] if found else None
+
+
+def setup_client(api, spec):
+    """The desks-setup client, read strictly: None only for an answered empty list. Anything else that is not one
+    exact desks-setup record with a boolean `enabled` is an unknown state, never "disabled" or "absent"."""
+    found = api.get(realm_path(spec, "/clients?clientId=desks-setup"))
+    if not isinstance(found, list):
+        raise SystemExit("keycloak: the client list did not answer as a list; the setup client's state is unknown")
+    if not found:
+        return None
+    c = found[0]
+    if len(found) != 1 or not isinstance(c, dict) or c.get("clientId") != "desks-setup" \
+            or not isinstance(c.get("id"), str) or not c["id"] or not isinstance(c.get("enabled"), bool):
+        raise SystemExit("keycloak: the client list did not return one exact desks-setup record; its state is unknown")
+    return c
 
 
 def plan(api, spec):
@@ -190,9 +208,12 @@ ADMIN_CLIENT = "ekka-desk-admin"
 # UpdateConfig config:write; GetSandboxConfig, GetDraftPolicy and GetDraftHistory config:read (discovery: the
 # approval mode read back after it is set, and the evidence). Without config:read the adapter set a discovery desk's
 # approval mode and could not read it back (PermissionDenied, a box, 5 Nov 2026).
-# Never provider:write: a stolen adapter credential must not create, delete or rotate a provider.
+# Legacy adapters do not write providers. A matching governed-provider adapter
+# explicitly enables provider:write with --provider-writes; ordinary installs
+# keep the legacy scopes. This permission belongs only to the adapter client.
 ADMIN_SCOPES = ["config:read", "config:write", "provider:read", "sandbox:read", "sandbox:write"]
 SCOPE_DESCRIPTIONS = {
+    "provider:write": "Create or rotate providers through the governed provider adapter (OpenShell provider:write).",
     "sandbox:write": "Create, stop, start and remove sandboxes, and detach a provider (OpenShell sandbox:write).",
     "config:write": "Change desk configuration and policy (OpenShell config:write).",
     "config:read": "Read a desk's settings and its proposed policy changes (OpenShell config:read).",
@@ -404,12 +425,16 @@ def main(argv):
             raise SystemExit("keycloak: the ekka-enclave client does not exist; run apply first")
         sys.stdout.write(api.get(realm_path(spec, f"/clients/{c['id']}/client-secret"))["value"])
         return 0
-    if cmd == "setup-client" and len(argv) == 2 and argv[1] in ("on", "off"):
+    if cmd == "setup-client" and len(argv) == 2 and argv[1] in ("on", "off", "status"):
         # up.sh's own administrator for its one-time gateway steps: a confidential client whose service account holds
         # openshell-admin. `on` enables it and writes its secret into a pipe; `off` disables it. Not in realm.json on
         # purpose: it exists only while up.sh needs it, and stays disabled otherwise.
         api = Api()
-        c = find_client(api, spec, "desks-setup")
+        c = setup_client(api, spec)
+        if argv[1] == "status":
+            # Missing (an answered empty list) is disabled; a malformed or unanswered read never claims so.
+            print("enabled" if c is not None and c["enabled"] else "disabled")
+            return 0
         if c is None:
             if argv[1] == "off":
                 return 0
@@ -422,7 +447,9 @@ def main(argv):
                                      "protocolMapper": "oidc-audience-mapper",
                                      "config": {"included.custom.audience": "ekka-desks",
                                                 "access.token.claim": "true", "id.token.claim": "false"}}]})
-            c = find_client(api, spec, "desks-setup")
+            c = setup_client(api, spec)
+            if c is None:
+                raise SystemExit("keycloak: the setup client was created but is not readable; nothing more was changed")
             if "openshell:all" in scopes:
                 api.write("PUT", realm_path(spec, f"/clients/{c['id']}/default-client-scopes/{scopes['openshell:all']}"), {})
             user = api.get(realm_path(spec, f"/clients/{c['id']}/service-account-user"))
@@ -459,7 +486,7 @@ def main(argv):
                   f"after {' '.join(done['after'])}; {done['sessions_ended']} sessions signed out"
                   + (", finishing a run that stopped before its sign-out" if done["resumed"] else ""))
         return 0
-    if cmd == "admin-client" and len(argv) == 2 and argv[1] in ("on", "off"):
+    if cmd == "admin-client" and (argv[1:] in (["on"], ["off"], ["on", "--provider-writes"])):
         if argv[1] == "on" and sys.stdout.isatty():
             print("keycloak: refusing to print a secret to a terminal; pipe it into `ekka api connect desks --stdin`",
                   file=sys.stderr)
@@ -483,7 +510,8 @@ def main(argv):
             api.write("POST", realm_path(spec, f"/users/{user['id']}/role-mappings/realm"),
                       [api.get(realm_path(spec, "/roles/openshell-admin"))])
         if argv[1] == "on":
-            set_scopes(api, spec, ADMIN_CLIENT, ADMIN_SCOPES)
+            scopes = ADMIN_SCOPES + (["provider:write"] if "--provider-writes" in argv else [])
+            set_scopes(api, spec, ADMIN_CLIENT, scopes)
             c = find_client(api, spec, ADMIN_CLIENT)   # read again: set_scopes cleared its sign-out marker
         c["enabled"] = argv[1] == "on"
         api.write("PUT", realm_path(spec, f"/clients/{c['id']}"), c)

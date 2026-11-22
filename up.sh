@@ -535,25 +535,82 @@ as_gateway_admin() {  # run "$@" as the gateway's administrator, then switch tha
   (( i < 60 )) || die "NVIDIA's gateway is not answering on 8080; see: sudo ./deploy/setup.sh compose logs gateway"
   grep -q " $NAME\$" /etc/hosts 2>/dev/null || getent hosts "$NAME" >/dev/null || echo "127.0.0.1 $NAME" >> /etc/hosts
   # Each step is checked by hand: a caller runs this with `||`, which switches set -e off inside it.
-  local setup_client_secret rc=0
+  local setup_client_secret rc=0 lock=$DESKS_STATE/gateway-admin.lock
+  # One temporary-admin session at a time, shared with ekka-desk-host's emergency stop: otherwise one session could
+  # switch the setup client off under the other, or on again after the other confirmed it off. Fd 87 holds the lock
+  # until the end of this function; it must be this regular private file, never a link to one.
+  python3 -c 'import os, sys; os.close(os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600))' "$lock" \
+    || die "the gateway administrator lock ($lock) is not a regular file; nothing was changed"
+  exec 87<>"$lock" || die "the gateway administrator lock ($lock) could not be opened; nothing was changed"
+  rc=0; python3 -c '
+import fcntl, os, stat, sys
+st, ln = os.fstat(87), os.lstat(sys.argv[1])
+if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (ln.st_dev, ln.st_ino) or st.st_uid != os.geteuid() \
+        or st.st_mode & 0o077 or st.st_nlink != 1:
+    sys.exit(3)
+try:
+    fcntl.flock(87, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(4)' "$lock" || rc=$?
+  (( rc != 4 )) || { exec 87>&-; die "another gateway administrator session is running (an emergency stop or another up.sh command); run this again when it finishes. Nothing was changed"; }
+  (( rc == 0 )) || { exec 87>&-; die "the gateway administrator lock ($lock) must be a private regular file owned by root; nothing was changed"; }
+  # Fd 87 is inherited by every child of this session on purpose: a child still running after this shell died (an
+  # `on` in flight) keeps the next session, native or not, out until it has finished.
+  local home=$DESKS_STATE/openshell-admin marker=$DESKS_STATE/gateway-admin.pending
+  rm -rf "$home"   # fresh every time: a folder an interrupted session left can hold a registration of its own
+  # The open session, durably, before access is enabled: ekka-desk-host status reports it, and its next emergency
+  # stop switches access off and removes this folder, if this shell is killed before the end.
+  python3 -c '
+import json, os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+data = (json.dumps({"home": sys.argv[2]}) + "\n").encode()
+assert os.write(fd, data) == len(data)
+os.fsync(fd); os.close(fd)
+folder = os.open(os.path.dirname(sys.argv[1]), os.O_RDONLY); os.fsync(folder); os.close(folder)' "$marker" "$home" \
+    || { exec 87>&-; die "the gateway administrator session could not be recorded ($marker); nothing was changed"; }
+  # Interrupted (Ctrl-C, SIGTERM, SIGHUP): switch access off, confirm it, then leave. A child in progress ends first.
+  trap 'trap "" INT TERM HUP; kc setup-client off >/dev/null 2>&1
+        [[ $(kc setup-client status 2>/dev/null) == disabled ]] && rm -f "$DESKS_STATE/gateway-admin.pending"
+        rm -rf "$DESKS_STATE/openshell-admin"; exit 130' INT TERM HUP
   # `on` enables the client before it reads the secret, so a failed `on` may have left it enabled: it is switched off
-  # again, and a failure there too is said, never "nothing was changed".
+  # again and read back, and a failure there too is said, never "nothing was changed".
   setup_client_secret=$(kc setup-client on) && [[ -n $setup_client_secret ]] || {
-    kc setup-client off >/dev/null 2>&1 \
+    kc setup-client off >/dev/null 2>&1 && [[ $(kc setup-client status 2>/dev/null) == disabled ]] \
       || die "Keycloak did not switch the gateway's setup client on, and it may still be switched on; run the same command again"
+    rm -f "$marker"; trap - INT TERM HUP; exec 87>&-
     die "Keycloak did not switch the gateway's setup client on; nothing was changed"; }
   # NVIDIA's gateway flags read these too; one kept by `sudo -E` would send the calls, and this sign-in, elsewhere.
-  ( unset OPENSHELL_GATEWAY OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_INSECURE
+  # NVIDIA's CLI falls back to /etc/openshell for a registration its own home lacks, as it does after a `gateway add`
+  # whose sign-in failed (it removes its registration and still exits 0). An empty system folder of this session's own
+  # leaves no registration but the one just added, so the secret can only reach this gateway's issuer.
+  ( unset OPENSHELL_GATEWAY OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_INSECURE XDG_CONFIG_HOME
     export OPENSHELL_OIDC_CLIENT_SECRET=$setup_client_secret SSL_CERT_FILE=$DESKS_STATE/tls/ca.crt HOME=$DESKS_STATE/openshell-admin
-    install -d -m 0700 "$HOME"
+    export OPENSHELL_SYSTEM_GATEWAY_DIR=$HOME/system
+    install -d -m 0700 "$HOME" "$OPENSHELL_SYSTEM_GATEWAY_DIR"
     "$OS" gateway add "https://$NAME:8080" --name ekka-agent-desks --oidc-issuer "https://$NAME/realms/ekka-desks" \
       --oidc-client-id desks-setup --oidc-audience ekka-desks >/dev/null 2>&1 || true
+    # What `gateway add` kept, read back before the secret signs in anywhere: its endpoint, issuer and client.
+    python3 -c '
+import json, os, stat, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+if not stat.S_ISREG(os.fstat(fd).st_mode):
+    sys.exit(1)
+kept = json.loads(os.read(fd, 65536))
+want = {"gateway_endpoint": sys.argv[2], "auth_mode": "oidc", "oidc_issuer": sys.argv[3], "oidc_client_id": "desks-setup"}
+sys.exit(0 if isinstance(kept, dict) and all(kept.get(k) == v for k, v in want.items()) else 1)' \
+      "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json" "https://$NAME:8080" \
+      "https://$NAME/realms/ekka-desks" 2>/dev/null || exit 97
     "$OS" gateway login ekka-agent-desks >/dev/null || exit 97  # 97: never an answer of the call it guards
     "$@"
   ) || rc=$?
   unset setup_client_secret
   kc setup-client off >/dev/null || die "the gateway's setup client may still be switched on; run the same command again"
-  rm -rf "$DESKS_STATE/openshell-admin"
+  # A successful switch-off alone is not proof: it is read back before the session counts as closed.
+  [[ $(kc setup-client status) == disabled ]] \
+    || die "the gateway's setup client is not confirmed switched off; run the same command again"
+  rm -rf "$home"; rm -f "$marker"
+  trap - INT TERM HUP
+  exec 87>&-
   (( rc != 97 )) || die "could not sign in to NVIDIA's gateway as its administrator; nothing was changed there"
   return $rc
 }
@@ -780,7 +837,8 @@ render() {  # render <template> <dest> <mode> KEY=VALUE...: @@KEY@@ replaced; ro
 snapshot_stack() {  # a ROOT-OWNED copy of deploy/, tools/, providers/ and this script: the supervisor unit and the
   # wrapper's `ekka desk connect|invite|revoke|plans` run from it, never from a person's checkout
   rm -rf "$SNAPSHOT.new"; install -d -m 0755 "$SNAPSHOT.new"
-  cp -a deploy tools providers desk ekka vendor up.sh "$SNAPSHOT.new/"   # every folder a routed verb reads (test_server_cli)
+  cp -a deploy tools providers desk ekka vendor up.sh ekka-desk-host "$SNAPSHOT.new/"   # every folder a routed verb reads (test_server_cli); ekka-desk-host runs only from here as root
+  find "$SNAPSHOT.new" -name __pycache__ -prune -exec rm -rf {} +   # no bytecode from the checkout becomes "root-owned"
   chown -R root:root "$SNAPSHOT.new"; chmod -R u+rwX,go+rX,go-w "$SNAPSHOT.new"
   rm -rf "$SNAPSHOT.old"; [[ -d $SNAPSHOT ]] && mv "$SNAPSHOT" "$SNAPSHOT.old"; mv "$SNAPSHOT.new" "$SNAPSHOT"; rm -rf "$SNAPSHOT.old"
   install -D -m 0755 -o root -g root deploy/host/libexec/wait-interceptor /usr/local/libexec/ekka-desks/wait-interceptor
@@ -1135,7 +1193,7 @@ server_ekka() {
 registry_dir() { install -d -m 0700 -o root -g root "$DESKS_STATE/secrets/registry"; echo "$DESKS_STATE/secrets/registry"; }
 registry_login() {
   local host=$1 user=$2 token scopes cfg
-  [[ $host =~ ^[a-z0-9.-]+(:[0-9]+)?$ && -n $user && $user =~ ^[A-Za-z0-9._-]+$ ]] \
+  [[ $host =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ && -n $user && $user =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "usage: <token> | sudo ekka desk registry login <host> <user>   (the token comes on stdin, never as an argument)"
   [[ -t 0 ]] && die "the token comes from a pipe, never typed at a terminal: <token source> | sudo ekka desk registry login $host $user"
   IFS= read -r -d '' token || true; token=${token%$'\n'}
@@ -1143,7 +1201,8 @@ registry_login() {
   cfg=$(mktemp -d "$DESKS_STATE/secrets/.registry-login.XXXXXX"); chmod 0700 "$cfg"
   # shellcheck disable=SC2064  # expanded now on purpose: the folder's name
   trap "rm -rf '$cfg'" EXIT
-  if [[ $host == ghcr.io || $host == *.pkg.github.com ]]; then
+  local name=${host%:*}   # the registry without its port: ghcr.io:443 is still GitHub Packages
+  if [[ $name == ghcr.io || $name == *.pkg.github.com ]]; then
     # GitHub Packages: a CLASSIC token whose scopes are exactly read:packages. Its npm registry refuses fine-grained tokens,
     # and anything wider than read:packages is more than a pull needs. The header reaches curl from a file, never argv.
     [[ $token == ghp_* ]] || { token=; die "GitHub Packages needs a classic token (ghp_…) with the scope read:packages only; nothing was kept"; }
@@ -1152,7 +1211,9 @@ registry_login() {
     [[ $scopes == "read:packages" ]] || { token=; die "the token's scopes are '${scopes:-none}', not exactly read:packages; nothing was kept"; }
     ok "GitHub token: scope read:packages only"
   fi
-  mkdir -p "$cfg/docker"
+  # A config that names the registry: Docker picks a host credential helper only for a config with no auth entry,
+  # so the credential stays in this throwaway folder and never reaches a helper's store.
+  mkdir -p "$cfg/docker"; ( umask 077; printf '{"auths":{"%s":{}}}\n' "$host" > "$cfg/docker/config.json" )
   printf '%s' "$token" | docker --config "$cfg/docker" login "$host" -u "$user" --password-stdin >/dev/null 2>&1 \
     || { token=; die "$host refused the credential for $user; nothing was kept"; }
   docker --config "$cfg/docker" logout "$host" >/dev/null 2>&1 || true
@@ -1170,16 +1231,19 @@ registry_show() {
   (( n > 0 )) || echo "no registry credential kept; public images need none"
 }
 image_pull() {  # image_pull <ref@sha256:…> [--signed-by <identity> --issuer <url>]: by digest, signature checked when asked, no login saved
-  local ref="" identity="" issuer=""
+  local ref="" identity="" issuer="" asked=0
   while (( $# )); do case "$1" in
-    --signed-by) identity=${2:-}; shift 2 ;; --issuer) issuer=${2:-}; shift 2 ;;
+    --signed-by) identity=${2:-}; asked=1; shift 2 ;; --issuer) issuer=${2:-}; asked=1; shift 2 ;;
     --*) die "usage: sudo ekka desk image pull <registry>/<name>@sha256:<64 hex> [--signed-by <certificate identity> --issuer <oidc issuer>]" ;;
     *) [[ -z $ref ]] || die "one image at a time"; ref=$1; shift ;; esac; done
   [[ $ref =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$ ]] \
     || die "the image must be <registry>/<name>@sha256:<64 hex>: a digest names exactly one image, a tag can move"
   [[ -z $identity && -z $issuer || -n $identity && -n $issuer ]] || die "--signed-by and --issuer go together"
+  # Asked for, even with empty values, a signature check is never skipped.
+  (( asked == 0 )) || [[ -n $identity ]] || die "--signed-by and --issuer must both name a value; nothing was pulled"
   local host=${ref%%/*} digest=${ref##*@} cfg cred
   cfg=$(mktemp -d "$DESKS_STATE/secrets/.image-pull.XXXXXX"); chmod 0700 "$cfg"; mkdir -p "$cfg/docker"
+  ( umask 077; printf '{"auths":{"%s":{}}}\n' "$host" > "$cfg/docker/config.json" )   # no host credential helper
   # shellcheck disable=SC2064
   trap "docker --config '$cfg/docker' logout '$host' >/dev/null 2>&1 || true; rm -rf '$cfg'" EXIT
   cred=$DESKS_STATE/secrets/registry/$host.env

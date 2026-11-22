@@ -291,6 +291,85 @@ class TheRegistryAndImageVerbs(unittest.TestCase):
             r = self.run_verb(d, "registry", "logout", "ghcr.io"); self.assertEqual(r.returncode, 0, r.stderr)
 
 
+class TheRegistryAndImageReviewFixes(unittest.TestCase):
+    """The up.sh side: a registry port keeps the GitHub scope check, no host helper keeps a credential, and an
+    asked-for signature check always runs. docker, curl and cosign are stubs that log;
+    docker behaves as Docker CLI does with a host credential helper installed: a login whose --config folder has no
+    auth entry goes to the helper (configfile ContainsAuth, credentials.DetectDefaultStore)."""
+    run_verb = TheRegistryAndImageVerbs.run_verb   # the same fixture, without running TheRegistryAndImageVerbs's cases again
+
+    REF = "ghcr.io/x/y@sha256:" + "a" * 64
+
+    def box(self, d, scopes="read:packages"):
+        log = Path(d, "log")
+        log.write_text("")
+        stubs = {
+            "id": "#!/bin/bash\necho 0\n",
+            "curl": f"#!/bin/bash\necho curl >> {log}\nprintf 'HTTP/2 200\\r\\nx-oauth-scopes: {scopes}\\r\\n\\r\\n'\n",
+            "cosign": f"#!/bin/bash\necho cosign >> {log}\n",
+            "install": "#!/bin/bash\nargs=(); while (($#)); do case $1 in -o|-g) shift 2 ;; *) args+=(\"$1\"); shift ;; esac; done\n"
+                       "exec /usr/bin/install \"${args[@]}\"\n",
+            "docker": f"""#!/bin/bash
+cfg=""; [[ $1 == --config ]] && {{ cfg=$2; shift 2; }}
+case $1 in
+  login) if [[ -n $cfg ]] && grep -q '"auths": *{{ *"' "$cfg/config.json" 2>/dev/null; then echo "docker login file" >> {log}
+         else echo "docker login helper $(cat)" >> {log}; fi ;;
+  pull) echo "docker pull $*" >> {log} ;;
+  image) echo "{self.REF}" ;;
+  *) : ;;
+esac
+""",
+        }
+        for name, text in stubs.items():
+            Path(d, name).write_text(text)
+            os.chmod(Path(d, name), 0o755)
+        state = Path(d, "state")
+        (state / "secrets").mkdir(parents=True)
+        (state / "up.env").write_text("DESKS_NAME=desks.example.test\n")
+        return log
+
+    def test_a_registry_port_does_not_skip_the_github_scope_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d, scopes="repo, read:packages")
+            r = self.run_verb(d, "registry", "login", "ghcr.io:443", "someone", stdin="ghp_" + "a" * 36)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("curl", log.read_text().split())
+            self.assertNotIn("docker login", log.read_text(), "a token wider than read:packages reached docker")
+
+    def test_a_trailing_dot_cannot_skip_the_github_scope_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d, scopes="repo, read:packages")
+            for host in ("ghcr.io.", ".ghcr.io", "ghcr.io.:443"):
+                r = self.run_verb(d, "registry", "login", host, "someone", stdin="ghp_" + "a" * 36)
+                self.assertEqual(r.returncode, 1, host)
+            self.assertNotIn("docker login", log.read_text(), "a token reached docker without the scope check")
+
+    def test_a_login_never_reaches_a_host_credential_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            r = self.run_verb(d, "registry", "login", "registry.example.test", "someone", stdin="planted-token")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("helper", log.read_text(), "the token went to the host's credential helper")
+            self.assertIn("docker login file", log.read_text())
+
+    def test_a_pull_with_a_kept_credential_never_reaches_a_host_credential_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io.env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=planted-token\n")
+            r = self.run_verb(d, "image", "pull", self.REF)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("helper", log.read_text())
+
+    def test_empty_signing_options_never_skip_the_signature_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            r = self.run_verb(d, "image", "pull", self.REF, "--signed-by", "", "--issuer", "")
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertNotIn("docker pull", log.read_text(), "pulled without the signature check it was asked for")
+
+
 class TheRootOwnedCopy(unittest.TestCase):
     """`sudo ekka desk connect|invite|revoke|plans|grant|registry|image` run up.sh from the root-owned copy the installer
     makes (snapshot_stack), never the checkout. Every repository folder the tools read by ROOT must be in that copy.
@@ -307,6 +386,31 @@ class TheRootOwnedCopy(unittest.TestCase):
         self.assertTrue(read, "the scan found the folders the tools read")
         self.assertEqual(sorted(read - copied), [], "folders the tools read that the root-owned copy leaves out")
         self.assertTrue({"tools", "up.sh"} <= copied)
+
+    def test_the_copy_carries_no_bytecode_from_the_checkout(self):
+        # snapshot_stack as written in up.sh, run in a stand-in checkout; chown is a no-op, install only makes folders.
+        import re as _re
+        fn = _re.search(r"^snapshot_stack\(\) \{.*?^\}\n", (ROOT/"up.sh").read_text(), _re.S | _re.M).group(0)
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d, "checkout")
+            for folder in ("deploy", "tools/__pycache__", "tools/ekka_host/__pycache__", "providers", "desk", "ekka", "vendor"):
+                Path(src, folder).mkdir(parents=True, exist_ok=True)
+            for name in ("up.sh", "ekka-desk-host", "tools/x.py", "tools/__pycache__/x.cpython-39.pyc",
+                         "tools/ekka_host/__pycache__/gateway.cpython-39.pyc"):
+                Path(src, name).write_text("x")
+            script = f"set -euo pipefail\nSNAPSHOT={d}/snap\nchown() {{ :; }}\ninstall() {{ [[ $1 == -d ]] && mkdir -p \"${{@: -1}}\"; return 0; }}\n{fn}\nsnapshot_stack\n"
+            r = subprocess.run(["bash", "-c", script], cwd=src, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            snap = Path(d, "snap")
+            self.assertTrue((snap / "ekka-desk-host").is_file())
+            self.assertTrue((snap / "tools" / "x.py").is_file())
+            self.assertEqual(sorted(str(p.relative_to(snap)) for p in snap.rglob("__pycache__")), [])
+
+    def test_the_copy_holds_the_native_host_command(self):
+        # ekka-desk-host refuses to run as root from anywhere but this copy (docs/NATIVE-HOST.md).
+        up = (ROOT/"up.sh").read_text()
+        line = next(l for l in up.splitlines() if l.strip().startswith('cp -a ') and '$SNAPSHOT.new/' in l)
+        self.assertIn("ekka-desk-host", line.split('"$SNAPSHOT.new/"')[0].split())
 
 
 if __name__ == '__main__':

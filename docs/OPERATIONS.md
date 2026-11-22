@@ -583,7 +583,7 @@ Usually the next `ekka desk status <desk>` settles it on its own. When status sa
 sudo ./up.sh desks settle code-desk --operation 3f1c2a9e-5b7d-4e2a-9c1b-7d6e5f4a3b2c
 ```
 
-It checks that the desk's lock names exactly this change and does nothing otherwise. Then it restarts the gateway, and watches the desk's containers until none is starting, restarting or being removed and nothing has changed for 40 seconds (NVIDIA OpenShell's 10-second stop timeout plus 30). Only then does it write one settle marker for this change, `settle/<request id>.json`, into the adapter's state. It gives up after 10 minutes and writes nothing. For a deleted desk, whose containers are gone, add `--backend-id <id>` from `ekka desk status`. For a create that never reached the desk, no container carries its labels: the procedure writes the marker with no backend id and no containers, and the adapter accepts that only for a create it cannot find either. It then answers `NOT_APPLIED`: nothing was created.
+It checks that the desk's lock names exactly this change and does nothing otherwise. Then it restarts the gateway. **That restart stops every running desk on this machine, not only this one, and interrupts their jobs**: NVIDIA's gateway stops the desks it manages when it shuts down. Then it watches the desk's containers until none is starting, restarting or being removed and nothing has changed for 40 seconds (NVIDIA OpenShell's 10-second stop timeout plus 30). Only then does it write one settle marker for this change, `settle/<request id>.json`, into the adapter's state. It gives up after 10 minutes and writes nothing. For a deleted desk, whose containers are gone, add `--backend-id <id>` from `ekka desk status`. For a create that never reached the desk, no container carries its labels: the procedure writes the marker with no backend id and no containers, and the adapter accepts that only for a create it cannot find either. It then answers `NOT_APPLIED`: nothing was created.
 
 **The hold.** Before it restarts the gateway, the procedure writes a hold for the change, `settle/<request id>.hold` in the adapter's state. While the hold exists, the adapter never re-issues that change, so a `status` during the quiet window cannot send it again after the restart. The procedure removes the hold when it writes the marker. If the procedure stops without a marker (the desk kept changing, the gateway did not restart, or it was interrupted), the hold stays, and the message says so. Check the desk with `ekka desk status <desk>`, then remove the hold:
 
@@ -591,7 +591,7 @@ It checks that the desk's lock names exactly this change and does nothing otherw
 sudo ./up.sh desks unhold <desk> --operation <request id>
 ```
 
-After that the adapter may re-issue the change, or you settle it again.
+Unhold removes the hold only while that desk's lock still names the change, or when the settle that wrote the hold recorded this desk for it and the desk's lock no longer names the change (the change ended meanwhile). The hold itself names no desk, so a request id from another desk is refused and nothing is removed. One settle or unhold runs at a time on the machine. After that the adapter may re-issue the change, or you settle it again.
 
 Then run `ekka desk status code-desk` again. The adapter reads the marker once, settles the change and frees the desk.
 
