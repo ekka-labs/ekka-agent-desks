@@ -1,6 +1,6 @@
 # This setup's gateway.toml. A template: setup writes deploy/state's copy with
-# @@PUBLIC_NAME@@ filled in. The bindings are the methods EKKA's adapter governs (14 validate, 9 post_commit), the
-# 23 RPC and phase pairs in all.
+# @@PUBLIC_NAME@@ filled in. The bindings are the methods EKKA's adapter governs (17 validate, 12 post_commit), the
+# 29 RPC and phase pairs in all.
 [openshell]
 version = 2
 
@@ -113,6 +113,19 @@ phases = ["validate"]  # never while a job is in flight
 rpc    = "openshell.v1.OpenShell/DeleteSandbox"
 phases = ["validate"]  # refused for the Enclave's own identity; a person's delete is OpenShell's decision
 
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ConfigureProviderRefresh"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/RotateProviderCredential"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/DeleteProviderRefresh"
+phases = ["validate"]
+
 [[openshell.gateway.interceptors]]
 name = "ekka-observer"
 grpc_endpoint = "unix:///run/ekka/openshell-interceptor.sock"
@@ -157,3 +170,15 @@ phases = ["post_commit"]  # record the committed change
 [[openshell.gateway.interceptors.bindings]]
 rpc    = "openshell.v1.OpenShell/DeleteSandbox"
 phases = ["post_commit"]  # record the committed change
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ConfigureProviderRefresh"
+phases = ["post_commit"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/RotateProviderCredential"
+phases = ["post_commit"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/DeleteProviderRefresh"
+phases = ["post_commit"]

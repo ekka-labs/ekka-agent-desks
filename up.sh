@@ -46,7 +46,7 @@ EKKA_ENV=${EKKA_ENV:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE"
 export EKKA_ENV
 AGENT=${AGENT:-claude-code}
 OPENSHELL_TELEMETRY=${OPENSHELL_TELEMETRY:-off}
-OPENSHELL_TAG=v0.1.4
+OPENSHELL_TAG=v$(python3 tools/verify_pins.py --version)
 # EKKA desk administration requires the compatible Enclave release below.
 # Upgrade the integration and Enclave together. The release must support governed desk
 # changes through the two general plans, per-run output collection, verified requester identities,
@@ -66,16 +66,16 @@ case $MACHINE in
     COMPOSE_SHA=40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a
     BUILDX_FILE=buildx-$BUILDX_VER.linux-amd64
     BUILDX_SHA=4fe4cc38adf48169132749b6ca22a990928db0118e3407584ee553723115d287
-    OPENSHELL_CLI_FILE=openshell-x86_64-unknown-linux-musl.tar.gz
-    OPENSHELL_CLI_SHA=2b65178e62e1ece1d90d482555e9f1f98ff0296e058409b33418104b6333df07
+    OPENSHELL_CLI_FILE=$(python3 tools/verify_pins.py --cli-pin "$MACHINE" release_asset)
+    OPENSHELL_CLI_SHA=$(python3 tools/verify_pins.py --cli-pin "$MACHINE" archive_sha256)
     COSIGN_FILE=cosign-linux-amd64 ;;
   aarch64)
     COMPOSE_FILE=docker-compose-linux-aarch64
     COMPOSE_SHA=733ec76717ceb59052a9609b9dadfb523b2df8eab57a54212872d10a58078ea2
     BUILDX_FILE=buildx-$BUILDX_VER.linux-arm64
     BUILDX_SHA=38e890e1a162bfdbf32fbe91404991dc4fc28e55b0de901b34374a061bab4d2c
-    OPENSHELL_CLI_FILE=openshell-aarch64-unknown-linux-musl.tar.gz
-    OPENSHELL_CLI_SHA=1cd6e63597e1947c44a753bf5352f949e8d8d02e344af92ab899b7c111112d95
+    OPENSHELL_CLI_FILE=$(python3 tools/verify_pins.py --cli-pin "$MACHINE" release_asset)
+    OPENSHELL_CLI_SHA=$(python3 tools/verify_pins.py --cli-pin "$MACHINE" archive_sha256)
     COSIGN_FILE=cosign-linux-arm64 ;;
   *) COMPOSE_FILE=; COMPOSE_SHA=; BUILDX_FILE=; BUILDX_SHA=; OPENSHELL_CLI_FILE=; OPENSHELL_CLI_SHA=; COSIGN_FILE= ;;
 esac
@@ -140,6 +140,7 @@ step_preflight() {
   (( abi >= 3 )) || die "the kernel's Landlock ABI is $abi; NVIDIA OpenShell needs 3 or newer (Linux 6.2+). On Amazon Linux 2023, install kernel6.18 and reboot"
   ok "Linux $(uname -r), Landlock ABI $abi"
   docker info >/dev/null 2>&1 || die "Docker is not running"
+  python3 tools/upgrade_desks.py "$DESKS_STATE" || die "existing desks must be verified before upgrade"
   install -d -m 0755 "$PLUGINS"
   docker compose version >/dev/null 2>&1 || { fetch_pinned "https://github.com/docker/compose/releases/download/$COMPOSE_VER/$COMPOSE_FILE" "$PLUGINS/docker-compose" "$COMPOSE_SHA" 0755; ok "installed Docker Compose $COMPOSE_VER ($MACHINE)"; }
   docker buildx version >/dev/null 2>&1 || { fetch_pinned "https://github.com/docker/buildx/releases/download/$BUILDX_VER/$BUILDX_FILE" "$PLUGINS/docker-buildx" "$BUILDX_SHA" 0755; ok "installed Docker buildx $BUILDX_VER ($MACHINE)"; }
@@ -239,6 +240,8 @@ step_settings() {
 }
 
 step_workspace_policy() {
+  python3 tools/credential_bindings.py "$DESKS_STATE/gateway.toml" || die "gateway interceptor allowlist could not be refreshed"
+
   local result
   install -d -m 0700 "$DONE"
   result=$(python3 tools/workspace_policy.py configure "$DESKS_STATE/gateway.toml" false "$DESKS_STATE/workspace-policy.pending") \
@@ -653,10 +656,12 @@ sync_profiles() {  # the gateway's profiles = providers/, or this install's own;
     if [[ $src == providers/* ]]; then from="providers/"; else from="$src (this install's own)"; fi
     if ! v=$("$OS" -g ekka-agent-desks provider profile export --global "$p" 2>/dev/null | sed -n 's/^resource_version: *//p'); then v=; fi
     if [[ -z $v ]]; then
-      "$OS" -g ekka-agent-desks provider profile import --global --file "$src" >/dev/null && ok "profile $p imported from $from"
+      "$OS" -g ekka-agent-desks provider profile import --global --file "$src" >/dev/null || exit 1
+      ok "profile $p imported from $from"
     else
       t=$(mktemp --suffix .yaml); sed "0,/^id: .*/s//&\nresource_version: $v/" "$src" > "$t"
-      "$OS" -g ekka-agent-desks provider profile update --global --file "$t" "$p" >/dev/null && ok "profile $p updated from $from"
+      "$OS" -g ekka-agent-desks provider profile update --global --file "$t" "$p" >/dev/null || { rm -f "$t"; exit 1; }
+      ok "profile $p updated from $from"
       rm -f "$t"
     fi
   done
@@ -722,12 +727,30 @@ step_desk_admin() {  # desk administration through EKKA: only once up.env runs t
   fi
 }
 
+require_pinned_gateway() {
+  local container ref intended active
+  container=$(cd deploy && bash setup.sh compose ps -q gateway) || return 1
+  [[ -n $container ]] || return 1
+  ref=$(python3 -c 'import json; print(json.load(open("deploy/pins.json"))["openshell"]["gateway"]["image"])') || return 1
+  intended=$(docker image inspect --format '{{.Id}}' "$ref") || return 1
+  active=$(docker inspect --format '{{if .State.Running}}{{.Image}}{{end}}' "$container") || return 1
+  [[ -n $active && $active == "$intended" ]]
+}
+
 step_admin() {
-  is_done admin && { ok "desk workspace, Enclave membership and profiles: done"; return; }
+  require_pinned_gateway || die "the running gateway does not match its release pin; provider profiles were not touched"
+  if is_done admin; then
+    if ! is_done "profiles-$OPENSHELL_TAG"; then
+      as_gateway_admin sync_profiles || die "the upgraded gateway catalog could not be refreshed; rerun to retry"
+      done_ "profiles-$OPENSHELL_TAG"
+    fi
+    ok "desk workspace, Enclave membership and profiles: done"; return
+  fi
   say "the gateway's one-time setup (workspace, the Enclave's membership, provider profiles)"
   local sub; sub=$(cd deploy && bash setup.sh enclave-subject)
   as_gateway_admin admin_setup "$sub" || die "the gateway's setup did not finish; desks-setup is disabled again. Re-run to retry"
   done_ admin
+  done_ "profiles-$OPENSHELL_TAG"
   ok "workspace desks, the Enclave as a member, the profiles in providers/; desks-setup disabled again"
 }
 
@@ -819,13 +842,12 @@ edge_current() {
 
 step_start() {
   (cd deploy && DESKS_STATE=$DESKS_STATE bash ./certs.sh bundle >/dev/null) || die "the gateway's CA bundle could not be built"   # system roots + desks CA, and /etc/ekka/desks-ca.crt
-  # A pin bump applies whole or not at all: the supervisor first, then nothing starts the gateway able to hand
-  # desk credentials out.
+  # Stage the immutable images first. The new gateway activates this pair only for new desks.
   (cd deploy && bash setup.sh supervisor >/dev/null) || die "the supervisor binary could not be put in place"
   (cd deploy && bash setup.sh preflight) || die "the gateway preflight refused (above); nothing was started"
   backend_permits_dir   # the adapter's permits folder, before any start (compose never creates it)
   (cd deploy && bash setup.sh backend-preflight)   # with desk-admin on, the stack starts the adapter too
-  local stack_sha; stack_sha=$( { cat deploy/compose.yml deploy/pins.json deploy/edge/nginx.conf deploy/host/ekka-desks.service.template "$DESKS_STATE/up.env"; } | sha256sum | cut -c1-16)
+  local stack_sha; stack_sha=$( { cat "$DESKS_STATE/gateway.toml" deploy/compose.yml deploy/pins.json deploy/edge/nginx.conf deploy/host/ekka-desks.service.template "$DESKS_STATE/up.env"; } | sha256sum | cut -c1-16)
   if is_done started; then
     snapshot_stack; enclave_units
     rm -f "$DESKS_STATE/stack.hold"; systemctl reset-failed ekka-desks >/dev/null 2>&1 || true   # a first install that died while held

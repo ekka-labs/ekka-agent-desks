@@ -224,8 +224,22 @@ class Refuses(unittest.TestCase):
             self.assertNothingSet(r, calls, log, "exactly one key")
 
     def test_planted_a_provider_that_needs_several_keys_is_refused(self):
-        r, calls, log = run(["codex"], KEY.encode())
-        self.assertNothingSet(r, calls, log, "needs 3 keys")
+        with tempfile.TemporaryDirectory() as folder:
+            profile = os.path.join(folder, "multi.yaml")
+            with open(profile, "w") as f:
+                f.write("credentials:\n")
+                for key in ("first", "second", "third"):
+                    f.write(f"  - name: {key}\n    env_vars: [TEST_{key.upper()}]\n    required: true\n")
+            result = subprocess.run(["python3", os.path.join(ROOT, "tools/provider_connect.py"), "key", profile],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("needs 3 keys", result.stderr)
+
+    def test_codex_uses_one_api_key(self):
+        result, calls, log = run(["codex"], KEY.encode())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("OPENAI_API_KEY", calls[-1]["argv"])
+        self.assertNotIn(KEY, log)
 
     def test_planted_a_profile_naming_a_system_variable_is_refused(self):
         # regression review: the name was checked for shape only, so PATH or LD_PRELOAD passed.

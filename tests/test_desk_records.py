@@ -210,7 +210,7 @@ class Ceiling(Top):
             doc = json.load(f)
         expected = {"bitbucket": ["api.bitbucket.org", "bitbucket.org"],
                     "claude-code": ["api.anthropic.com"],
-                    "codex": ["ab.chatgpt.com", "api.openai.com", "auth.openai.com", "chatgpt.com"],
+                    "codex": ["api.openai.com"],
                     "github": ["api.github.com", "github.com"]}
         self.assertEqual(doc["profiles"], [{"name": n, "hosts": hs} for n, hs in sorted(expected.items())])
         self.assertEqual(doc["hosts"], dg.profile_hosts(files=files))

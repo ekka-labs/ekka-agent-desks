@@ -215,17 +215,30 @@ def reasons(compose, pins, machine=None):
         out.append(f"compose mounts no gateway.toml at {CONFIG_IN_CONTAINER}")
     else:
         try:
-            out += toml_reasons(read_toml(toml_path))
-        except (OSError, ValueError) as e:  # tomllib's TOMLDecodeError, PlainTOMLError and a bad UTF-8 byte included
+            cfg = read_toml(toml_path)
+            out += toml_reasons(cfg)
+            from credential_bindings import missing
+            for interceptor, methods in missing(cfg).items():
+                if methods:
+                    out.append(f"{interceptor} is missing required credential bindings: {', '.join(methods)}")
+
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:  # tomllib's TOMLDecodeError, PlainTOMLError and a bad UTF-8 byte included
             out.append(f"{toml_path} cannot be read as TOML: {e}")
-    sup = (service.get("environment") or {}).get("OPENSHELL_DOCKER_SUPERVISOR_BIN")
+    env = service.get("environment") or {}
+    for component, variable in (("supervisor", "OPENSHELL_SUPERVISOR_IMAGE"),
+                                ("sandbox", "OPENSHELL_SANDBOX_RUNTIME_IMAGE")):
+        if env.get(variable) != pins[component]["image"]:
+            out.append(f"{variable} must name the pinned {component} image")
+    if "OPENSHELL_DOCKER_SUPERVISOR_BIN" in env:
+        out.append("remove the old unsplit runtime setting")
+    sup = (service.get("environment") or {}).get("EKKA_VERIFIED_SUPERVISOR_BIN")
     sup_path = mounted_source(service, sup) if sup else None
     m = this_machine(machine)
     want = ((pins["supervisor"].get("platforms") or {}).get(m) or {}).get("binary_sha256")
     if not want:
         out.append(f"deploy/pins.json pins no supervisor for this machine's processor type ({m})")
     elif not sup_path:
-        out.append("compose mounts no supervisor binary at OPENSHELL_DOCKER_SUPERVISOR_BIN")
+        out.append("compose mounts no supervisor binary at EKKA_VERIFIED_SUPERVISOR_BIN")
     else:
         try:
             got = sha256_file(sup_path)

@@ -37,7 +37,9 @@ class PreflightTest(unittest.TestCase):
             "entrypoint": None,
             "environment": {
                 "OPENSHELL_GATEWAY_CONFIG": "/etc/openshell/gateway.toml",
-                "OPENSHELL_DOCKER_SUPERVISOR_BIN": "/srv/desks/supervisor/openshell-supervisor",
+                "OPENSHELL_SUPERVISOR_IMAGE": self.pins["supervisor"]["image"],
+                "OPENSHELL_SANDBOX_RUNTIME_IMAGE": self.pins["sandbox"]["image"],
+                "EKKA_VERIFIED_SUPERVISOR_BIN": "/srv/desks/supervisor/openshell-supervisor",
                 "OPENSHELL_TELEMETRY_ENABLED": "false",
             },
             "volumes": [
@@ -124,6 +126,14 @@ class PreflightTest(unittest.TestCase):
         os.remove(self.supervisor)
         self.assertIn("unreadable", " ".join(gp.reasons(self.compose, self.pins, self.machine)))
 
+    def test_mixed_or_legacy_runtime_pins_are_refused(self):
+        env = self.compose["services"]["gateway"]["environment"]
+        env["OPENSHELL_SANDBOX_RUNTIME_IMAGE"] = self.pins["supervisor"]["image"]
+        self.assertTrue(gp.reasons(self.compose, self.pins, self.machine))
+        env["OPENSHELL_SANDBOX_RUNTIME_IMAGE"] = self.pins["sandbox"]["image"]
+        env["OPENSHELL_DOCKER_SUPERVISOR_BIN"] = self.supervisor
+        self.assertTrue(gp.reasons(self.compose, self.pins, self.machine))
+
     def test_no_gateway_service_is_refused(self):
         self.assertEqual(gp.reasons({"services": {}}, self.pins, self.machine), ["compose has no gateway service"])
 
@@ -188,7 +198,7 @@ class PlainTomlTest(unittest.TestCase):
         with open(TEMPLATE) as f:
             text = f.read()
         plain = gp.plain_toml(text)
-        self.assertEqual([len(i["bindings"]) for i in plain["openshell"]["gateway"]["interceptors"]], [14, 9])
+        self.assertEqual([len(i["bindings"]) for i in plain["openshell"]["gateway"]["interceptors"]], [17, 12])
         self.assertIs(plain["openshell"]["gateway"]["mtls_auth"]["operator_enabled"], False)
         if gp.tomllib:
             self.assertEqual(plain, gp.tomllib.loads(text))
