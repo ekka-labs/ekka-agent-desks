@@ -4,6 +4,7 @@ No shell, inherited tool selection, environment-file evaluation or desk action.
 The initial release operates the existing default installation only.
 """
 import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ class Runtime:
     def __init__(self, output=print):
         self.output = output
 
-    def run(self, args, allowed=(0,), stdin=None, timeout=90, environment=None, quiet=False):
+    def run(self, args, allowed=(0,), stdin=None, timeout=90, environment=None, quiet=False, keep_fds=()):
         # Cleanup runs quietly: a closed console must never stop the command that switches access off.
         if not quiet:
             self.output("→ " + shlex.join(args))
@@ -38,7 +39,7 @@ class Runtime:
             result = subprocess.run(args, input=stdin,
                                     stdin=subprocess.DEVNULL if stdin is None else None,
                                     capture_output=True, text=True, env={**ENV, **(environment or {})},
-                                    timeout=timeout, check=False)
+                                    timeout=timeout, check=False, pass_fds=tuple(keep_fds))
         except (OSError, subprocess.TimeoutExpired) as error:
             # A timeout is an unknown result; do not automatically retry a change.
             raise HostError("command did not finish; inspect the host before retrying") from error
@@ -65,12 +66,21 @@ class Runtime:
         return (STATE / "up" / "started").is_file()
 
     def unfinished_admin_session(self):
-        """True when a temporary gateway administrator session ended without its verified cleanup."""
-        try:
-            names = os.listdir(STATE)
-        except FileNotFoundError:
+        """True when a temporary gateway administrator session left its marker and no session holds the lock now:
+        a session in progress also has a marker, and is not reported as abandoned."""
+        if not os.path.lexists(STATE / ADMIN_PENDING):
             return False
-        return ADMIN_PENDING in names or any(n.startswith(ADMIN_HOME_PREFIX) for n in names)
+        try:
+            fd = os.open(STATE / "gateway-admin.lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+        return True
 
     def audit(self, action, outcome):
         record = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(),

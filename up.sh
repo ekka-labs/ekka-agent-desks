@@ -539,7 +539,7 @@ as_gateway_admin() {  # run "$@" as the gateway's administrator, then switch tha
   # One temporary-admin session at a time, shared with ekka-desk-host's emergency stop: otherwise one session could
   # switch the setup client off under the other, or on again after the other confirmed it off. Fd 87 holds the lock
   # until the end of this function; it must be this regular private file, never a link to one.
-  python3 -c 'import os, sys; os.close(os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))' "$lock" \
+  python3 -c 'import os, sys; os.close(os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600))' "$lock" \
     || die "the gateway administrator lock ($lock) is not a regular file; nothing was changed"
   exec 87<>"$lock" || die "the gateway administrator lock ($lock) could not be opened; nothing was changed"
   rc=0; python3 -c '
@@ -554,11 +554,30 @@ except BlockingIOError:
     sys.exit(4)' "$lock" || rc=$?
   (( rc != 4 )) || { exec 87>&-; die "another gateway administrator session is running (an emergency stop or another up.sh command); run this again when it finishes. Nothing was changed"; }
   (( rc == 0 )) || { exec 87>&-; die "the gateway administrator lock ($lock) must be a private regular file owned by root; nothing was changed"; }
+  # Fd 87 is inherited by every child of this session on purpose: a child still running after this shell died (an
+  # `on` in flight) keeps the next session, native or not, out until it has finished.
+  local home=$DESKS_STATE/openshell-admin marker=$DESKS_STATE/gateway-admin.pending
+  rm -rf "$home"   # fresh every time: a folder an interrupted session left can hold a registration of its own
+  # The open session, durably, before access is enabled: ekka-desk-host status reports it, and its next emergency
+  # stop switches access off and removes this folder, if this shell is killed before the end.
+  python3 -c '
+import json, os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+data = (json.dumps({"home": sys.argv[2]}) + "\n").encode()
+assert os.write(fd, data) == len(data)
+os.fsync(fd); os.close(fd)
+folder = os.open(os.path.dirname(sys.argv[1]), os.O_RDONLY); os.fsync(folder); os.close(folder)' "$marker" "$home" \
+    || { exec 87>&-; die "the gateway administrator session could not be recorded ($marker); nothing was changed"; }
+  # Interrupted (Ctrl-C, SIGTERM, SIGHUP): switch access off, confirm it, then leave. A child in progress ends first.
+  trap 'trap "" INT TERM HUP; kc setup-client off >/dev/null 2>&1
+        [[ $(kc setup-client status 2>/dev/null) == disabled ]] && rm -f "$DESKS_STATE/gateway-admin.pending"
+        rm -rf "$DESKS_STATE/openshell-admin"; exit 130' INT TERM HUP
   # `on` enables the client before it reads the secret, so a failed `on` may have left it enabled: it is switched off
-  # again, and a failure there too is said, never "nothing was changed".
+  # again and read back, and a failure there too is said, never "nothing was changed".
   setup_client_secret=$(kc setup-client on) && [[ -n $setup_client_secret ]] || {
-    kc setup-client off >/dev/null 2>&1 \
+    kc setup-client off >/dev/null 2>&1 && [[ $(kc setup-client status 2>/dev/null) == disabled ]] \
       || die "Keycloak did not switch the gateway's setup client on, and it may still be switched on; run the same command again"
+    rm -f "$marker"; trap - INT TERM HUP; exec 87>&-
     die "Keycloak did not switch the gateway's setup client on; nothing was changed"; }
   # NVIDIA's gateway flags read these too; one kept by `sudo -E` would send the calls, and this sign-in, elsewhere.
   # NVIDIA's CLI falls back to /etc/openshell for a registration its own home lacks, as it does after a `gateway add`
@@ -570,12 +589,27 @@ except BlockingIOError:
     install -d -m 0700 "$HOME" "$OPENSHELL_SYSTEM_GATEWAY_DIR"
     "$OS" gateway add "https://$NAME:8080" --name ekka-agent-desks --oidc-issuer "https://$NAME/realms/ekka-desks" \
       --oidc-client-id desks-setup --oidc-audience ekka-desks >/dev/null 2>&1 || true
+    # What `gateway add` kept, read back before the secret signs in anywhere: its endpoint, issuer and client.
+    python3 -c '
+import json, os, stat, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+if not stat.S_ISREG(os.fstat(fd).st_mode):
+    sys.exit(1)
+kept = json.loads(os.read(fd, 65536))
+want = {"gateway_endpoint": sys.argv[2], "auth_mode": "oidc", "oidc_issuer": sys.argv[3], "oidc_client_id": "desks-setup"}
+sys.exit(0 if isinstance(kept, dict) and all(kept.get(k) == v for k, v in want.items()) else 1)' \
+      "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json" "https://$NAME:8080" \
+      "https://$NAME/realms/ekka-desks" 2>/dev/null || exit 97
     "$OS" gateway login ekka-agent-desks >/dev/null || exit 97  # 97: never an answer of the call it guards
     "$@"
   ) || rc=$?
   unset setup_client_secret
   kc setup-client off >/dev/null || die "the gateway's setup client may still be switched on; run the same command again"
-  rm -rf "$DESKS_STATE/openshell-admin"
+  # A successful switch-off alone is not proof: it is read back before the session counts as closed.
+  [[ $(kc setup-client status) == disabled ]] \
+    || die "the gateway's setup client is not confirmed switched off; run the same command again"
+  rm -rf "$home"; rm -f "$marker"
+  trap - INT TERM HUP
   exec 87>&-
   (( rc != 97 )) || die "could not sign in to NVIDIA's gateway as its administrator; nothing was changed there"
   return $rc

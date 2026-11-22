@@ -46,9 +46,11 @@ class GatewayHost(Host):
         self.stopped = []            # (workspace, desk)
         self.quiet = []              # the step of every call made with quiet=True
         self.on_step = {}            # step -> callable, run before the step's effect
+        self.kept = []               # the fds each child was given
 
-    def run(self, args, allowed=(0,), stdin=None, timeout=90, environment=None, quiet=False):
+    def run(self, args, allowed=(0,), stdin=None, timeout=90, environment=None, quiet=False, keep_fds=()):
         self.processes.append((args, environment))
+        self.kept.append(tuple(keep_fds))
         step = args[-1] if "setup-client" in args else (
             "login" if "login" in args else "add" if "add" in args else "stop")
         if quiet:
@@ -327,7 +329,7 @@ record()
         outcome = json.loads(result_file.read_text())
         self.assertFalse(outcome["enabled"], "the setup client was left enabled: " + result.stdout + result.stderr)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("termination signal", result.stdout)
+        self.assertIn("stopped by a signal", result.stdout)
         self.assertEqual([p.name for p in self.state.iterdir() if p.name != "gateway-admin.lock"], [],
                          "a sign-in or marker was left behind")
 
@@ -379,7 +381,9 @@ record()
         left = self.state / ".gateway-admin-abc123"
         (left / "config").mkdir(parents=True)
         (left / "config" / "oidc_token.json").write_text("{}")
-        (self.state / "gateway-admin.pending").write_text("open\n")
+        info = left.lstat()
+        (self.state / "gateway-admin.pending").write_text(json.dumps(
+            {"home": str(left), "dev": info.st_dev, "ino": info.st_ino}))
         host = GatewayHost()
         host.enabled = True                  # the killed session never switched it off
         with self.installed:
@@ -392,7 +396,7 @@ record()
 
     def test_status_reports_an_unfinished_session(self):
         from ekka_host.runtime import status
-        (self.state / ".gateway-admin-abc123").mkdir()
+        (self.state / "gateway-admin.pending").write_text("{}")
         lines = []
         host = Runtime(output=lines.append)
         host.installed = lambda: True
@@ -401,6 +405,94 @@ record()
         with patch("ekka_host.runtime.STATE", self.state), self.assertRaises(HostError):
             status(host)
         self.assertTrue(any("did not finish" in line for line in lines))
+
+
+class SessionRecoveryIsExact(unittest.TestCase):
+    """Signals are noted, never raised; children hold the session lock; a marker names exactly one sign-in folder;
+    an unwritable audit log never stops access being switched off; status tells a live session from a dead one."""
+
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.state = Path(self.folder.name)
+        replacement = patch("ekka_host.gateway.STATE", self.state)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+        self.installed = patch("ekka_host.gateway.validate", return_value=(
+            "gateway.example", Path("/installed/openshell"), Path("/installed/apply_realm.py")))
+
+    def test_every_session_child_holds_the_session_lock(self):
+        host = GatewayHost()
+        with self.installed:
+            gateway.emergency_stop(host, "code-desk")
+        self.assertTrue(host.kept)
+        self.assertTrue(all(len(k) == 1 for k in host.kept), "a session child ran without the lock: " + str(host.kept))
+        self.assertEqual(len(set(host.kept)), 1)
+
+    def test_the_runtime_hands_the_lock_to_the_child(self):
+        with patch("ekka_host.runtime.subprocess.run") as call:
+            call.return_value = subprocess.CompletedProcess([], 0, "", "")
+            Runtime(output=lambda line: None).run(["/bin/true"], keep_fds=(7,))
+        self.assertEqual(call.call_args.kwargs["pass_fds"], (7,))
+
+    def test_a_signal_is_noted_and_the_session_stops_after_its_current_step(self):
+        host = GatewayHost()
+        host.on_step["add"] = lambda: os.kill(os.getpid(), signal.SIGINT)
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            with self.installed, self.assertRaisesRegex(HostError, "stopped by a signal"):
+                gateway.emergency_stop(host, "code-desk")
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        steps = [p[0][-1] if "setup-client" in p[0] else p[0][1] for p in host.processes]
+        self.assertNotIn("login", steps, "the session went on after the signal")
+        self.assertFalse(host.enabled)
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ["gateway-admin.lock"])
+
+    def test_an_unwritable_audit_log_never_stops_the_old_session_being_switched_off(self):
+        (self.state / "gateway-admin.pending").write_text("{}")
+        host = GatewayHost()
+        host.enabled = True
+        host.fail_audit = True
+        with self.installed, self.assertRaisesRegex(HostError, "audit log"):
+            gateway.emergency_stop(host, "code-desk")
+        self.assertFalse(host.enabled, "access stayed on because the audit log could not be written")
+        self.assertNotIn("on", [p[0][-1] for p in host.processes], "a new session started without its audit")
+
+    def test_only_the_recorded_sign_in_folder_is_removed(self):
+        recorded = self.state / ".gateway-admin-recorded"
+        recorded.mkdir()
+        info = recorded.lstat()
+        (self.state / "gateway-admin.pending").write_text(json.dumps(
+            {"home": str(recorded), "dev": info.st_dev, "ino": info.st_ino}))
+        backup = self.state / ".gateway-admin-backup-of-something"
+        backup.mkdir()
+        (backup / "keep.txt").write_text("keep")
+        (self.state / ".gateway-admin-note").write_text("a file with the prefix")
+        host = GatewayHost()
+        with self.installed:
+            gateway.emergency_stop(host, "code-desk")
+        self.assertFalse(recorded.exists())
+        self.assertTrue((backup / "keep.txt").exists(), "an unrecorded folder was deleted")
+        self.assertEqual(host.records[-1], ("emergency-stop code-desk", "command_completed_admin_disabled"))
+
+    def test_status_does_not_call_a_live_session_abandoned(self):
+        import fcntl
+        from ekka_host.runtime import status
+        (self.state / "gateway-admin.pending").write_text("{}")
+        lines = []
+        host = Runtime(output=lines.append)
+        host.installed = lambda: True
+        host.socket_exists = lambda: True
+        host.service = lambda unit: {"LoadState": "loaded", "ActiveState": "active", "SubState": "running"}
+        fd = os.open(self.state / "gateway-admin.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)             # an emergency stop is running now
+            with patch("ekka_host.runtime.STATE", self.state):
+                status(host)
+        finally:
+            os.close(fd)
+        self.assertFalse(any("did not finish" in line for line in lines))
 
 
 class TheSetupClientStateIsReadStrictly(unittest.TestCase):

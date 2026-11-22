@@ -25,15 +25,13 @@ NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 WORKSPACE = "desks"
 REGISTRATION = "ekka-agent-desks"
 SETUP_CLIENT = "desks-setup"
+LOCK = "gateway-admin.lock"          # up.sh's as_gateway_admin locks the same file
+LEGACY_HOME = "openshell-admin"      # up.sh's session folder, which its marker names
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
 class Terminated(BaseException):
     """A termination signal arrived; the temporary administrator is still switched off before exit."""
-
-
-def _terminate(signum, frame):
-    raise Terminated()
 
 
 @contextlib.contextmanager
@@ -97,7 +95,9 @@ def emergency_stop(runtime, desk):
     name, binary, script = validate(runtime, argv)
     # One lock for every temporary-admin session, native and up.sh alike (up.sh's as_gateway_admin takes it too).
     # Otherwise one could disable the other's identity while its request is still running, or re-enable it.
-    fd = os.open(STATE / "gateway-admin.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    # Every child of the session inherits this lock (keep_fds), so a child still running after this process died,
+    # an `on` in flight for example, keeps the next session out until it has finished.
+    fd = os.open(STATE / LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(fd)
         # The command runs as root (cli.main refuses otherwise), so the owner must be root.
@@ -107,10 +107,12 @@ def emergency_stop(runtime, desk):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise HostError("another gateway administrator session is running; run this again when it finishes") from None
-        # SIGTERM and SIGHUP raise, so the cleanup below still runs; Ctrl-C already raises KeyboardInterrupt.
-        with _signals(_terminate, (signal.SIGTERM, signal.SIGHUP)):
-            _reconcile(runtime, script)
-            _run(runtime, argv, name, binary, script)
+        # Ctrl-C, SIGTERM and SIGHUP are noted, never raised: the session stops after the step it is in, and no signal
+        # can land between that step and the cleanup that switches access off.
+        noted = []
+        with _signals(lambda number, frame: noted.append(number)):
+            _reconcile(runtime, script, fd)
+            _run(runtime, argv, name, binary, script, fd, noted)
     finally:
         os.close(fd)
 
@@ -123,53 +125,115 @@ def _keycloak(script):
     return ["/usr/bin/python3", str(script), "setup-client"], env
 
 
-def _disable(runtime, kc, kc_env):
+def _disable(runtime, kc, kc_env, fd=None):
     """Switch the setup client off and read it back. Termination signals and console output cannot stop it:
     they are ignored (children inherit that) and nothing is printed while it runs."""
+    keep = () if fd is None else (fd,)
     try:
         with _signals(signal.SIG_IGN):
-            runtime.run([*kc, "off"], environment=kc_env, quiet=True)
+            runtime.run([*kc, "off"], environment=kc_env, quiet=True, keep_fds=keep)
             # A successful PUT alone is not proof the identity is disabled.
-            return runtime.run([*kc, "status"], environment=kc_env, quiet=True).stdout.strip() == "disabled"
+            return runtime.run([*kc, "status"], environment=kc_env, quiet=True,
+                               keep_fds=keep).stdout.strip() == "disabled"
     except Exception:
         return False
 
 
-def _private_marker(path):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+def _sync_state():
+    folder = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(folder)
+    finally:
+        os.close(folder)
+
+
+def _write_marker(record):
+    """The open session, durably: written (file and folder synced) before access is enabled."""
+    fd = os.open(STATE / ADMIN_PENDING, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
             raise HostError("the gateway administrator session marker must be a private regular file")
-        os.write(fd, b"open\n")
+        data = (json.dumps(record, sort_keys=True) + "\n").encode()
+        if os.write(fd, data) != len(data):
+            raise HostError("the gateway administrator session marker could not be written")
         os.fsync(fd)
     finally:
         os.close(fd)
+    _sync_state()
 
 
-def _reconcile(runtime, script):
-    """A session that ended abruptly (SIGKILL, power loss) left its marker or its temporary home. Switch the client
-    off and remove that sign-in before anything else is enabled."""
-    leftovers = sorted(p for p in STATE.iterdir() if p.name.startswith(ADMIN_HOME_PREFIX))
-    pending = STATE / ADMIN_PENDING
-    if not leftovers and not os.path.lexists(pending):
+def _read_marker():
+    """None when there is no marker; {} when it cannot be read as one (the client is still switched off)."""
+    try:
+        fd = os.open(STATE / ADMIN_PENDING, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}
+        data = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    try:
+        record = json.loads(data) if len(data) <= 4096 else {}
+    except ValueError:
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _recorded_home(record):
+    """The one temporary home a marker names, if it is still exactly that folder; never anything else."""
+    home = record.get("home")
+    if not isinstance(home, str):
+        return None
+    path = Path(home)
+    if path.parent != STATE or not (path.name.startswith(ADMIN_HOME_PREFIX) or path.name == LEGACY_HOME):
+        return None
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        return None
+    if path.name != LEGACY_HOME and (record.get("dev"), record.get("ino")) != (info.st_dev, info.st_ino):
+        return None
+    return path
+
+
+def _reconcile(runtime, script, fd=None):
+    """A session that ended abruptly (SIGKILL, power loss) left its marker. Switch the client off and remove the
+    sign-in folder that marker names, before anything else is enabled. Nothing the marker does not name is removed."""
+    record = _read_marker()
+    if record is None:
+        strays = sorted(p.name for p in STATE.iterdir() if p.name.startswith(ADMIN_HOME_PREFIX))
+        if strays:
+            runtime.output("Left as they are, recorded by no session: " + ", ".join(strays))
         return
-    runtime.audit("gateway-admin reconcile", "requested")
+    try:
+        runtime.audit("gateway-admin reconcile", "requested")
+        audited = True
+    except (OSError, HostError):
+        audited = False     # switching access off is still attempted: it only ever removes access
     kc, kc_env = _keycloak(script)
-    if not _disable(runtime, kc, kc_env):
-        runtime.audit("gateway-admin reconcile", "temporary_admin_disable_not_verified")
+    if not _disable(runtime, kc, kc_env, fd):
+        with contextlib.suppress(OSError, HostError):
+            runtime.audit("gateway-admin reconcile", "temporary_admin_disable_not_verified")
         raise HostError("a previous gateway administrator session did not finish and its setup client is not confirmed "
                         "disabled; disable desks-setup in Keycloak before retrying")
-    for path in leftovers:
-        info = path.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-            raise HostError("an unexpected entry uses the temporary administrator folder name; inspect " + str(path))
-        shutil.rmtree(path)
-    with contextlib.suppress(FileNotFoundError):
-        pending.unlink()
+    home = _recorded_home(record)
+    if home is not None:
+        shutil.rmtree(home)
+    (STATE / ADMIN_PENDING).unlink()
+    _sync_state()
+    if not audited:
+        raise HostError("a previous gateway administrator session's setup client is now confirmed disabled, but the "
+                        "host audit log cannot be written, so no new session was started")
     runtime.audit("gateway-admin reconcile", "previous_session_closed")
     runtime.output("A previous gateway administrator session did not finish; its setup client is now confirmed "
-                   "disabled and its temporary sign-in removed.")
+                   "disabled" + (" and its temporary sign-in removed." if home is not None else "."))
 
 
 def _registered(config, endpoint, issuer):
@@ -177,7 +241,7 @@ def _registered(config, endpoint, issuer):
     can remove it and still exit zero; `login` would then fall back to another registration of the same name."""
     path = Path(config) / "openshell" / "gateways" / REGISTRATION / "metadata.json"
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         raise HostError("the temporary gateway registration was not kept; no sign-in was attempted") from None
     try:
@@ -197,55 +261,64 @@ def _registered(config, endpoint, issuer):
                         "client; no sign-in was attempted")
 
 
-def _run(runtime, argv, name, binary, script):
+def _run(runtime, argv, name, binary, script, fd=None, noted=()):
     action = "emergency-stop " + argv[-1]
     runtime.audit(action, "requested")
     kc, kc_env = _keycloak(script)
-    pending = STATE / ADMIN_PENDING
-    secret = ""
-    failed = None
-    # Written before access is enabled, removed only after it is confirmed disabled.
-    _private_marker(pending)
+    # The sign-in folder exists, and the marker names it, before access is enabled. It holds no secret until login.
+    home = Path(tempfile.mkdtemp(prefix=ADMIN_HOME_PREFIX, dir=STATE))
     try:
-        # `on` can fail AFTER enabling access. The finally block runs even then.
-        secret = runtime.run([*kc, "on"], environment=kc_env).stdout
+        info = home.lstat()
+        _write_marker({"home": str(home), "dev": info.st_dev, "ino": info.st_ino})
+    except BaseException:
+        shutil.rmtree(home, ignore_errors=True)
+        raise
+    failed = None
+
+    def step(args, env, timeout=90):
+        result = runtime.run(args, environment=env, timeout=timeout, keep_fds=() if fd is None else (fd,))
+        if noted:
+            raise Terminated()
+        return result
+
+    try:
+        if noted:
+            raise Terminated()
+        # `on` can fail AFTER enabling access. The cleanup below runs even then.
+        secret = step([*kc, "on"], kc_env).stdout
         if not secret or len(secret) > 8192 or any(ord(c) < 33 or ord(c) > 126 for c in secret):
             raise HostError("the temporary gateway credential was not returned correctly")
-        with tempfile.TemporaryDirectory(prefix=ADMIN_HOME_PREFIX, dir=STATE) as home:
-            config = Path(home) / "config"
-            system = Path(home) / "system"
-            system.mkdir(mode=0o700)   # empty: no registration outside this session can be used
-            endpoint = "https://" + name + ":8080"
-            issuer = "https://" + name + "/realms/ekka-desks"
-            env = {"HOME": home, "XDG_CONFIG_HOME": str(config), "OPENSHELL_SYSTEM_GATEWAY_DIR": str(system),
-                   "SSL_CERT_FILE": str(STATE / "tls/ca.crt"), "OPENSHELL_OIDC_CLIENT_SECRET": secret}
-            runtime.run([str(binary), "gateway", "add", endpoint, "--name", REGISTRATION, "--oidc-issuer", issuer,
-                         "--oidc-client-id", SETUP_CLIENT, "--oidc-audience", "ekka-desks"], environment=env)
-            _registered(config, endpoint, issuer)
-            runtime.run([str(binary), "gateway", "login", REGISTRATION], environment=env)
-            runtime.run([str(binary), "-g", REGISTRATION, "--workspace", WORKSPACE, *argv],
-                        environment=env, timeout=150)
+        config = home / "config"
+        system = home / "system"
+        system.mkdir(mode=0o700)   # empty: no registration outside this session can be used
+        endpoint = "https://" + name + ":8080"
+        issuer = "https://" + name + "/realms/ekka-desks"
+        env = {"HOME": str(home), "XDG_CONFIG_HOME": str(config), "OPENSHELL_SYSTEM_GATEWAY_DIR": str(system),
+               "SSL_CERT_FILE": str(STATE / "tls/ca.crt"), "OPENSHELL_OIDC_CLIENT_SECRET": secret}
+        secret = ""
+        step([str(binary), "gateway", "add", endpoint, "--name", REGISTRATION, "--oidc-issuer", issuer,
+              "--oidc-client-id", SETUP_CLIENT, "--oidc-audience", "ekka-desks"], env)
+        _registered(config, endpoint, issuer)
+        step([str(binary), "gateway", "login", REGISTRATION], env)
+        step([str(binary), "-g", REGISTRATION, "--workspace", WORKSPACE, *argv], env, timeout=150)
     except BaseException as error:
         failed = error
-    secret = ""
-    # A signal that lands before _disable has switched signals off interrupts nothing: it is retried.
-    while True:
-        try:
-            disabled = _disable(runtime, kc, kc_env)
-            break
-        except (Terminated, KeyboardInterrupt) as error:
-            failed = failed or error
+    env = None
+    disabled = _disable(runtime, kc, kc_env, fd)
+    with _signals(signal.SIG_IGN):
+        shutil.rmtree(home, ignore_errors=True)
     if not disabled:
         runtime.audit(action, "temporary_admin_disable_not_verified")
         raise HostError("the temporary setup client may still be enabled; disable desks-setup in Keycloak before retrying") from None
-    with contextlib.suppress(FileNotFoundError):
-        pending.unlink()
+    if not os.path.lexists(home):
+        (STATE / ADMIN_PENDING).unlink()
+        _sync_state()
     if failed is not None:
         runtime.audit(action, "not_verified_admin_disabled")
         if isinstance(failed, (KeyboardInterrupt, SystemExit)):
             raise failed
-        if isinstance(failed, Terminated):
-            raise HostError("stopped by a termination signal; its setup client was disabled; inspect before retrying") from None
+        if noted or isinstance(failed, Terminated):
+            raise HostError("stopped by a signal; its setup client was disabled; inspect before retrying") from None
         raise HostError("gateway command did not complete; its setup client was disabled; inspect before retrying") from None
     runtime.audit(action, "command_completed_admin_disabled")
     runtime.output("Emergency stop was acknowledged and its temporary setup client is disabled.")
