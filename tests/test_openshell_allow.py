@@ -147,7 +147,8 @@ class UpSh(unittest.TestCase):
         unset = re.search(r"unset ([A-Z_ ]+)\n", body)
         self.assertTrue(unset, "as_gateway_admin clears NVIDIA's gateway environment")
         self.assertEqual(set(unset.group(1).split()),
-                         {"OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE"})
+                         {"OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
+                          "XDG_CONFIG_HOME"})
         self.assertLess(unset.start(), body.find('\n    "$@"\n'), "cleared before the call runs")
 
 

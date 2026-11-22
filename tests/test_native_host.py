@@ -26,6 +26,7 @@ class Host:
         self.loaded = True
         self.apply = True
         self.fail_audit = False
+        self.unfinished = False
 
     def output(self, line):
         self.lines.append(line)
@@ -35,6 +36,9 @@ class Host:
 
     def socket_exists(self):
         return self.socket
+
+    def unfinished_admin_session(self):
+        return self.unfinished
 
     def service(self, unit):
         self.calls.append(("read", unit))

@@ -16,6 +16,9 @@ STACK = "ekka-desks.service"
 STATE = Path("/var/lib/ekka-agent-desks")
 SOCKET = Path("/run/ekka/openshell-interceptor.sock")
 AUDIT = Path("/var/log/ekka-desk-host.jsonl")
+# Present while a temporary gateway administrator session is open; left behind only if that session ended abruptly.
+ADMIN_PENDING = "gateway-admin.pending"
+ADMIN_HOME_PREFIX = ".gateway-admin-"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 
 
@@ -27,8 +30,10 @@ class Runtime:
     def __init__(self, output=print):
         self.output = output
 
-    def run(self, args, allowed=(0,), stdin=None, timeout=90, environment=None):
-        self.output("→ " + shlex.join(args))
+    def run(self, args, allowed=(0,), stdin=None, timeout=90, environment=None, quiet=False):
+        # Cleanup runs quietly: a closed console must never stop the command that switches access off.
+        if not quiet:
+            self.output("→ " + shlex.join(args))
         try:
             result = subprocess.run(args, input=stdin,
                                     stdin=subprocess.DEVNULL if stdin is None else None,
@@ -58,6 +63,14 @@ class Runtime:
 
     def installed(self):
         return (STATE / "up" / "started").is_file()
+
+    def unfinished_admin_session(self):
+        """True when a temporary gateway administrator session ended without its verified cleanup."""
+        try:
+            names = os.listdir(STATE)
+        except FileNotFoundError:
+            return False
+        return ADMIN_PENDING in names or any(n.startswith(ADMIN_HOME_PREFIX) for n in names)
 
     def audit(self, action, outcome):
         record = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -91,7 +104,11 @@ def status(runtime):
         if values.get("Result") == "start-limit-hit":
             runtime.output(name + " reached its start limit; inspect its journal before restarting")
     runtime.output("interceptor socket: " + ("present" if socket else "missing"))
-    if any(s["LoadState"] != "loaded" or s["ActiveState"] != "active"
+    unfinished = runtime.unfinished_admin_session()
+    if unfinished:
+        runtime.output("gateway setup client: a temporary administrator session did not finish; treat desks-setup "
+                       "as enabled until the next emergency-stop switches it off and removes its sign-in")
+    if unfinished or any(s["LoadState"] != "loaded" or s["ActiveState"] != "active"
            for s in (enclave, stack)) or not socket:
         raise HostError("host services are not ready")
     # This is host readiness, not a claim that a desk job or model works.

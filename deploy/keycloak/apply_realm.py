@@ -105,6 +105,21 @@ def find_client(api, spec, client_id):
     return found[0] if found else None
 
 
+def setup_client(api, spec):
+    """The desks-setup client, read strictly: None only for an answered empty list. Anything else that is not one
+    exact desks-setup record with a boolean `enabled` is an unknown state, never "disabled" or "absent"."""
+    found = api.get(realm_path(spec, "/clients?clientId=desks-setup"))
+    if not isinstance(found, list):
+        raise SystemExit("keycloak: the client list did not answer as a list; the setup client's state is unknown")
+    if not found:
+        return None
+    c = found[0]
+    if len(found) != 1 or not isinstance(c, dict) or c.get("clientId") != "desks-setup" \
+            or not isinstance(c.get("id"), str) or not c["id"] or not isinstance(c.get("enabled"), bool):
+        raise SystemExit("keycloak: the client list did not return one exact desks-setup record; its state is unknown")
+    return c
+
+
 def plan(api, spec):
     """(creates, differences): what is absent, and every declared value that differs from the live one."""
     creates, diffs = [], []
@@ -415,16 +430,11 @@ def main(argv):
         # openshell-admin. `on` enables it and writes its secret into a pipe; `off` disables it. Not in realm.json on
         # purpose: it exists only while up.sh needs it, and stays disabled otherwise.
         api = Api()
-        c = find_client(api, spec, "desks-setup")
+        c = setup_client(api, spec)
         if argv[1] == "status":
-            # Missing is disabled; malformed/ambiguous state never claims so.
-            if c is None or c.get("enabled") is False:
-                print("disabled")
-                return 0
-            if c.get("enabled") is True:
-                print("enabled")
-                return 0
-            raise SystemExit("keycloak: setup client returned no boolean enabled state")
+            # Missing (an answered empty list) is disabled; a malformed or unanswered read never claims so.
+            print("enabled" if c is not None and c["enabled"] else "disabled")
+            return 0
         if c is None:
             if argv[1] == "off":
                 return 0
@@ -437,7 +447,9 @@ def main(argv):
                                      "protocolMapper": "oidc-audience-mapper",
                                      "config": {"included.custom.audience": "ekka-desks",
                                                 "access.token.claim": "true", "id.token.claim": "false"}}]})
-            c = find_client(api, spec, "desks-setup")
+            c = setup_client(api, spec)
+            if c is None:
+                raise SystemExit("keycloak: the setup client was created but is not readable; nothing more was changed")
             if "openshell:all" in scopes:
                 api.write("PUT", realm_path(spec, f"/clients/{c['id']}/default-client-scopes/{scopes['openshell:all']}"), {})
             user = api.get(realm_path(spec, f"/clients/{c['id']}/service-account-user"))

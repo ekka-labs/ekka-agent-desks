@@ -27,6 +27,7 @@ python3() {
   case $1 in
     tools/provider_connect.py) [[ $2 == keyless ]] && return 1; printf '%s\n' "$CREDENTIAL_ENV" ;;
     tools/openshell_allow.py) return 0 ;;
+    -c) command python3 "$@" ;;   # as_gateway_admin's lock, run for real
     *) return 99 ;;
   esac
 }
