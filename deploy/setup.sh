@@ -11,7 +11,7 @@
 #   setup.sh enclave-backend <env>           the backend adapter's subject and the discovery permits folder, in
 #                                            enclave.env; prints `changed` or `kept` (up.sh restarts the Enclave on changed)
 #   setup.sh people                          the bundle each person runs once: the desks CA and backend.json
-#   setup.sh supervisor                      the desks' supervisor binary from the pinned image (again after a pin bump)
+#   setup.sh supervisor                      stage both pinned runtime images and verify their binaries (again after a pin bump)
 #   setup.sh preflight                       refuse, by name, a gateway that could hand credentials out
 #   setup.sh compose <args...>               docker compose with this setup's settings loaded (ps, logs, down, ...);
 #                                            commands that can start a service first pass both preflights

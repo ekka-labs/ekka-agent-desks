@@ -724,7 +724,18 @@ step_desk_admin() {  # desk administration through EKKA: only once up.env runs t
   fi
 }
 
+require_pinned_gateway() {
+  local container ref intended active
+  container=$(cd deploy && bash setup.sh compose ps -q gateway) || return 1
+  [[ -n $container ]] || return 1
+  ref=$(python3 -c 'import json; print(json.load(open("deploy/pins.json"))["openshell"]["gateway"]["image"])') || return 1
+  intended=$(docker image inspect --format '{{.Id}}' "$ref") || return 1
+  active=$(docker inspect --format '{{if .State.Running}}{{.Image}}{{end}}' "$container") || return 1
+  [[ -n $active && $active == "$intended" ]]
+}
+
 step_admin() {
+  require_pinned_gateway || die "the running gateway does not match its release pin; provider profiles were not touched"
   if is_done admin; then
     if ! is_done "profiles-$OPENSHELL_TAG"; then
       as_gateway_admin sync_profiles || die "the upgraded gateway catalog could not be refreshed; rerun to retry"
