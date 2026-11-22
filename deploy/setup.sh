@@ -69,6 +69,7 @@ stage_supervisor() (
 # Before any compose call that can start the gateway: refuse, by name, what would let it hand credentials out
 # or run with an unpinned supervisor (tools/gateway_preflight.py).
 gateway_preflight() {
+  python3 "$ROOT/tools/upgrade_desks.py" "$DESKS_STATE" || die "incompatible or unverified gateway desk state"
   $P --env-file "$DESKS_STATE/desks.env" config --format json | python3 "$ROOT/tools/gateway_preflight.py" \
     || die "the gateway was not started (above: each reason, and its fix)"
 }

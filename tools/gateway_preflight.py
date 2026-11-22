@@ -215,8 +215,14 @@ def reasons(compose, pins, machine=None):
         out.append(f"compose mounts no gateway.toml at {CONFIG_IN_CONTAINER}")
     else:
         try:
-            out += toml_reasons(read_toml(toml_path))
-        except (OSError, ValueError) as e:  # tomllib's TOMLDecodeError, PlainTOMLError and a bad UTF-8 byte included
+            cfg = read_toml(toml_path)
+            out += toml_reasons(cfg)
+            from credential_bindings import missing
+            for interceptor, methods in missing(cfg).items():
+                if methods:
+                    out.append(f"{interceptor} is missing required credential bindings: {', '.join(methods)}")
+
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:  # tomllib's TOMLDecodeError, PlainTOMLError and a bad UTF-8 byte included
             out.append(f"{toml_path} cannot be read as TOML: {e}")
     env = service.get("environment") or {}
     for component, variable in (("supervisor", "OPENSHELL_SUPERVISOR_IMAGE"),

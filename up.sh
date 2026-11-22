@@ -140,6 +140,7 @@ step_preflight() {
   (( abi >= 3 )) || die "the kernel's Landlock ABI is $abi; NVIDIA OpenShell needs 3 or newer (Linux 6.2+). On Amazon Linux 2023, install kernel6.18 and reboot"
   ok "Linux $(uname -r), Landlock ABI $abi"
   docker info >/dev/null 2>&1 || die "Docker is not running"
+  python3 tools/upgrade_desks.py "$DESKS_STATE" || die "existing desks must be verified before upgrade"
   install -d -m 0755 "$PLUGINS"
   docker compose version >/dev/null 2>&1 || { fetch_pinned "https://github.com/docker/compose/releases/download/$COMPOSE_VER/$COMPOSE_FILE" "$PLUGINS/docker-compose" "$COMPOSE_SHA" 0755; ok "installed Docker Compose $COMPOSE_VER ($MACHINE)"; }
   docker buildx version >/dev/null 2>&1 || { fetch_pinned "https://github.com/docker/buildx/releases/download/$BUILDX_VER/$BUILDX_FILE" "$PLUGINS/docker-buildx" "$BUILDX_SHA" 0755; ok "installed Docker buildx $BUILDX_VER ($MACHINE)"; }
@@ -239,6 +240,8 @@ step_settings() {
 }
 
 step_workspace_policy() {
+  python3 tools/credential_bindings.py "$DESKS_STATE/gateway.toml" || die "gateway interceptor allowlist could not be refreshed"
+
   local result
   install -d -m 0700 "$DONE"
   result=$(python3 tools/workspace_policy.py configure "$DESKS_STATE/gateway.toml" false "$DESKS_STATE/workspace-policy.pending") \
@@ -844,7 +847,7 @@ step_start() {
   (cd deploy && bash setup.sh preflight) || die "the gateway preflight refused (above); nothing was started"
   backend_permits_dir   # the adapter's permits folder, before any start (compose never creates it)
   (cd deploy && bash setup.sh backend-preflight)   # with desk-admin on, the stack starts the adapter too
-  local stack_sha; stack_sha=$( { cat deploy/compose.yml deploy/pins.json deploy/edge/nginx.conf deploy/host/ekka-desks.service.template "$DESKS_STATE/up.env"; } | sha256sum | cut -c1-16)
+  local stack_sha; stack_sha=$( { cat "$DESKS_STATE/gateway.toml" deploy/compose.yml deploy/pins.json deploy/edge/nginx.conf deploy/host/ekka-desks.service.template "$DESKS_STATE/up.env"; } | sha256sum | cut -c1-16)
   if is_done started; then
     snapshot_stack; enclave_units
     rm -f "$DESKS_STATE/stack.hold"; systemctl reset-failed ekka-desks >/dev/null 2>&1 || true   # a first install that died while held

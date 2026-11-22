@@ -198,7 +198,7 @@ class PlainTomlTest(unittest.TestCase):
         with open(TEMPLATE) as f:
             text = f.read()
         plain = gp.plain_toml(text)
-        self.assertEqual([len(i["bindings"]) for i in plain["openshell"]["gateway"]["interceptors"]], [14, 9])
+        self.assertEqual([len(i["bindings"]) for i in plain["openshell"]["gateway"]["interceptors"]], [17, 12])
         self.assertIs(plain["openshell"]["gateway"]["mtls_auth"]["operator_enabled"], False)
         if gp.tomllib:
             self.assertEqual(plain, gp.tomllib.loads(text))
