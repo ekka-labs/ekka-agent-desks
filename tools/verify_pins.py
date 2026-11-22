@@ -49,6 +49,11 @@ def shape_errors(pins):
         errors.append("version is not MAJOR.MINOR.PATCH")
     if pins.get("release") != f"https://github.com/NVIDIA/OpenShell/releases/download/v{pins.get('version')}":
         errors.append("release is not NVIDIA's download URL for this version")
+    for machine in PLATFORMS:
+        entry = pins.get("cli", {}).get("platforms", {}).get(machine, {})
+        if (entry.get("release_asset") != f"openshell-{machine}-unknown-linux-musl.tar.gz"
+                or not HEX64.fullmatch(entry.get("archive_sha256", ""))):
+            errors.append(f"invalid CLI archive pin for {machine}")
     for name in COMPONENTS:
         c = pins.get(name) or {}
         if not IMAGE.fullmatch(c.get("image", "")):
@@ -137,6 +142,14 @@ def main(argv):
     if errors:
         print("\n".join(f"pins: {e}" for e in errors))
         return 1
+    if argv == ["--version"]:
+        print(pins["version"])
+        return 0
+    if argv[:1] == ["--cli-pin"]:
+        if len(argv) != 3 or argv[1] not in PLATFORMS or argv[2] not in ("release_asset", "archive_sha256"):
+            return 1
+        print(pins["cli"]["platforms"][argv[1]][argv[2]])
+        return 0
     print(f"pins: shape OK (OpenShell {pins['version']})")
     failed = False
     machines = list(PLATFORMS)

@@ -46,7 +46,7 @@ EKKA_ENV=${EKKA_ENV:-$(python3 tools/workspace_policy.py retained "$DESKS_STATE"
 export EKKA_ENV
 AGENT=${AGENT:-claude-code}
 OPENSHELL_TELEMETRY=${OPENSHELL_TELEMETRY:-off}
-OPENSHELL_TAG=v0.1.4
+OPENSHELL_TAG=v$(python3 tools/verify_pins.py --version)
 # EKKA desk administration requires the compatible Enclave release below.
 # Upgrade the integration and Enclave together. The release must support governed desk
 # changes through the two general plans, per-run output collection, verified requester identities,
@@ -66,16 +66,16 @@ case $MACHINE in
     COMPOSE_SHA=40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a
     BUILDX_FILE=buildx-$BUILDX_VER.linux-amd64
     BUILDX_SHA=4fe4cc38adf48169132749b6ca22a990928db0118e3407584ee553723115d287
-    OPENSHELL_CLI_FILE=openshell-x86_64-unknown-linux-musl.tar.gz
-    OPENSHELL_CLI_SHA=2b65178e62e1ece1d90d482555e9f1f98ff0296e058409b33418104b6333df07
+    OPENSHELL_CLI_FILE=$(python3 tools/verify_pins.py --cli-pin "$MACHINE" release_asset)
+    OPENSHELL_CLI_SHA=$(python3 tools/verify_pins.py --cli-pin "$MACHINE" archive_sha256)
     COSIGN_FILE=cosign-linux-amd64 ;;
   aarch64)
     COMPOSE_FILE=docker-compose-linux-aarch64
     COMPOSE_SHA=733ec76717ceb59052a9609b9dadfb523b2df8eab57a54212872d10a58078ea2
     BUILDX_FILE=buildx-$BUILDX_VER.linux-arm64
     BUILDX_SHA=38e890e1a162bfdbf32fbe91404991dc4fc28e55b0de901b34374a061bab4d2c
-    OPENSHELL_CLI_FILE=openshell-aarch64-unknown-linux-musl.tar.gz
-    OPENSHELL_CLI_SHA=1cd6e63597e1947c44a753bf5352f949e8d8d02e344af92ab899b7c111112d95
+    OPENSHELL_CLI_FILE=$(python3 tools/verify_pins.py --cli-pin "$MACHINE" release_asset)
+    OPENSHELL_CLI_SHA=$(python3 tools/verify_pins.py --cli-pin "$MACHINE" archive_sha256)
     COSIGN_FILE=cosign-linux-arm64 ;;
   *) COMPOSE_FILE=; COMPOSE_SHA=; BUILDX_FILE=; BUILDX_SHA=; OPENSHELL_CLI_FILE=; OPENSHELL_CLI_SHA=; COSIGN_FILE= ;;
 esac

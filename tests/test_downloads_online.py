@@ -7,6 +7,7 @@ names the other processor type's file fails here. Docker Compose and buildx are 
 lines of up.sh, with a `docker` on PATH that says neither plugin is installed; the openshell CLI by install_cli.
 """
 import os
+import json
 import platform
 import re
 import shutil
@@ -91,7 +92,8 @@ mkdir -p "$PLUGINS"
         cli = os.path.join(self.dir, "openshell")
         self.assert_this_machine(cli)
         version = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=60).stdout
-        tag = re.search(r"^OPENSHELL_TAG=v(\S+)", up_sh(), re.M).group(1)
+        with open(os.path.join(ROOT, "deploy", "pins.json")) as source:
+            tag = json.load(source)["openshell"]["version"]
         self.assertRegex(version, rf" {re.escape(tag)}$")
 
 
