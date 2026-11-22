@@ -192,12 +192,33 @@ class PullReviewFixes(unittest.TestCase):
         cosign = folder / "cosign"
         cosign.write_text("#!/bin/sh\n")
         cosign.chmod(0o755)
-        self.host = DockerWithAHelper(cosign=(str(cosign.resolve()),))
+        self.host = DockerWithAHelper(cosign=(str(cosign),))
         with patch("ekka_host.images.COSIGN", (str(self.state / "usr-local-bin/cosign"), str(cosign)), create=True), \
              patch("ekka_host.images.ROOT_UID", os.getuid(), create=True):
             self.invoke(real_cosign=True, identity="https://example.com/release", issuer="https://issuer.example")
         self.assertEqual(self.host.records[-1][1], "verified_digest")
-        self.assertTrue(any(str(cosign.resolve()) in a for a, _ in self.host.processes))
+        self.assertTrue(any(str(cosign) in a for a, _ in self.host.processes))
+
+    def test_a_linked_cosign_is_refused_and_its_own_folder_is_the_one_checked(self):
+        # A link in a folder someone else controls could point at any root-owned program that exits 0.
+        target = self.state / "target"
+        target.mkdir()
+        program = target / "true"
+        program.write_text("#!/bin/sh\n")
+        program.chmod(0o755)
+        lookup = self.state / "lookup"
+        lookup.mkdir()
+        (lookup / "cosign").symlink_to(program)
+        checked = []
+        with patch("ekka_host.images.COSIGN", (str(lookup / "cosign"),), create=True), \
+             patch("ekka_host.images.ROOT_UID", os.getuid(), create=True), \
+             patch("ekka_host.images.root_directory", side_effect=lambda p: checked.append(Path(p)) or Path(p)), \
+             patch("ekka_host.images.STATE", self.state), \
+             patch("ekka_host.registry.root_file", side_effect=lambda p, **_: p.read_text()), \
+             self.assertRaises(HostError):
+            pull(self.host, REF, "https://example.com/release", "https://issuer.example")
+        self.assertIn(lookup, checked, "the folder the program is looked up in was not checked")
+        self.assertEqual(self.host.processes, [], "a linked cosign ran")
 
     def test_a_cosign_others_can_change_is_refused(self):
         folder = self.state / "usr-bin"

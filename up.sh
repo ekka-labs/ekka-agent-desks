@@ -1192,7 +1192,7 @@ server_ekka() {
 registry_dir() { install -d -m 0700 -o root -g root "$DESKS_STATE/secrets/registry"; echo "$DESKS_STATE/secrets/registry"; }
 registry_login() {
   local host=$1 user=$2 token scopes cfg
-  [[ $host =~ ^[a-z0-9.-]+(:[0-9]+)?$ && -n $user && $user =~ ^[A-Za-z0-9._-]+$ ]] \
+  [[ $host =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ && -n $user && $user =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "usage: <token> | sudo ekka desk registry login <host> <user>   (the token comes on stdin, never as an argument)"
   [[ -t 0 ]] && die "the token comes from a pipe, never typed at a terminal: <token source> | sudo ekka desk registry login $host $user"
   IFS= read -r -d '' token || true; token=${token%$'\n'}

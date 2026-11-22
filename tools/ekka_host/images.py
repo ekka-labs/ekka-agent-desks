@@ -1,6 +1,5 @@
 """Pull an immutable image with temporary, private Docker credentials."""
 import json
-import os
 from pathlib import Path
 import re
 import stat
@@ -8,7 +7,7 @@ import tempfile
 from urllib.parse import urlsplit
 
 from .files import root_directory
-from .registry import docker_config, read_credential
+from .registry import TEMPORARY, docker_config, read_credential, registry_use
 from .runtime import HostError, STATE
 
 IMAGE = re.compile(r"[a-z0-9.-]+(?::[0-9]+)?(?:/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}")
@@ -18,19 +17,21 @@ ROOT_UID = 0
 
 
 def cosign_path():
-    """The first installed cosign: a root-owned executable regular file in a root-owned folder chain."""
+    """The first installed cosign: a root-owned executable regular file, never a link, whose own folder chain (the
+    path that is looked up, not wherever a link leads) is root-owned and not writable by others."""
     candidates = COSIGN
     for candidate in candidates:
+        path = Path(candidate)
         try:
-            Path(candidate).lstat()
+            info = path.lstat()
         except FileNotFoundError:
             continue
-        real = Path(os.path.realpath(candidate))
-        root_directory(real.parent)
-        info = real.lstat()
+        root_directory(path.parent)
+        if stat.S_ISLNK(info.st_mode):
+            raise HostError("cosign at " + candidate + " is a link; install the binary itself there")
         if not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & 0o022 or not info.st_mode & 0o111:
             raise HostError("cosign at " + candidate + " must be a root-owned executable that others cannot change")
-        return str(real)
+        return str(path)
     raise HostError("cosign is not installed in " + " or ".join(candidates) + "; nothing was pulled")
 
 
@@ -57,7 +58,7 @@ def pull(runtime, ref, identity=None, issuer=None):
     action = "image pull " + ref
     runtime.audit(action, "requested")
     try:
-        with tempfile.TemporaryDirectory(prefix=".image-pull-", dir=secrets) as folder:
+        with registry_use(STATE), tempfile.TemporaryDirectory(prefix=TEMPORARY[1], dir=secrets) as folder:
             config = Path(folder) / "docker"
             config.mkdir(mode=0o700)
             docker = ["/usr/bin/docker", "--config", docker_config(config, host)]

@@ -166,3 +166,31 @@ class RegistryReviewFixes(unittest.TestCase):
              patch("sys.stdin", io.StringIO(TOKEN + "\n")), contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(HostError):
                 registry.read_token(Terminal())
+
+    def test_logout_removes_a_temporary_config_a_killed_pull_left(self):
+        left = self.state / "secrets" / ".image-pull-abc123" / "docker"
+        left.mkdir(parents=True)
+        (left / "config.json").write_text(json.dumps({"auths": {"registry.example": {"auth": TOKEN}}}))
+        old = self.state / "secrets" / ".image-pull.XYZ123"        # up.sh's, from long ago
+        old.mkdir()
+        os.utime(old, (1, 1))
+        recent = self.state / "secrets" / ".registry-login.ABC456"  # up.sh's, maybe still running
+        recent.mkdir()
+        self.login()
+        registry.logout(self.host, "registry.example")
+        names = sorted(p.name for p in (self.state / "secrets").iterdir())
+        self.assertEqual(names, [".registry-login.ABC456", "registry"], "a credential stayed in a temporary config")
+
+    def test_logout_waits_for_a_live_pull(self):
+        import fcntl
+        live = self.state / "secrets" / ".image-pull-live01"
+        live.mkdir()
+        fd = os.open(self.state / "registry.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)           # a pull is running
+            with self.assertRaisesRegex(HostError, "running"):
+                registry.logout(self.host, "registry.example")
+        finally:
+            os.close(fd)
+        self.assertTrue(live.exists(), "a live pull's folder was removed")
+

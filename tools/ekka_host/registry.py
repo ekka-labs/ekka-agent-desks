@@ -1,12 +1,17 @@
 """Root-owned registry credentials; values enter through hidden input or stdin."""
 import base64
+import contextlib
+import fcntl
 import getpass
 import json
 import os
 from pathlib import Path
 import re
+import shutil
+import stat
 import sys
 import tempfile
+import time
 import warnings
 
 from .files import atomic_secret, private_destination, root_directory, root_file
@@ -69,6 +74,48 @@ def docker_config(folder, host, user=None, token=None):
     return str(folder)
 
 
+# Temporary Docker configs: this command's own, and up.sh's (mktemp names). A credential can be left in one if the
+# process that made it was killed; logout removes them while no login or pull is running.
+TEMPORARY = (".registry-login-", ".image-pull-")
+LEGACY_TEMPORARY = (".registry-login.", ".image-pull.")
+LEGACY_AGE = 3600       # up.sh takes no lock, so only its folders older than any pull are removed
+
+
+@contextlib.contextmanager
+def registry_use(state, exclusive=False):
+    """Logins and pulls share this lock; logout takes it alone, so it never removes a live pull's folder."""
+    fd = os.open(Path(state) / "registry.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+            raise HostError("the registry lock must be a private root-owned regular file")
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HostError("a registry login, pull or logout is running; run this again when it finishes") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def remove_abandoned(base):
+    """Temporary Docker configs a killed login or pull left behind. Call only under registry_use(exclusive=True)."""
+    removed = []
+    now = time.time()
+    for entry in os.scandir(base):
+        native, legacy = entry.name.startswith(TEMPORARY), entry.name.startswith(LEGACY_TEMPORARY)
+        if not (native or legacy):
+            continue
+        info = os.lstat(entry.path)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            continue
+        if legacy and now - info.st_mtime < LEGACY_AGE:
+            continue
+        shutil.rmtree(entry.path)
+        removed.append(entry.name)
+    return removed
+
+
 def read_credential(path):
     try:
         path.lstat()
@@ -122,7 +169,7 @@ def login(runtime, host, user, token_source=read_token):
                       if line.lower().startswith("x-oauth-scopes:")]
             if scopes != ["read:packages"]:
                 raise HostError("GitHub token must have exactly read:packages scope; nothing was kept")
-        with tempfile.TemporaryDirectory(prefix=".registry-login-", dir=base) as folder:
+        with registry_use(STATE), tempfile.TemporaryDirectory(prefix=TEMPORARY[0], dir=base) as folder:
             runtime.run(["/usr/bin/docker", "--config", docker_config(folder, host), "login", host,
                          "--username", user, "--password-stdin"], stdin=token)
             if not exists:
@@ -159,13 +206,18 @@ def show(runtime):
 def logout(runtime, host):
     if not HOST.fullmatch(host):
         raise HostError("registry logout needs a registry host")
-    _, store, exists = directory(runtime)
+    base, store, exists = directory(runtime)
     target = store / (host + ".env")
     if exists:
         private_destination(target)
     action = "registry logout " + host
     runtime.audit(action, "requested")
     try:
+        with registry_use(STATE, exclusive=True):
+            removed = remove_abandoned(base)
+        if removed:
+            runtime.output("Removed " + str(len(removed)) + " temporary Docker configuration(s) an interrupted "
+                           "login or pull left behind")
         if exists:
             target.unlink(missing_ok=True)
             fd = os.open(store, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

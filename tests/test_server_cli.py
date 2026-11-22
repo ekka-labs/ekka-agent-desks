@@ -336,6 +336,14 @@ esac
             self.assertIn("curl", log.read_text().split())
             self.assertNotIn("docker login", log.read_text(), "a token wider than read:packages reached docker")
 
+    def test_a_trailing_dot_cannot_skip_the_github_scope_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d, scopes="repo, read:packages")
+            for host in ("ghcr.io.", ".ghcr.io", "ghcr.io.:443"):
+                r = self.run_verb(d, "registry", "login", host, "someone", stdin="ghp_" + "a" * 36)
+                self.assertEqual(r.returncode, 1, host)
+            self.assertNotIn("docker login", log.read_text(), "a token reached docker without the scope check")
+
     def test_a_login_never_reaches_a_host_credential_helper(self):
         with tempfile.TemporaryDirectory() as d:
             log = self.box(d)
