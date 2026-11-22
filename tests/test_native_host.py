@@ -161,6 +161,35 @@ class NativeHostTests(unittest.TestCase):
                 with patch("ekka_host.runtime.SOCKET", path):
                     self.assertFalse(Runtime().socket_exists())
 
+    def test_as_root_a_checkout_others_can_change_is_refused_before_any_import(self):
+        # As root, code is imported only from the root-owned installed copy.
+        command = Path(__file__).resolve().parents[1] / "ekka-desk-host"
+        child = ("import os, runpy, sys; path = sys.argv[1]; os.geteuid = lambda: 0; sys.argv = [path, 'status']; "
+                 "runpy.run_path(path, run_name='__main__')")
+        result = subprocess.run([sys.executable, "-c", child, str(command)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("sudo /usr/local/lib/ekka-desks/ekka-desk-host", result.stderr)
+
+    def test_the_trust_check_accepts_only_a_tree_root_owns_and_nobody_else_can_change(self):
+        command = Path(__file__).resolve().parents[1] / "ekka-desk-host"
+        launcher = __import__("runpy").run_path(str(command), run_name="ekka_desk_host_under_test")
+        real = Path.lstat
+
+        def as_installed(path, loose=None):
+            info = real(path)
+            mode = info.st_mode & ~0o022
+            if loose is not None and Path(path) == loose:
+                mode |= 0o002
+            return os.stat_result((mode, info.st_ino, info.st_dev, info.st_nlink, 0, 0, info.st_size,
+                                   info.st_atime, info.st_mtime, info.st_ctime))
+        root = command.parent
+        with patch.object(Path, "lstat", lambda path: as_installed(path)):
+            self.assertTrue(launcher["trusted"](root))
+        loose = root / "tools" / "ekka_host" / "gateway.py"
+        with patch.object(Path, "lstat", lambda path: as_installed(path, loose)):
+            self.assertFalse(launcher["trusted"](root), "a file others can change was trusted")
+        self.assertFalse(launcher["trusted"](root), "this checkout is not root-owned, yet it was trusted")
+
     def test_entry_point_has_help_without_privilege(self):
         command = Path(__file__).resolve().parents[1] / "ekka-desk-host"
         result = subprocess.run([sys.executable, str(command), "--help"], capture_output=True, text=True)

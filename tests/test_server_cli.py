@@ -379,6 +379,12 @@ class TheRootOwnedCopy(unittest.TestCase):
         self.assertEqual(sorted(read - copied), [], "folders the tools read that the root-owned copy leaves out")
         self.assertTrue({"tools", "up.sh"} <= copied)
 
+    def test_the_copy_holds_the_native_host_command(self):
+        # ekka-desk-host refuses to run as root from anywhere but this copy (docs/NATIVE-HOST.md).
+        up = (ROOT/"up.sh").read_text()
+        line = next(l for l in up.splitlines() if l.strip().startswith('cp -a ') and '$SNAPSHOT.new/' in l)
+        self.assertIn("ekka-desk-host", line.split('"$SNAPSHOT.new/"')[0].split())
+
 
 if __name__ == '__main__':
     unittest.main()
