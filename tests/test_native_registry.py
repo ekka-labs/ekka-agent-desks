@@ -1,5 +1,8 @@
 """Native registry operations keep input off argv and preserve failed updates."""
+import contextlib
+import getpass
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -121,3 +124,45 @@ class RegistryTests(unittest.TestCase):
         for value in ("", TOKEN + "\nsecond", "a" * 8193, "a" * 8192 + "\r\nextra"):
             with self.assertRaises(HostError):
                 registry.read_token(io.StringIO(value))
+
+
+class RegistryReviewFixes(unittest.TestCase):
+    """A registry port keeps the GitHub scope check, no host helper keeps a credential, and input stays hidden."""
+    setUp = RegistryTests.setUp   # the same fixture, without running RegistryTests's cases again
+    login = RegistryTests.login   # the same fixture, without running RegistryTests's cases again
+
+    def test_a_registry_port_does_not_skip_the_github_scope_check(self):
+        self.host.scope = "repo, read:packages"
+        with self.assertRaises(HostError):
+            self.login("ghcr.io:443", CLASSIC)
+        self.assertFalse((self.state / "secrets/registry/ghcr.io:443.env").exists())
+        self.host.scope = "read:packages"
+        self.login("ghcr.io:443", CLASSIC)
+        self.assertEqual(self.host.processes[-2][0][0], "/usr/bin/curl")
+
+    def test_login_never_stores_the_credential_in_a_host_helper(self):
+        helper = {}
+        original = self.host.run
+
+        def docker(args, allowed=(0,), stdin=None, timeout=90):
+            if args[:1] == ["/usr/bin/docker"] and "login" in args:
+                folder = Path(args[args.index("--config") + 1])
+                try:
+                    config = json.loads((folder / "config.json").read_text())
+                except FileNotFoundError:
+                    config = {}
+                if not (config.get("credsStore") or config.get("credHelpers") or config.get("auths")):
+                    helper[args[args.index("login") + 1]] = stdin   # Docker picked pass or secretservice
+            return original(args, allowed, stdin, timeout)
+        self.host.run = docker
+        self.login()
+        self.assertEqual(helper, {}, "the credential was stored in the host's credential helper")
+
+    def test_a_terminal_that_cannot_hide_input_is_refused(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        with patch("getpass.getpass", side_effect=lambda prompt: getpass.fallback_getpass(prompt)), \
+             patch("sys.stdin", io.StringIO(TOKEN + "\n")), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(HostError):
+                registry.read_token(Terminal())

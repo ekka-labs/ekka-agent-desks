@@ -1,4 +1,5 @@
 """Immutable pulls verify the digest and keep Docker credentials temporary."""
+import contextlib
 import json
 from pathlib import Path
 import subprocess
@@ -37,6 +38,41 @@ class ImageHost(Host):
         return subprocess.CompletedProcess(args, 0, out, "")
 
 
+def contains_auth(folder):
+    """Docker CLI's ConfigFile.ContainsAuth (cli/config/configfile/file.go): a credsStore, a credHelpers entry or an
+    auths entry. Without one, LoadDefaultConfigFile selects a host credential helper (credentials.DetectDefaultStore:
+    pass or secretservice, when installed)."""
+    try:
+        config = json.loads((Path(folder) / "config.json").read_text())
+    except FileNotFoundError:
+        return False
+    return bool(config.get("credsStore") or config.get("credHelpers") or config.get("auths"))
+
+
+class DockerWithAHelper(ImageHost):
+    """Docker on a host with a credential helper installed: what lands in the helper outlives the pull."""
+
+    def __init__(self, cosign=("/usr/local/bin/cosign",)):
+        super().__init__()
+        self.helper = {}
+        self.helper_reads = 0
+        self.cosign = set(cosign)
+
+    def run(self, args, allowed=(0,), stdin=None, timeout=90):
+        named = [a for a in args if a.endswith("/cosign")]
+        if named and named[0] not in self.cosign:
+            self.processes.append((args, stdin))
+            raise HostError("command did not finish; inspect the host before retrying")   # exec: not found
+        if "--config" in args and not contains_auth(args[args.index("--config") + 1]):
+            self.processes.append((args, stdin))
+            if "login" in args:
+                self.helper[args[args.index("login") + 1]] = stdin
+            else:
+                self.helper_reads += 1
+            return subprocess.CompletedProcess(args, 0, json.dumps(self.found) if "inspect" in args else "", "")
+        return super().run(args, allowed, stdin, timeout)
+
+
 class NativeImageTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
@@ -46,10 +82,12 @@ class NativeImageTests(unittest.TestCase):
         self.secrets.mkdir()
         self.host = ImageHost()
 
-    def invoke(self, **kwargs):
+    def invoke(self, real_cosign=False, **kwargs):
+        cosign = patch("ekka_host.images.cosign_path", return_value="/usr/local/bin/cosign", create=True)
         with patch("ekka_host.images.STATE", self.state), \
              patch("ekka_host.images.root_directory", return_value=self.secrets), \
-             patch("ekka_host.registry.root_file", side_effect=lambda p, **_: p.read_text()):
+             patch("ekka_host.registry.root_file", side_effect=lambda p, **_: p.read_text()), \
+             (contextlib.nullcontext() if real_cosign else cosign):
             pull(self.host, kwargs.pop("ref", REF), **kwargs)
 
     def save_credential(self, text=None):
@@ -126,3 +164,49 @@ class NativeImageTests(unittest.TestCase):
                  patch("ekka_host.files.os.fstat", return_value=file):
                 with self.assertRaises(HostError):
                     root_file(source, private=True)
+
+
+class PullReviewFixes(unittest.TestCase):
+    """Credentials stay out of host helpers, asked-for signature checks always run, and cosign's location."""
+    setUp = NativeImageTests.setUp   # the same fixture, without running NativeImageTests's cases again
+    invoke = NativeImageTests.invoke   # the same fixture, without running NativeImageTests's cases again
+    save_credential = NativeImageTests.save_credential   # the same fixture, without running NativeImageTests's cases again
+
+    def test_a_credential_never_reaches_a_host_credential_helper(self):
+        self.host = DockerWithAHelper()
+        self.save_credential()
+        self.invoke()
+        self.assertEqual(self.host.helper, {}, "the registry credential was stored in the host's helper")
+        self.assertEqual(self.host.helper_reads, 0, "the pull read the host's helper")
+        self.assertEqual(self.host.records[-1][1], "verified_digest")
+
+    def test_empty_signing_options_never_skip_the_signature_check(self):
+        for identity, issuer in (("", ""), ("", "https://issuer.example"), ("https://example.com/release", "")):
+            with self.subTest(identity=identity, issuer=issuer), self.assertRaises(HostError):
+                self.invoke(identity=identity, issuer=issuer)
+        self.assertEqual(self.host.processes, [], "a pull ran without the signature check it was asked for")
+
+    def test_cosign_is_found_in_its_other_trusted_location(self):
+        folder = self.state / "usr-bin"
+        folder.mkdir()
+        cosign = folder / "cosign"
+        cosign.write_text("#!/bin/sh\n")
+        cosign.chmod(0o755)
+        self.host = DockerWithAHelper(cosign=(str(cosign.resolve()),))
+        with patch("ekka_host.images.COSIGN", (str(self.state / "usr-local-bin/cosign"), str(cosign)), create=True), \
+             patch("ekka_host.images.ROOT_UID", os.getuid(), create=True):
+            self.invoke(real_cosign=True, identity="https://example.com/release", issuer="https://issuer.example")
+        self.assertEqual(self.host.records[-1][1], "verified_digest")
+        self.assertTrue(any(str(cosign.resolve()) in a for a, _ in self.host.processes))
+
+    def test_a_cosign_others_can_change_is_refused(self):
+        folder = self.state / "usr-bin"
+        folder.mkdir()
+        cosign = folder / "cosign"
+        cosign.write_text("#!/bin/sh\n")
+        cosign.chmod(0o777)
+        with patch("ekka_host.images.COSIGN", (str(cosign),), create=True), \
+             patch("ekka_host.images.ROOT_UID", os.getuid(), create=True), \
+             self.assertRaisesRegex(HostError, "cosign"):
+            self.invoke(real_cosign=True, identity="https://example.com/release", issuer="https://issuer.example")
+        self.assertEqual(self.host.processes, [])

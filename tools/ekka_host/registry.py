@@ -1,10 +1,13 @@
 """Root-owned registry credentials; values enter through hidden input or stdin."""
+import base64
 import getpass
+import json
 import os
 from pathlib import Path
 import re
 import sys
 import tempfile
+import warnings
 
 from .files import atomic_secret, private_destination, root_directory, root_file
 from .runtime import HostError, STATE
@@ -22,7 +25,14 @@ def read_token(stream=None):
     stream = sys.stdin if stream is None else stream
     try:
         if stream.isatty():
-            token = getpass.getpass("Registry read credential (hidden): ")
+            # getpass falls back to VISIBLE input with only a warning when it cannot switch echo off. Refuse instead.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                try:
+                    token = getpass.getpass("Registry read credential (hidden): ")
+                except getpass.GetPassWarning:
+                    raise HostError("this terminal cannot hide input; pipe the credential on stdin instead. "
+                                    "Nothing was kept") from None
         else:
             token = stream.read(CAP + 3)
             if len(token) > CAP + 2:
@@ -36,6 +46,27 @@ def read_token(stream=None):
     if not valid_token(token):
         raise HostError("input must contain one registry credential without spaces or additional lines")
     return token
+
+
+def hostname(host):
+    """The registry's name without a port: the policy applies to the registry, whatever port reaches it."""
+    return host.rsplit(":", 1)[0] if ":" in host else host
+
+
+def github_packages(host):
+    name = hostname(host)
+    return name == "ghcr.io" or name.endswith(".pkg.github.com")
+
+
+def docker_config(folder, host, user=None, token=None):
+    """A private Docker config that names an entry for the registry. Docker picks a host credential helper (pass,
+    secretservice) only for a config with NO auth entry, so with this one every credential stays in this file and
+    goes when the folder does. Returns the folder to pass to --config."""
+    entry = {} if user is None else {"auth": base64.b64encode((user + ":" + token).encode()).decode()}
+    fd = os.open(Path(folder) / "config.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump({"auths": {host: entry}}, stream)
+    return str(folder)
 
 
 def read_credential(path):
@@ -81,7 +112,7 @@ def login(runtime, host, user, token_source=read_token):
         token = token_source()
         if not valid_token(token):
             raise HostError("input must contain one registry credential without spaces or additional lines")
-        if host == "ghcr.io" or host.endswith(".pkg.github.com"):
+        if github_packages(host):
             if not re.fullmatch(r"ghp_[A-Za-z0-9]+", token):
                 raise HostError("GitHub Packages requires a classic token with only read:packages scope")
             headers = runtime.run(["/usr/bin/curl", "-q", "--fail", "--silent", "--show-error",
@@ -92,7 +123,7 @@ def login(runtime, host, user, token_source=read_token):
             if scopes != ["read:packages"]:
                 raise HostError("GitHub token must have exactly read:packages scope; nothing was kept")
         with tempfile.TemporaryDirectory(prefix=".registry-login-", dir=base) as folder:
-            runtime.run(["/usr/bin/docker", "--config", folder, "login", host,
+            runtime.run(["/usr/bin/docker", "--config", docker_config(folder, host), "login", host,
                          "--username", user, "--password-stdin"], stdin=token)
             if not exists:
                 store.mkdir(mode=0o700)

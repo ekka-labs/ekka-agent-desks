@@ -291,6 +291,77 @@ class TheRegistryAndImageVerbs(unittest.TestCase):
             r = self.run_verb(d, "registry", "logout", "ghcr.io"); self.assertEqual(r.returncode, 0, r.stderr)
 
 
+class TheRegistryAndImageReviewFixes(unittest.TestCase):
+    """The up.sh side: a registry port keeps the GitHub scope check, no host helper keeps a credential, and an
+    asked-for signature check always runs. docker, curl and cosign are stubs that log;
+    docker behaves as Docker CLI does with a host credential helper installed: a login whose --config folder has no
+    auth entry goes to the helper (configfile ContainsAuth, credentials.DetectDefaultStore)."""
+    run_verb = TheRegistryAndImageVerbs.run_verb   # the same fixture, without running TheRegistryAndImageVerbs's cases again
+
+    REF = "ghcr.io/x/y@sha256:" + "a" * 64
+
+    def box(self, d, scopes="read:packages"):
+        log = Path(d, "log")
+        log.write_text("")
+        stubs = {
+            "id": "#!/bin/bash\necho 0\n",
+            "curl": f"#!/bin/bash\necho curl >> {log}\nprintf 'HTTP/2 200\\r\\nx-oauth-scopes: {scopes}\\r\\n\\r\\n'\n",
+            "cosign": f"#!/bin/bash\necho cosign >> {log}\n",
+            "install": "#!/bin/bash\nargs=(); while (($#)); do case $1 in -o|-g) shift 2 ;; *) args+=(\"$1\"); shift ;; esac; done\n"
+                       "exec /usr/bin/install \"${args[@]}\"\n",
+            "docker": f"""#!/bin/bash
+cfg=""; [[ $1 == --config ]] && {{ cfg=$2; shift 2; }}
+case $1 in
+  login) if [[ -n $cfg ]] && grep -q '"auths": *{{ *"' "$cfg/config.json" 2>/dev/null; then echo "docker login file" >> {log}
+         else echo "docker login helper $(cat)" >> {log}; fi ;;
+  pull) echo "docker pull $*" >> {log} ;;
+  image) echo "{self.REF}" ;;
+  *) : ;;
+esac
+""",
+        }
+        for name, text in stubs.items():
+            Path(d, name).write_text(text)
+            os.chmod(Path(d, name), 0o755)
+        state = Path(d, "state")
+        (state / "secrets").mkdir(parents=True)
+        (state / "up.env").write_text("DESKS_NAME=desks.example.test\n")
+        return log
+
+    def test_a_registry_port_does_not_skip_the_github_scope_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d, scopes="repo, read:packages")
+            r = self.run_verb(d, "registry", "login", "ghcr.io:443", "someone", stdin="ghp_" + "a" * 36)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("curl", log.read_text().split())
+            self.assertNotIn("docker login", log.read_text(), "a token wider than read:packages reached docker")
+
+    def test_a_login_never_reaches_a_host_credential_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            r = self.run_verb(d, "registry", "login", "registry.example.test", "someone", stdin="planted-token")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("helper", log.read_text(), "the token went to the host's credential helper")
+            self.assertIn("docker login file", log.read_text())
+
+    def test_a_pull_with_a_kept_credential_never_reaches_a_host_credential_helper(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            folder = Path(d, "state", "secrets", "registry")
+            folder.mkdir()
+            (folder / "ghcr.io.env").write_text("REGISTRY_USER=someone\nREGISTRY_TOKEN=planted-token\n")
+            r = self.run_verb(d, "image", "pull", self.REF)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("helper", log.read_text())
+
+    def test_empty_signing_options_never_skip_the_signature_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = self.box(d)
+            r = self.run_verb(d, "image", "pull", self.REF, "--signed-by", "", "--issuer", "")
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertNotIn("docker pull", log.read_text(), "pulled without the signature check it was asked for")
+
+
 class TheRootOwnedCopy(unittest.TestCase):
     """`sudo ekka desk connect|invite|revoke|plans|grant|registry|image` run up.sh from the root-owned copy the installer
     makes (snapshot_stack), never the checkout. Every repository folder the tools read by ROOT must be in that copy.

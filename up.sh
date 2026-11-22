@@ -1166,7 +1166,8 @@ registry_login() {
   cfg=$(mktemp -d "$DESKS_STATE/secrets/.registry-login.XXXXXX"); chmod 0700 "$cfg"
   # shellcheck disable=SC2064  # expanded now on purpose: the folder's name
   trap "rm -rf '$cfg'" EXIT
-  if [[ $host == ghcr.io || $host == *.pkg.github.com ]]; then
+  local name=${host%:*}   # the registry without its port: ghcr.io:443 is still GitHub Packages
+  if [[ $name == ghcr.io || $name == *.pkg.github.com ]]; then
     # GitHub Packages: a CLASSIC token whose scopes are exactly read:packages. Its npm registry refuses fine-grained tokens,
     # and anything wider than read:packages is more than a pull needs. The header reaches curl from a file, never argv.
     [[ $token == ghp_* ]] || { token=; die "GitHub Packages needs a classic token (ghp_…) with the scope read:packages only; nothing was kept"; }
@@ -1175,7 +1176,9 @@ registry_login() {
     [[ $scopes == "read:packages" ]] || { token=; die "the token's scopes are '${scopes:-none}', not exactly read:packages; nothing was kept"; }
     ok "GitHub token: scope read:packages only"
   fi
-  mkdir -p "$cfg/docker"
+  # A config that names the registry: Docker picks a host credential helper only for a config with no auth entry,
+  # so the credential stays in this throwaway folder and never reaches a helper's store.
+  mkdir -p "$cfg/docker"; ( umask 077; printf '{"auths":{"%s":{}}}\n' "$host" > "$cfg/docker/config.json" )
   printf '%s' "$token" | docker --config "$cfg/docker" login "$host" -u "$user" --password-stdin >/dev/null 2>&1 \
     || { token=; die "$host refused the credential for $user; nothing was kept"; }
   docker --config "$cfg/docker" logout "$host" >/dev/null 2>&1 || true
@@ -1193,16 +1196,19 @@ registry_show() {
   (( n > 0 )) || echo "no registry credential kept; public images need none"
 }
 image_pull() {  # image_pull <ref@sha256:…> [--signed-by <identity> --issuer <url>]: by digest, signature checked when asked, no login saved
-  local ref="" identity="" issuer=""
+  local ref="" identity="" issuer="" asked=0
   while (( $# )); do case "$1" in
-    --signed-by) identity=${2:-}; shift 2 ;; --issuer) issuer=${2:-}; shift 2 ;;
+    --signed-by) identity=${2:-}; asked=1; shift 2 ;; --issuer) issuer=${2:-}; asked=1; shift 2 ;;
     --*) die "usage: sudo ekka desk image pull <registry>/<name>@sha256:<64 hex> [--signed-by <certificate identity> --issuer <oidc issuer>]" ;;
     *) [[ -z $ref ]] || die "one image at a time"; ref=$1; shift ;; esac; done
   [[ $ref =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$ ]] \
     || die "the image must be <registry>/<name>@sha256:<64 hex>: a digest names exactly one image, a tag can move"
   [[ -z $identity && -z $issuer || -n $identity && -n $issuer ]] || die "--signed-by and --issuer go together"
+  # Asked for, even with empty values, a signature check is never skipped.
+  (( asked == 0 )) || [[ -n $identity ]] || die "--signed-by and --issuer must both name a value; nothing was pulled"
   local host=${ref%%/*} digest=${ref##*@} cfg cred
   cfg=$(mktemp -d "$DESKS_STATE/secrets/.image-pull.XXXXXX"); chmod 0700 "$cfg"; mkdir -p "$cfg/docker"
+  ( umask 077; printf '{"auths":{"%s":{}}}\n' "$host" > "$cfg/docker/config.json" )   # no host credential helper
   # shellcheck disable=SC2064
   trap "docker --config '$cfg/docker' logout '$host' >/dev/null 2>&1 || true; rm -rf '$cfg'" EXIT
   cred=$DESKS_STATE/secrets/registry/$host.env
