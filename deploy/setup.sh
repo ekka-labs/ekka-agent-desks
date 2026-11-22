@@ -35,26 +35,36 @@ kc_env() {
 }
 ekka_run() { EKKA_ENV="$1" enclave_ekka "${@:2}"; }   # as the Enclave's user, with its home and environment
 
-# The supervisor binary every desk runs, from the pinned image, checked against the committed sha256. Run again
-# after a pin bump: the gateway does not start with a supervisor that is not the pinned one (tools/gateway_preflight.py).
-# The new file replaces the old in one rename, so a desk already running keeps the binary it started with.
-# The image is one index for every processor type; the binary taken from it is this machine's, by name, and the
-# sha256 it must match is this machine's own pin.
-stage_supervisor() {
-  local machine platform; machine=$(uname -m)
+# Stage and verify both release images without starting a process. The old gateway
+# retains its running desks and bind-mounted inode. Only the new gateway consumes
+# the two image references from its own container environment.
+stage_supervisor() (
+  set -euo pipefail
+  local machine platform component image member want dst c= tmp
+  machine=$(uname -m)
   case $machine in x86_64) platform=linux/amd64 ;; aarch64) platform=linux/arm64 ;;
-    *) die "no supervisor is pinned for this machine's processor type ($machine)" ;; esac
-  local dst=$DESKS_STATE/supervisor/openshell-supervisor want; want=$(pins "['supervisor']['platforms']['$machine']['binary_sha256']")
-  if [[ -f $dst ]] && echo "$want  $dst" | sha256sum -c - >/dev/null 2>&1; then say "supervisor: already OpenShell $(pins "['version']") ($machine)"; return; fi
-  say "the supervisor binary ($machine), from the pinned image, checked against the committed sha256"
+    *) die "no runtime is pinned for $machine" ;; esac
   install -d -m 0755 "$DESKS_STATE/supervisor"
-  local c; c=$(docker create --platform "$platform" "$(pins "['supervisor']['image']")" x)
-  docker cp "$c:$(pins "['supervisor']['binary_in_image']")" "$dst.new" >/dev/null; docker rm "$c" >/dev/null
-  echo "$want  $dst.new" | sha256sum -c - >/dev/null \
-    || { rm -f "$dst.new"; die "the supervisor binary does not match deploy/pins.json; nothing was changed"; }
-  chmod 0755 "$dst.new"; mv -f "$dst.new" "$dst"
-  say "supervisor: OpenShell $(pins "['version']") ($machine); desks started from now on use it"
-}
+  tmp=$(mktemp -d "$DESKS_STATE/supervisor/.stage.XXXXXXXX")
+  trap 'if [[ -n $c ]]; then docker rm "$c" >/dev/null || true; fi; rm -rf -- "$tmp"' EXIT
+  for component in supervisor sandbox; do
+    image=$(pins "['$component']['image']")
+    member=$(pins "['$component']['binary_in_image']")
+    want=$(pins "['$component']['platforms']['$machine']['binary_sha256']")
+    docker image inspect "$image" >/dev/null 2>&1 || docker pull --platform "$platform" "$image" >/dev/null
+    c=$(docker create --platform "$platform" "$image" x)
+    docker cp "$c:$member" "$tmp/$component" >/dev/null
+    docker rm "$c" >/dev/null
+    c=
+    echo "$want  $tmp/$component" | sha256sum -c - >/dev/null || die "$component does not match its release pin"
+  done
+  # Keep the existing supervisor checksum check in gateway preflight. The driver
+  # runs from immutable images, never from this host-side attestation file.
+  dst="$DESKS_STATE/supervisor/openshell-supervisor"
+  chmod 0755 "$tmp/supervisor"
+  mv -f "$tmp/supervisor" "$dst"
+  say "verified the matching supervisor and sandbox runtime for $machine"
+)
 
 # Before any compose call that can start the gateway: refuse, by name, what would let it hand credentials out
 # or run with an unpinned supervisor (tools/gateway_preflight.py).

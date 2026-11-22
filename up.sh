@@ -653,10 +653,12 @@ sync_profiles() {  # the gateway's profiles = providers/, or this install's own;
     if [[ $src == providers/* ]]; then from="providers/"; else from="$src (this install's own)"; fi
     if ! v=$("$OS" -g ekka-agent-desks provider profile export --global "$p" 2>/dev/null | sed -n 's/^resource_version: *//p'); then v=; fi
     if [[ -z $v ]]; then
-      "$OS" -g ekka-agent-desks provider profile import --global --file "$src" >/dev/null && ok "profile $p imported from $from"
+      "$OS" -g ekka-agent-desks provider profile import --global --file "$src" >/dev/null || exit 1
+      ok "profile $p imported from $from"
     else
       t=$(mktemp --suffix .yaml); sed "0,/^id: .*/s//&\nresource_version: $v/" "$src" > "$t"
-      "$OS" -g ekka-agent-desks provider profile update --global --file "$t" "$p" >/dev/null && ok "profile $p updated from $from"
+      "$OS" -g ekka-agent-desks provider profile update --global --file "$t" "$p" >/dev/null || { rm -f "$t"; exit 1; }
+      ok "profile $p updated from $from"
       rm -f "$t"
     fi
   done
@@ -723,11 +725,18 @@ step_desk_admin() {  # desk administration through EKKA: only once up.env runs t
 }
 
 step_admin() {
-  is_done admin && { ok "desk workspace, Enclave membership and profiles: done"; return; }
+  if is_done admin; then
+    if ! is_done "profiles-$OPENSHELL_TAG"; then
+      as_gateway_admin sync_profiles || die "the upgraded gateway catalog could not be refreshed; rerun to retry"
+      done_ "profiles-$OPENSHELL_TAG"
+    fi
+    ok "desk workspace, Enclave membership and profiles: done"; return
+  fi
   say "the gateway's one-time setup (workspace, the Enclave's membership, provider profiles)"
   local sub; sub=$(cd deploy && bash setup.sh enclave-subject)
   as_gateway_admin admin_setup "$sub" || die "the gateway's setup did not finish; desks-setup is disabled again. Re-run to retry"
   done_ admin
+  done_ "profiles-$OPENSHELL_TAG"
   ok "workspace desks, the Enclave as a member, the profiles in providers/; desks-setup disabled again"
 }
 
@@ -819,8 +828,7 @@ edge_current() {
 
 step_start() {
   (cd deploy && DESKS_STATE=$DESKS_STATE bash ./certs.sh bundle >/dev/null) || die "the gateway's CA bundle could not be built"   # system roots + desks CA, and /etc/ekka/desks-ca.crt
-  # A pin bump applies whole or not at all: the supervisor first, then nothing starts the gateway able to hand
-  # desk credentials out.
+  # Stage the immutable images first. The new gateway activates this pair only for new desks.
   (cd deploy && bash setup.sh supervisor >/dev/null) || die "the supervisor binary could not be put in place"
   (cd deploy && bash setup.sh preflight) || die "the gateway preflight refused (above); nothing was started"
   backend_permits_dir   # the adapter's permits folder, before any start (compose never creates it)

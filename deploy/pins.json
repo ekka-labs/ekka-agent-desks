@@ -43,6 +43,21 @@
           "archive_sha256": "cb923d08703b966f7e0e6b1483ed4ba6ed77bc10812c5502bcc1fb6ee0f6ad59"
         }
       }
+    },
+    "sandbox": {
+      "image": "ghcr.io/nvidia/openshell/sandbox@sha256:e57d07cd6cc1fc314b80368d6b51ec6fbf825fb62cd8f081312941180846866f",
+      "binary_in_image": "/openshell-sandbox",
+      "release_checksums": "openshell-sandbox-checksums-sha256.txt",
+      "platforms": {
+        "x86_64": {
+          "release_asset": "openshell-sandbox-x86_64-unknown-linux-musl.tar.gz",
+          "binary_sha256": "6c3afd40f40922c9c84be19460779c951b61c6c542aaa95e4c2c8a4b0e7f48c4"
+        },
+        "aarch64": {
+          "release_asset": "openshell-sandbox-aarch64-unknown-linux-musl.tar.gz",
+          "binary_sha256": "72b5e97099eda1c46f5b0d9a3e2b8d1d922c5a50a7108fb89950bc9d5c3d380f"
+        }
+      }
     }
   },
   "ekka_backend": {

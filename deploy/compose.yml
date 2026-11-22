@@ -105,7 +105,9 @@ services:
       OPENSHELL_DB_URL: "sqlite:/var/lib/openshell/state/gateway.db?mode=rwc"
       HOME: /var/lib/openshell/state
       OPENSHELL_GRPC_ENDPOINT: https://host.openshell.internal:8080
-      OPENSHELL_DOCKER_SUPERVISOR_BIN: ${DESKS_STATE:-/var/lib/ekka-agent-desks}/supervisor/openshell-supervisor
+      OPENSHELL_SUPERVISOR_IMAGE: ghcr.io/nvidia/openshell/supervisor@sha256:f1ec231b5dbe5b6a40c33acb2ac847995aabb959a56134ef6d7d7aa4f43199d3
+      OPENSHELL_SANDBOX_RUNTIME_IMAGE: ghcr.io/nvidia/openshell/sandbox@sha256:e57d07cd6cc1fc314b80368d6b51ec6fbf825fb62cd8f081312941180846866f
+      EKKA_VERIFIED_SUPERVISOR_BIN: ${DESKS_STATE:-/var/lib/ekka-agent-desks}/supervisor/openshell-supervisor
       SSL_CERT_FILE: /tls/ca-bundle.crt        # public roots + the desks CA: the issuer AND public hosts (AWS STS) are trusted
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock          # the ONLY service with the socket: root on this host

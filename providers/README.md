@@ -4,12 +4,12 @@
 
 A provider profile tells the OpenShell gateway three things about a key: which programs on a desk may use it, which hosts it may be sent to, and how it is sent. A profile's key is set on the server, from a pipe: `<key> | sudo ekka desk connect <profile>` ([Operations](../docs/OPERATIONS.md#connect-a-providers-key)). A profile that declares `credentials: []` (public hosts such as package registries) has no key: `sudo ekka desk connect <profile> </dev/null` makes its provider, so a desk created with it reaches those hosts with the programs it names. A live desk never gains a program it was not created with, so this is the way a project's public hosts reach a desk.
 
-These are NVIDIA's own profiles from [OpenShell v0.1.3](https://github.com/NVIDIA/OpenShell/tree/v0.1.3/providers), with the changes below, and EKKA's own `bitbucket` (NVIDIA ships none). `PIN.json` records NVIDIA's commit, each file's SHA-256 and every change. Every profile here is loaded on every server; connecting its key is the only step.
+These are NVIDIA's own profiles from [OpenShell v0.1.9](https://github.com/NVIDIA/OpenShell/tree/v0.1.9/providers), with the changes below, and EKKA's own `bitbucket` (NVIDIA ships none). `PIN.json` records NVIDIA's commit, each file's SHA-256 and every change. Every profile here is loaded on every server; connecting its key is the only step.
 
 | Profile | For | The key | It may reach |
 |---|---|---|---|
 | `claude-code` | the Claude Code agent | an Anthropic API key | `api.anthropic.com` |
-| `codex` | the Codex agent | four ChatGPT sign-in tokens, one per command | `api.openai.com`, `auth.openai.com`, `chatgpt.com`, `ab.chatgpt.com` |
+| `codex` | the Codex agent | one OpenAI API key in the Authorization header | `api.openai.com` |
 | `github` | `git` and `gh` | a GitHub token | `github.com` (for `git`), `api.github.com` (read only) |
 | `bitbucket` | `git` | a Bitbucket scoped API token (repository read) | `bitbucket.org` (clone and fetch, for `git`), `api.bitbucket.org` (read only) |
 
@@ -38,7 +38,7 @@ sudo cat /root/agent.key | sudo ./up.sh connect <profile>   # on the server
 sudo ./up.sh ekka desk create code-desk --provider <profile>   # on the server
 ```
 
-`up.sh connect` sets a profile that takes one key. `codex` takes several, so it is refused there today.
+`up.sh connect` sets a profile that takes one key. The Codex profile takes one OpenAI API key. OAuth refresh inside a desk is unsupported because the response would return new tokens to the sandbox and a rotated refresh token would invalidate the gateway’s stored copy. Use gateway-side refresh only with a provider that supports keeping token issuance and rotation outside desks. Existing OAuth connections need a separately supplied API key.
 
 To add a kind of connection the server does not have yet, on the server: put its `.yaml` in `/var/lib/ekka-agent-desks/providers.local/` (or here) and run `sudo ./up.sh profiles`. A person's `ekka desk profile add` is refused.
 

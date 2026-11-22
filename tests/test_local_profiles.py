@@ -80,6 +80,21 @@ fake_os() {{ echo "$*" >> {self.log}; return 0; }}   # export prints no version:
         r = self.run_up("sync_profiles")
         self.assertIn(f"ok: profile my-model imported from {own} (this install's own)", r.stdout, r.stderr)
 
+    def test_failed_catalog_update_is_returned_to_the_upgrade(self):
+        call = """
+fake_os() {
+  case "$*" in
+    *"profile export"*) echo 'resource_version: 7' ;;
+    *"profile update"*) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+sync_profiles
+"""
+        result = self.run_up(call)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("updated from", result.stdout)
+
     def test_an_unsafe_profile_late_in_the_order_stops_the_sync_before_any_import(self):
         # "zz-late" sorts after every shipped profile: nothing may be imported first.
         self.own("zz-late", "id: zz-late\n", mode=0o666)

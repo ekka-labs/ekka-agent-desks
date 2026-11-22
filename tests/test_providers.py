@@ -12,7 +12,7 @@ HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "providers
 # The hosts a key may reach, per profile. A new host is a decision, not an edit: the key is valid there.
 VENDOR_HOSTS = {
     "claude-code": {"api.anthropic.com"},
-    "codex": {"api.openai.com", "auth.openai.com", "chatgpt.com", "ab.chatgpt.com"},
+    "codex": {"api.openai.com"},
     "github": {"api.github.com", "github.com"},
     "bitbucket": {"api.bitbucket.org", "bitbucket.org"},
 }

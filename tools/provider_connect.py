@@ -4,7 +4,7 @@
     python3 tools/provider_connect.py keyless <profile file>    exit 0 when the profile declares no credential at all
 
 Prints the environment name NVIDIA's CLI reads the key from: the first `env_vars` entry of the profile's one required
-credential. A profile that needs more than one key (Codex: an access token, a refresh token and an account id) is
+credential. A profile that needs more than one key is
 refused: one key comes on stdin, and a second one would have to come some other way.
 
 Standard library only: the profile files are small YAML with one fixed shape (providers/*.yaml, NVIDIA's own).

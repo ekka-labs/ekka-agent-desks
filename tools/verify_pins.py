@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PINS = os.path.join(ROOT, "deploy", "pins.json")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IMAGE = re.compile(r"^ghcr\.io/nvidia/openshell/[a-z-]+@sha256:[0-9a-f]{64}$")
-COMPONENTS = ("gateway", "supervisor")
+COMPONENTS = ("gateway", "supervisor", "sandbox")
 # `uname -m` of each machine this setup installs on, and the image platform docker runs there.
 PLATFORMS = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}
 
@@ -70,7 +70,8 @@ def shape_errors(pins):
             if not HEX64.fullmatch(p.get("binary_sha256", "")):
                 errors.append(f"{name}.platforms.{m}.binary_sha256 is not 64 lowercase hex")
             # NVIDIA's own file name for this processor type, so a pin cannot name another platform's tarball.
-            if not re.fullmatch(rf"openshell-{name}-{m}-unknown-linux-gnu\.tar\.gz", p.get("release_asset", "")):
+            libc = "musl" if name == "sandbox" else "gnu"
+            if not re.fullmatch(rf"openshell-{name}-{m}-unknown-linux-{libc}\.tar\.gz", p.get("release_asset", "")):
                 errors.append(f"{name}.platforms.{m}.release_asset is not NVIDIA's {m} tarball")
         shas = [(platforms.get(m) or {}).get("binary_sha256") for m in PLATFORMS]
         if len(set(shas)) != len(shas):
@@ -97,7 +98,7 @@ def release_binary_sha256(pins, name, machine_name):
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as t:
         files = [m for m in t.getmembers() if m.isfile()]
         if len(files) != 1:
-            raise SystemExit(f"{name}: expected one file in {c['release_asset']}, found {len(files)}")
+            raise SystemExit(f"{name}: expected one file in {asset}, found {len(files)}")
         return hashlib.sha256(t.extractfile(files[0]).read()).hexdigest()
 
 
