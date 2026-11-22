@@ -175,7 +175,7 @@ class RecoveryReviewFixes(unittest.TestCase):
         lock.parent.mkdir(parents=True)
         if place is not None:
             place(lock)
-        host = RealLockReader(self.state / "desks")
+        host = RealLockReader((self.state / "desks").resolve())   # the reader follows no link, /var on macOS included
         host.docker = self.host.docker
         self.host = host
         return self.invoke(verb)

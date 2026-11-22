@@ -64,12 +64,23 @@ POLL = 2
 LOCK_LIMIT = 512                 # a lock holds one short line: `admin:<uuid>[ unknown]` or a job's attempt id
 ADMIN_LOCK = re.compile(r"admin:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?: unknown)?")
 JOB_LOCK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-# Read as the Enclave's user, by a bounded reader that follows no link and opens no special file. Exit 3: there is
-# no lock; any other non-zero exit: the lock could not be read safely.
+# Read as the Enclave's user, by a bounded reader that follows no link at ANY level: it walks from / one folder at a
+# time, each opened with O_NOFOLLOW | O_DIRECTORY, then opens the lock itself with O_NOFOLLOW and refuses anything but
+# a regular file with one link. Exit 3: the lock file itself is absent (nothing holds the desk). Any other non-zero
+# exit (7: a folder on the way is missing or not a real folder) means the lock could not be read safely.
 LOCK_READER = (
     "import os, stat, sys\n"
+    "parts = sys.argv[1].split('/')\n"
+    "if parts[0] != '' or any(p in ('', '.', '..') for p in parts[1:]):\n"
+    "    sys.exit(8)\n"
+    "fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)\n"
+    "for part in parts[1:-1]:\n"
+    "    try:\n"
+    "        fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)\n"
+    "    except OSError:\n"
+    "        sys.exit(7)\n"
     "try:\n"
-    "    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY)\n"
+    "    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY, dir_fd=fd)\n"
     "except FileNotFoundError:\n"
     "    sys.exit(3)\n"
     "except OSError:\n"
@@ -155,6 +166,13 @@ def stop_timeout(gateway_toml_text):
         if m:
             return int(m.group(1))
     return DEFAULT_STOP_TIMEOUT
+
+
+def recognized(lock_text):
+    """True only for a lock in a shape the Enclave writes (another change's claim or a job's attempt id). An empty or
+    malformed file is not evidence of anything: the Enclave removes a lock to free a desk, it never empties one."""
+    held = (lock_text or "").strip()
+    return bool(ADMIN_LOCK.fullmatch(held) or JOB_LOCK.fullmatch(held))
 
 
 def holds(lock_text, operation_id):
@@ -298,7 +316,13 @@ def _settle_held(desk, operation_id, backend_id, run, clock, sleep, restart, rea
     restarted_at = clock()
     out(f"watching desk '{desk}' until it has not changed for {window} s (at most {give_up // 60} minutes)")
     rows, quiet_until = wait_quiet(desk, window, run, clock, sleep, give_up, poll)
-    if not holds(read_lock(), operation_id):
+    lock = read_lock()
+    if not holds(lock, operation_id):
+        # Only positive evidence lets the hold go: the lock file is gone (None), or it names another holder.
+        # An empty or unrecognized lock is uncertain, and the hold stays.
+        if lock is not None and not recognized(lock):
+            raise Refused("the desk lock no longer names this change, but what it holds is not recognized; "
+                          "no marker was written")
         remove_hold(operation_id, run)
         out(f"change {operation_id} no longer holds desk '{desk}': it was settled meanwhile. No marker was written, "
             "and the hold is removed.")
@@ -348,17 +372,59 @@ def parse(argv):
     return argv[0], argv[2], argv[4] if len(argv) == 5 else None
 
 
-def unhold(desk, op, read_lock, run=docker):
-    """`up.sh desks unhold <desk> --operation <request id>`: a person removes a hold a stopped settle left. Only while
-    that desk's lock still names the change: the hold file names no desk, so the lock is what binds the two."""
+def binding_path(state, op):
+    """Where a settle records, on the host, which desk its hold belongs to: the hold file itself names no desk
+    (settle-hold.v1 allows no other field)."""
+    return os.path.join(state, "settle", f"{op}.desk")
+
+
+def bind(state, op, desk):
+    folder = os.path.join(state, "settle")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd = os.open(binding_path(state, op), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, (desk + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def bound_desk(state, op):
+    try:
+        fd = os.open(binding_path(state, op), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        text = os.read(fd, 128).decode("ascii", "replace").strip()
+    finally:
+        os.close(fd)
+    return text if DESK.match(text) else None
+
+
+def unbind(state, op):
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(binding_path(state, op))
+
+
+def unhold(desk, op, read_lock, run=docker, state=None):
+    """`up.sh desks unhold <desk> --operation <request id>`: a person removes a hold a stopped settle left. The hold
+    file names no desk, so what binds the two is either the desk's lock still naming the change, or the host record a
+    settle wrote for this desk with the lock now positively free of the change (the change ended: an orphaned hold)."""
     lock = read_lock()
-    if not holds(lock, op):
-        raise Refused(f"change {op} does not hold desk '{desk}': {holder(lock)}. Its hold, if there is one, belongs to "
-                      "another desk or to a change that has ended; nothing was removed")
+    current = holds(lock, op)
+    orphaned = (not current and state is not None and bound_desk(state, op) == desk
+                and (lock is None or recognized(lock)))
+    if not current and not orphaned:
+        raise Refused(f"change {op} does not hold desk '{desk}': {holder(lock)}, and no settle of this desk recorded "
+                      "that hold. Its hold, if there is one, belongs to another desk; nothing was removed")
     if remove_hold(op, run):
         print(f"removed the hold on change {op} (desk '{desk}'): the adapter may re-issue it, or settle it again")
     else:
         print(f"change {op} had no hold; nothing changed")
+    if state is not None:
+        unbind(state, op)
 
 
 def main(argv, run=docker, ekka=enclave_ekka, read=read_as_enclave, state=None,
@@ -385,14 +451,14 @@ def main(argv, run=docker, ekka=enclave_ekka, read=read_as_enclave, state=None,
             try:
                 return read(lock_path)
             except FileNotFoundError:
-                return ""
+                return None             # no lock file: nothing holds the desk
             except OSError:
                 raise Refused("the desk lock could not be read; nothing was changed") from None
 
         state = state if state is not None else os.environ.get("DESKS_STATE", "/var/lib/ekka-agent-desks")
         if releasing:
             with one_at_a_time(state):
-                unhold(desk, op, read_lock, run)
+                unhold(desk, op, read_lock, run, state)
             return 0
         # The gateway's identity as the adapter itself has it, read before anything is held or restarted.
         config = os.path.join(state, "backend", "config.json")
@@ -415,8 +481,15 @@ def main(argv, run=docker, ekka=enclave_ekka, read=read_as_enclave, state=None,
                 raise Refused("the gateway did not restart; no marker was written")
 
         with one_at_a_time(state):
-            settle(desk, op, backend_id, run=run, read_lock=read_lock, gateway_toml=toml, restart=restart,
-                   identity=identity, unhold_command=unhold_command)
+            bind(state, op, desk)       # before any hold exists, so a hold never lacks its desk
+            try:
+                settle(desk, op, backend_id, run=run, read_lock=read_lock, gateway_toml=toml, restart=restart,
+                       identity=identity, unhold_command=unhold_command)
+            except Refused as e:
+                if "The hold stays" not in str(e):
+                    unbind(state, op)   # no hold was left behind by this settle
+                raise
+            unbind(state, op)           # the marker took the hold, or there was nothing to hold
         return 0
     except Refused as e:
         print(f"REFUSED: {e}", file=sys.stderr)

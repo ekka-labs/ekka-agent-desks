@@ -228,7 +228,7 @@ class Refuses(unittest.TestCase):
             go(flip)
 
     def test_planted_a_change_settled_during_the_wait_gets_no_marker(self):
-        marker, docker, said, restarts = go([STOPPED], locks=(f"admin:{OP}", ""))
+        marker, docker, said, restarts = go([STOPPED], locks=(f"admin:{OP}", None))   # None: the lock file is gone
         self.assertIsNone(marker)
         self.assertEqual(len(restarts), 1)
         self.assertIsNone(docker.written)
@@ -336,7 +336,7 @@ class Hold(unittest.TestCase):
 
     def test_a_change_settled_meanwhile_removes_its_hold(self):
         docker = FakeDocker([STOPPED])
-        marker, _, said, _ = go(None, locks=(f"admin:{OP}", ""), docker=docker)
+        marker, _, said, _ = go(None, locks=(f"admin:{OP}", None), docker=docker)
         self.assertIsNone(marker)
         self.assertEqual(docker.files, {}, "nothing left: no marker, no hold")
         self.assertIn("hold is removed", said[-1])
@@ -555,7 +555,7 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual(rc, 0)
 
     def test_a_lock_that_is_a_link_is_never_followed_or_printed(self):
-        folder = tempfile.mkdtemp()
+        folder = os.path.realpath(tempfile.mkdtemp())   # the reader follows no link, /var on macOS included
         secret = os.path.join(folder, "credential")
         with open(secret, "w") as f:
             f.write("TOKEN=planted-credential-value\n")
@@ -567,7 +567,7 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual(rc, 1)
 
     def test_an_oversized_lock_is_refused_not_read(self):
-        folder = tempfile.mkdtemp()
+        folder = os.path.realpath(tempfile.mkdtemp())
         desks = os.path.join(folder, "desks")
         os.makedirs(os.path.join(desks, ".state"))
         with open(os.path.join(desks, ".state", "code-desk.lock"), "w") as f:
@@ -599,6 +599,57 @@ class ReviewFixes(unittest.TestCase):
             rc = ds.main(["code-desk", "--operation", OP], run=FakeDocker([STOPPED]), ekka=enclave,
                          state=self.state())
         return rc, out.getvalue() + err.getvalue()
+
+    def test_an_emptied_or_unrecognized_lock_keeps_the_hold(self):
+        # The Enclave removes a lock to free a desk; it never empties one. Only positive evidence releases the hold.
+        for second in ("", "\x00\x01", "admin:not-a-uuid"):
+            with self.subTest(second=second):
+                docker = FakeDocker([STOPPED])
+                with self.assertRaisesRegex(ds.Refused, "The hold stays"):
+                    go(None, locks=(f"admin:{OP}", second), docker=docker)
+                self.assertEqual(list(docker.files), [f"{OP}.hold"])
+
+    def test_a_change_another_holder_took_over_releases_its_hold(self):
+        docker = FakeDocker([STOPPED])
+        marker, _, said, _ = go(None, locks=(f"admin:{OP}", f"admin:{self.OTHER}"), docker=docker)
+        self.assertIsNone(marker)
+        self.assertEqual(docker.files, {})
+
+    def test_a_lock_behind_a_linked_folder_is_not_read(self):
+        folder = os.path.realpath(tempfile.mkdtemp())
+        real = os.path.join(folder, "real")
+        os.makedirs(os.path.join(real, "desks", ".state"))
+        with open(os.path.join(real, "desks", ".state", "code-desk.lock"), "w") as f:
+            f.write(f"admin:{OP}")
+        os.symlink(real, os.path.join(folder, "linked"))
+        rc, out = self.settle_reading_for_real(os.path.join(folder, "linked", "desks"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("could not be read", out)
+
+    def test_an_orphaned_hold_of_this_desk_can_be_released(self):
+        # The settle stopped with its hold in place, then the Enclave freed the desk: the lock no longer names the
+        # change, and the host record says the hold is this desk's.
+        state = self.state()
+        docker = FakeDocker([STOPPED])
+
+        def failing_restart(args, stdin=None):
+            if args[0] == "restart":
+                return 1, ""
+            return docker(args, stdin)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.main(["code-desk", "--operation", OP], run=failing_restart, ekka=enclave,
+                                     read=lambda path: f"admin:{OP}", state=state), 1)
+        self.assertEqual(list(docker.files), [f"{OP}.hold"])
+
+        def freed(path):
+            raise FileNotFoundError(path)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.main(["--unhold", "other-desk", "--operation", OP], run=docker, ekka=enclave,
+                                     read=freed, state=state), 1, "another desk released this desk's hold")
+            self.assertEqual(ds.main(["--unhold", "code-desk", "--operation", OP], run=docker, ekka=enclave,
+                                     read=freed, state=state), 0)
+        self.assertEqual(docker.files, {})
+        self.assertFalse(os.path.exists(os.path.join(state, "settle", f"{OP}.desk")))
 
     def test_only_a_recognized_holder_is_printed(self):
         self.assertEqual(ds.holder(f"admin:{self.OTHER}"), f"another change holds it (admin:{self.OTHER})")
