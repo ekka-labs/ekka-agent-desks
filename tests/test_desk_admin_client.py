@@ -319,10 +319,15 @@ connect_desk_admin
 class SetupKeycloak:
     """The admin API calls `setup-client` makes, as Keycloak answers them. `listed` False is a client the list leaves
     out (the list returns only clients the reader may see), while a read by its id still finds it. `answer` replaces
-    the list's answer outright; `sticky` ignores writes, as a client that will not change does."""
+    the list's answer outright; `sticky` ignores writes, as a client that will not change does. `scope_read_id` and
+    `role_read_id` give the assignments back under another id, as a record that only shares the name would."""
 
-    def __init__(self, client=None, listed=True, answer=None, scope=True, sticky=False):
+    def __init__(self, client=None, listed=True, answer=None, scope=True, sticky=False, scope_read_id=None,
+                 role_read_id=None):
         self.scopes = [{"id": "s-all", "name": "openshell:all"}] if scope else []
+        self.scope_read_id = scope_read_id
+        self.role_read_id = role_read_id
+        self.reads = []
         self.client = client
         self.listed = listed
         self.answer = answer
@@ -335,6 +340,7 @@ class SetupKeycloak:
 
     def get(self, path):
         self.calls += 1
+        self.reads.append(path)
         if path == REALM + "/client-scopes":
             return list(self.scopes)
         if path == REALM + "/clients?clientId=desks-setup":
@@ -344,13 +350,13 @@ class SetupKeycloak:
         if path == REALM + "/clients/c-setup":
             return copy.deepcopy(self.client) if self.client else None    # 404: no such client
         if path == REALM + "/clients/c-setup/default-client-scopes":
-            return [s for s in self.scopes if s["id"] in self.defaults]
+            return [{**s, "id": self.scope_read_id or s["id"]} for s in self.scopes if s["id"] in self.defaults]
         if path == REALM + "/clients/c-setup/service-account-user":
             return {"id": "u-setup"}
         if path == REALM + "/roles/openshell-admin":
-            return {"name": "openshell-admin"}
+            return {"id": "r-admin", "name": "openshell-admin"}
         if path == REALM + "/users/u-setup/role-mappings/realm":
-            return [{"name": r} for r in self.roles]
+            return [{"id": self.role_read_id or "r-admin", "name": r} for r in self.roles]
         if path == REALM + "/clients/c-setup/client-secret":
             return {"value": SECRET}
         raise AssertionError("unexpected GET " + path)
@@ -409,8 +415,28 @@ class TheSetupClientIsReadStrictly(unittest.TestCase):
 
     def test_a_client_that_cannot_be_read_by_its_id_has_no_state(self):
         for verb in ("off", "status"):
-            with self.subTest(verb=verb), self.assertRaises(SystemExit):
-                run(["setup-client", verb, "c-setup"], SetupKeycloak(None))
+            with self.subTest(verb=verb):
+                kc = SetupKeycloak(None)
+                with self.assertRaises(SystemExit):
+                    run(["setup-client", verb, "c-setup"], kc)
+                # The refusal comes from the direct read of that id, not from an earlier step.
+                self.assertEqual(kc.reads, [REALM + "/clients/c-setup"])
+                self.assertEqual(kc.writes, [])
+
+    def test_a_client_id_up_sh_would_drop_is_never_used_or_written(self):
+        # up.sh keeps an id only of [0-9A-Za-z-]: a client it could not switch off by its id is refused first.
+        for verb in ("on", "off"):
+            with self.subTest(verb=verb):
+                kc, out = SetupKeycloak(answer=[{"id": "c/../x", "clientId": "desks-setup", "enabled": False}]), Piped()
+                real = apply_realm.Api
+                apply_realm.Api = lambda: kc
+                try:
+                    with self.assertRaises(SystemExit), redirect_stdout(out):
+                        apply_realm.main(["setup-client", verb])
+                finally:
+                    apply_realm.Api = real
+                self.assertEqual(kc.writes, [])
+                self.assertNotIn("c/../x", out.getvalue())
 
 
 class TheSetupClientIsWholeBeforeItIsEnabled(unittest.TestCase):
@@ -447,6 +473,15 @@ class TheSetupClientIsWholeBeforeItIsEnabled(unittest.TestCase):
             run(["setup-client", "on"], kc)
         self.assertFalse(any(w[0] == "PUT" and w[1].endswith("/clients/c-setup") for w in kc.writes),
                          "it was enabled before its scope and role read back")
+
+    def test_a_scope_or_role_that_reads_back_under_another_id_never_enables_it(self):
+        for kw in ({"scope_read_id": "s-other"}, {"role_read_id": "r-other"}):
+            with self.subTest(**kw):
+                kc = SetupKeycloak({**RECORD, "enabled": False}, **kw)
+                with self.assertRaises(SystemExit):
+                    run(["setup-client", "on"], kc)
+                self.assertFalse(any(w[0] == "PUT" and w[1].endswith("/clients/c-setup") for w in kc.writes),
+                                 "it was enabled on an assignment that only shares the name")
 
     def test_a_terminal_is_refused_before_anything_changes(self):
         class Tty(io.StringIO):
