@@ -118,6 +118,16 @@ class EachStepIsChecked(unittest.TestCase):
         self.assertIn("kc setup-client off c-setup", calls)
         self.assertIn("kc setup-client status c-setup", calls)
 
+    def test_a_failed_switch_on_hands_control_back_to_its_caller(self):
+        # A caller's own cleanup (the download safety pass) still runs: 70 while the client may still be on, 69 when
+        # it is read back off.
+        r, calls = run(on="fails", off="fails")
+        self.assertIn("rc=70", r.stdout, r.stderr)
+        self.assertIn("may still be switched on", r.stderr)
+        r, calls = run(on="fails")
+        self.assertIn("rc=69", r.stdout, r.stderr)
+        self.assertIn("nothing was changed", r.stderr)
+
     def test_a_setup_client_left_on_is_never_reported_as_done(self):
         # The caller gets control back (its own cleanup still runs), with 70: never an answer of the call it guards.
         r, _ = run(off="fails")
@@ -127,7 +137,7 @@ class EachStepIsChecked(unittest.TestCase):
 
     def test_planted_the_unchecked_steps_pass_a_failed_sign_in_and_a_client_left_on(self):
         old = function().replace('if (( signin == 1 && interrupted == 0 )); then', 'if (( interrupted == 0 )); then') \
-                        .replace('(( client_off == 1 && home_gone == 1 )) || return 70', ':')
+                        .replace('(( ${admin_open:-0} == 0 )) || return 70', ':')
         self.assertNotEqual(old, function())
         r, _ = run(login="fails", fn=old)
         self.assertIn("did-the-call", r.stdout, "PLANTED: without the check the call ran with no sign-in")

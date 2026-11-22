@@ -565,25 +565,26 @@ except BlockingIOError:
   (( rc != 4 )) || { exec 87>&-; die "another gateway administrator session is running on this machine; run this again when it finishes. Nothing was changed"; }
   (( rc == 0 )) || { exec 87>&-; die "the gateway administrator lock ($lock) must be a private regular file owned by root; nothing was changed"; }
   # A fresh sign-in folder every time: a folder an interrupted session left can hold a registration of its own.
-  rm -rf "$home"; [[ ! -e $home && ! -L $home ]] \
+  # The removal is checked by what is left, never by rm's own status: under set -e (the `openshell` verb) a failing
+  # rm would end the script before anything is said.
+  rm -rf "$home" 2>/dev/null || true
+  [[ ! -e $home && ! -L $home ]] \
     || { exec 87>&-; die "the gateway's old sign-in folder ($home) could not be removed; nothing was changed"; }
   # Ctrl-C, SIGTERM and SIGHUP are noted, for the whole session (bash runs this once the command in progress has
   # ended). Keycloak's own commands run shielded: signals are ignored in their subshell, and they inherit that.
   # A session interrupted before its call returns 130; a call that already ran keeps its own result, so the caller
   # never reports as undone what was done. Either way access is switched off first, and the caller's own cleanup runs.
   # The caller's own signal handling is put back afterwards, each signal straight from this session's handler to the
-  # caller's, never through the default. A caller that handles signals itself names its handler in admin_caller_trap
-  # (bash 3.2 cannot read a caller's handlers from inside a command substitution).
-  local called=0 client_off=1 home_gone=1 signin=0 on_rc=0 id="" out="" caller_traps put_back
-  caller_traps=$(trap -p INT TERM HUP)
-  if [[ -n ${admin_caller_trap:-} ]]; then
-    printf -v put_back 'trap %q INT TERM HUP' "$admin_caller_trap"
-  else
-    put_back=$caller_traps
-    [[ $caller_traps == *" SIGINT"* ]] || put_back+=$'\n''trap - INT'
-    [[ $caller_traps == *" SIGTERM"* ]] || put_back+=$'\n''trap - TERM'
-    [[ $caller_traps == *" SIGHUP"* ]] || put_back+=$'\n''trap - HUP'
-  fi
+  # caller's, never through the default, and the result is decided only after that, so a late signal cannot change
+  # it. Each signal's handler is read on its own. The download caller's handler is fixed here, by the caller's name:
+  # bash 3.2 does not always show a caller's handlers inside a command substitution, and nothing from the environment
+  # is ever taken as a handler.
+  local called=0 client_off=1 home_gone=1 signin=0 on_rc=0 id="" out="" s h put_back=""
+  admin_called=0 admin_open=0   # for the caller: whether the call ran, and whether the session was left open
+  for s in INT TERM HUP; do
+    if [[ ${FUNCNAME[1]:-} == download_settled ]]; then h="trap 'noted=1' $s"; else h=$(trap -p "$s"); fi
+    put_back+="${h:-trap - $s}"$'\n'
+  done
   trap 'interrupted=1' INT TERM HUP
   # `on` writes the client's id on its first line, then its secret, and exits 0 only once the client is enabled
   # whole. Its exit status is kept apart from what it wrote: a failed `on` that already named its client leaves the
@@ -600,11 +601,15 @@ except BlockingIOError:
     local off_ok=0 st_ok=0
     ( trap '' INT TERM HUP; kc setup-client off ${id:+"$id"} >/dev/null 2>&1 ) && off_ok=1
     st=$(trap '' INT TERM HUP; kc setup-client status ${id:+"$id"} 2>/dev/null) && [[ $st == disabled ]] && st_ok=1
-    eval "$put_back"; exec 87>&-
-    (( off_ok == 1 && st_ok == 1 )) \
-      || die "Keycloak did not switch the gateway's setup client on, and it may still be switched on; check desks-setup in Keycloak, then run the same command again"
+    exec 87>&-; eval "$put_back"
+    if (( off_ok == 0 || st_ok == 0 )); then
+      admin_open=1
+      printf 'up: %s\n' "Keycloak did not switch the gateway's setup client on, and it may still be switched on; check desks-setup in Keycloak, then run the same command again" >&2
+      return 70
+    fi
     (( interrupted == 0 )) || return 130
-    die "Keycloak did not switch the gateway's setup client on; nothing was changed on the gateway, and the setup client is switched off"; }
+    printf 'up: %s\n' "Keycloak did not switch the gateway's setup client on; nothing was changed on the gateway, and the setup client is switched off" >&2
+    return 69; }
   # NVIDIA's gateway flags read these too; one kept by `sudo -E` would send the calls, and this sign-in, elsewhere.
   # The gateway's registration is written here, into this session's new private folder, in the shape NVIDIA's
   # `gateway add --oidc-issuer` writes (OpenShell v0.1.9 metadata.rs). `gateway add` itself is not used: it signs in
@@ -645,10 +650,14 @@ with os.fdopen(fd, "w") as f:
   st=$(trap '' INT TERM HUP; kc setup-client status "$id") && [[ $st == disabled ]] || client_off=0
   (( client_off == 1 )) \
     || printf 'up: %s\n' "the gateway's setup client may still be switched on: it is not confirmed off. Check desks-setup in Keycloak, then run the same command again" >&2
-  rm -rf "$home"; [[ ! -e $home && ! -L $home ]] || home_gone=0
+  rm -rf "$home" 2>/dev/null || true
+  [[ ! -e $home && ! -L $home ]] || home_gone=0
   (( home_gone == 1 )) \
     || printf 'up: %s\n' "the gateway's sign-in folder ($home) could not be removed; remove it before anything else" >&2
   exec 87>&-
+  eval "$put_back"   # from here on a signal is the caller's; what this session saw is fixed
+  admin_called=$called
+  (( client_off == 1 && home_gone == 1 )) || admin_open=1
   if (( interrupted == 1 )); then
     local after="the setup client is switched off again"
     (( client_off == 1 )) || after="the setup client is not confirmed switched off (see above)"
@@ -658,26 +667,27 @@ with os.fdopen(fd, "w") as f:
       say "interrupted: the call did not run, and $after"; rc=130
     fi
   fi
-  eval "$put_back"
-  # 70: the session did not close (said above); never an answer of the call it guards.
-  (( client_off == 1 && home_gone == 1 )) || return 70
+  # 70: the session did not close (said above). Callers read admin_open, not the number: a call may exit 70 itself.
+  (( ${admin_open:-0} == 0 )) || return 70
   (( called == 1 || interrupted == 1 )) || {
     printf 'up: %s\n' "could not sign in to NVIDIA's gateway as its administrator; nothing was changed there" >&2; return 69; }
   return $rc
 }
 
-session_left_open() {  # session_left_open <what the call may have done>: as_gateway_admin's 70, said as it is
-  die "$1, but the gateway's administrator session did not close cleanly (see the lines above). Check desks-setup in Keycloak, then run this again"
+session_left_open() {  # session_left_open <what the call may have done>: as_gateway_admin left its session open
+  local done_=$1
+  (( ${admin_called:-0} == 1 )) || done_="nothing was changed on the gateway"
+  die "$done_, but the gateway's administrator session did not close cleanly (see the lines above). Check desks-setup in Keycloak, then run this again"
 }
 
 download_settled() {  # download_settled sandbox download <desk> ... <folder>: the copy, then the folder made safe
   # What a download brings was packed inside the desk. Whatever the copy's result, and whatever signal arrives, the
   # folder is made safe before anybody reads it: links and special files removed, setuid and write-by-others bits
-  # cleared (tools/openshell_allow.py says why). Signals are noted from before the copy, handed back by the session
-  # with no moment at their default, and ignored from just before the pass starts until it has finished, so the
-  # pass starts with them ignored and neither an interruption nor the session's own result can skip it.
-  local rc=0 pass=0 noted=0 admin_caller_trap='noted=1'
-  trap 'noted=1' INT TERM HUP
+  # cleared (tools/openshell_allow.py says why). Before the session takes signals over, an interruption ends this
+  # command with nothing copied. The session hands them back to this function's own handler (it knows this caller by
+  # name) with no moment at their default, and they are ignored from just before the pass starts until it has
+  # finished, so neither an interruption nor the session's own result can skip it.
+  local rc=0 pass=0 noted=0
   OPENSHELL_WORKSPACE=${OPENSHELL_WORKSPACE:-desks} as_gateway_admin "$OS" -g ekka-agent-desks "$@" || rc=$?
   trap '' INT TERM HUP
   python3 tools/openshell_allow.py --settle-download "${@: -1}" || pass=1
@@ -738,7 +748,7 @@ connect_cmd() {  # connect_cmd <provider>: a provider's one key, read from stdin
     [[ -z ${secret:-} ]] || { secret=; die "$p takes no key; nothing was changed. Run it with nothing on stdin: sudo ekka desk connect $p </dev/null"; }
     rc=0; OPENSHELL_WORKSPACE=desks as_gateway_admin connect_keyless "$p" || rc=$?
     # 70: the session did not close (said above). The call may have run, so the provider may well exist.
-    (( rc != 70 )) || session_left_open "the provider $p may have been made (see: sudo ./up.sh openshell provider get $p)"
+    (( ${admin_open:-0} == 0 )) || session_left_open "the provider $p may have been made (see: sudo ./up.sh openshell provider get $p)"
     (( rc == 0 )) || die "the provider $p was not made; nothing else was changed"
     ok "$p is connected: it takes no key"
     ( step_desk_grant ) || die "the provider $p IS made; the desks grant was not refreshed, so a desk naming $p is refused until it is: sudo ./up.sh server $NAME"
@@ -752,7 +762,7 @@ connect_cmd() {  # connect_cmd <provider>: a provider's one key, read from stdin
     || { secret=; die "stdin must carry exactly one key: no spaces, no second line; nothing was changed"; }
   rc=0; OPENSHELL_WORKSPACE=desks as_gateway_admin connect_provider "$p" "$key" || rc=$?
   # 70: the session did not close (said above). The call may have run, so the key may well be set.
-  (( rc != 70 )) || { secret=; session_left_open "the key for $p may have been set (see: sudo ./up.sh openshell provider get $p)"; }
+  (( ${admin_open:-0} == 0 )) || { secret=; session_left_open "the key for $p may have been set (see: sudo ./up.sh openshell provider get $p)"; }
   (( rc == 0 )) || { secret=; die "the key for $p was not set; nothing else was changed"; }
   secret=
   ok "$p is connected: its key is in the gateway"
@@ -885,15 +895,17 @@ step_admin() {
   if is_done admin; then
     if ! is_done "profiles-$OPENSHELL_TAG"; then
       local rc=0; as_gateway_admin sync_profiles || rc=$?
-      (( rc != 70 )) || session_left_open "the upgraded gateway catalog may have been refreshed"
-      (( rc == 0 )) || die "the upgraded gateway catalog could not be refreshed; rerun to retry"
+      (( ${admin_open:-0} == 0 )) || session_left_open "the upgraded gateway catalog may have been partly refreshed"
+      (( rc == 0 )) || die "the upgraded gateway catalog was not refreshed, or only partly; rerun to retry"
       done_ "profiles-$OPENSHELL_TAG"
     fi
     ok "desk workspace, Enclave membership and profiles: done"; return
   fi
   say "the gateway's one-time setup (workspace, the Enclave's membership, provider profiles)"
   local sub; sub=$(cd deploy && bash setup.sh enclave-subject)
-  as_gateway_admin admin_setup "$sub" || die "the gateway's setup did not finish (any line above says whether desks-setup is off). Re-run to retry"
+  local rc=0; as_gateway_admin admin_setup "$sub" || rc=$?
+  (( ${admin_open:-0} == 0 )) || session_left_open "the gateway's one-time setup may have been done, or part of it"
+  (( rc == 0 )) || die "the gateway's setup did not finish; desks-setup is switched off again. Re-run to retry"
   done_ admin
   done_ "profiles-$OPENSHELL_TAG"
   ok "workspace desks, the Enclave as a member, the profiles in providers/; desks-setup disabled again"
@@ -1437,6 +1449,7 @@ case "${1:-}" in
         case $found in named) return 0 ;; absent) return 1 ;; *) return 2 ;; esac  # only the printed word counts
       }
       rc=0; as_gateway_admin is_member "$sub" || rc=$?
+      (( ${admin_open:-0} == 0 )) || session_left_open "the desk workspace was only read; $who was not added"
       case $rc in
         0) die "$who was invited already; their one-time password: sudo cat $pf" ;;
         1) ;;
@@ -1450,7 +1463,7 @@ case "${1:-}" in
     fi
     add_member() { "$OS" -g ekka-agent-desks workspace member add --workspace desks --subject "$1" --role user; }
     rc=0; as_gateway_admin add_member "$sub" >/dev/null || rc=$?
-    (( rc != 70 )) || session_left_open "$who can sign in and may have been added to the desk workspace"
+    (( ${admin_open:-0} == 0 )) || session_left_open "$who can sign in and may have been added to the desk workspace"
     (( rc == 0 )) || die "$who can sign in but is not in the desk workspace yet; run invite again after fixing the gateway"
     ok "$who ($mail) may use desks"
     echo "   Give them: the people bundle ($DESKS_STATE/people/) and their one-time password, changed at first sign-in:"
@@ -1477,8 +1490,9 @@ case "${1:-}" in
         | python3 tools/workspace_member.py "$1") || return 1
       [[ $found == absent ]]  # only the printed word counts: a crash or an unreadable list is never "absent"
     }
-    as_gateway_admin remove_member "$sub" \
-      || die "$who can no longer sign in, but may still be in the desk workspace; run revoke again after fixing the gateway"
+    rc=0; as_gateway_admin remove_member "$sub" || rc=$?
+    (( ${admin_open:-0} == 0 )) || session_left_open "$who can no longer sign in, and may or may not still be in the desk workspace"
+    (( rc == 0 )) || die "$who can no longer sign in, but may still be in the desk workspace; run revoke again after fixing the gateway"
     rm -f "$DESKS_STATE/secrets/people/$who-password"
     ok "$who may no longer use desks: their sign-in is disabled, every session ended, and they are out of the desk workspace"
     exit 0 ;;
@@ -1508,8 +1522,8 @@ case "${1:-}" in
     NAME=$(sed -n 's/^DESKS_NAME=//p' "$DESKS_STATE/up.env" 2>/dev/null); [[ -n $NAME ]] || die "not installed yet"
     python3 -m unittest tests.test_providers >/dev/null 2>&1 || die "providers/ does not match providers/PIN.json; nothing was changed"
     say "provider profiles"; rc=0; as_gateway_admin sync_profiles || rc=$?
-    (( rc != 70 )) || session_left_open "the profiles may have been updated"
-    (( rc == 0 )) || die "the profiles were not updated"; exit 0 ;;
+    (( ${admin_open:-0} == 0 )) || session_left_open "the profiles may have been updated, or some of them"
+    (( rc == 0 )) || die "the profiles were not updated, or only some of them; rerun to retry"; exit 0 ;;
   connect)  # a provider's key, set on this machine: gh auth token | sudo ekka desk connect github
     [[ $(id -u) == 0 ]] || die "run with sudo"
     NAME=$(sed -n 's/^DESKS_NAME=//p' "$DESKS_STATE/up.env" 2>/dev/null); [[ -n $NAME ]] || die "not installed yet"

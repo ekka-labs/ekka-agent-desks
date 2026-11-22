@@ -103,7 +103,8 @@ class OnlyThisSessionsRegistration(unittest.TestCase):
 
 
 def run_session(d, action="echo did-the-call", status="disabled", on_hook=":", rm_fails=False,
-                login_hook=":", off_hook=":", caller='rc=0; as_gateway_admin action || rc=$?; echo "rc=$rc"'):
+                login_hook=":", off_hook=":", caller='rc=0; as_gateway_admin action || rc=$?; echo "rc=$rc"',
+                signal_at_handback=False):
     """as_gateway_admin with NVIDIA's CLI behaving as 0.1.9 does: `login` needs a registration in its home and signs
     in with whatever registration that is (commands/gateway.rs, gateway_login). A `gateway add` is recorded, and keeps
     what it was given as NVIDIA's CLI does."""
@@ -139,12 +140,14 @@ kc() {{ echo "kc $*" >> {log}; case "$1 $2" in "setup-client on") {on_hook}; pri
   "setup-client off") {off_hook} ;;
   "setup-client status") echo "$STATUS" ;; esac; }}
 {"rm() { return 1; }" if rm_fails is True else ""}
+{'trap() { if [ "$HANDBACK" = 1 ] && [ "${1:-}" = - ] && [ "$BASH_SUBSHELL" = 0 ]; then HANDBACK=0; kill -TERM $$; fi; builtin trap "$@"; }' if signal_at_handback else ""}
 {'rm() { [ -e "$DESKS_STATE/rm-once" ] && return 1; : > "$DESKS_STATE/rm-once"; command rm "$@"; }' if rm_fails == "later" else ""}
 action() {{ {action}; }}
 {function()}
 {caller}
 """
-    env = dict(os.environ, PATH=stubs + os.pathsep + os.environ["PATH"], STATUS=status, LOGIN_HOOK=login_hook)
+    env = dict(os.environ, PATH=stubs + os.pathsep + os.environ["PATH"], STATUS=status, LOGIN_HOOK=login_hook,
+               HANDBACK="1")
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
     with open(log) as f:
         return r, f.read().splitlines()
@@ -228,6 +231,22 @@ class TheLegacySessionIsRecoverable(unittest.TestCase):
 
 
 class EachEndOfSessionResultIsSaidAsItIs(unittest.TestCase):
+    def test_a_signal_as_the_session_hands_back_never_turns_a_failed_sign_in_into_success(self):
+        # The signal arrives at the last moment the session's own handler is in place, as the caller's comes back.
+        with tempfile.TemporaryDirectory() as d:
+            r, calls = run_session(d, login_hook="exit 1", signal_at_handback=True)
+            self.assertNotIn("did-the-call", r.stdout)
+            self.assertNotIn("rc=0", r.stdout, "the call never ran, and the caller was told it succeeded")
+            self.assertIn("rc=130", r.stdout, r.stderr)
+
+    def test_a_folder_left_on_disk_is_said_when_the_session_runs_without_a_guarding_caller(self):
+        # `sudo ./up.sh openshell ...` calls the session directly, with set -e on.
+        with tempfile.TemporaryDirectory() as d:
+            r, calls = run_session(d, rm_fails="later", caller='as_gateway_admin action; echo "unreached"')
+            self.assertIn("could not be removed", r.stderr)
+            self.assertEqual(r.returncode, 70, r.stderr)
+            self.assertNotIn("unreached", r.stdout)
+
     def test_a_folder_left_on_disk_is_said_without_doubting_the_switch_off(self):
         with tempfile.TemporaryDirectory() as d:
             r, calls = run_session(d, rm_fails="later")       # removed at the start, not at the end
@@ -273,7 +292,7 @@ def download_function():
     return "download_settled() {\n" + inline.replace("exit $rc", "return $rc") + "\n}\n"
 
 
-def run_download(d, login="ok", copy_exit=0, interrupt_the_pass=False, log_traps=False):
+def run_download(d, login="ok", copy_exit=0, interrupt_the_pass=False, log_traps=False, preflight=":"):
     """`up.sh openshell sandbox download` from as_gateway_admin through the safety pass, in a session of its own so a
     Ctrl-C reaches exactly this process group. The copy writes a plain file and a link into the destination; the
     real tools/openshell_allow.py --settle-download makes it safe. With interrupt_the_pass, the pass's own process
@@ -313,11 +332,11 @@ set -euo pipefail
 cd {ROOT}
 DESKS_STATE={d}; OS={stubs}/os; NAME=desks.example.com
 die() {{ echo "die: $*" >&2; exit 1; }}
-install_cli() {{ :; }}
 getent() {{ return 0; }}
 say() {{ echo "say: $*"; }}
 kc() {{ echo "kc $*" >> {log}; case "$1 $2" in "setup-client on") printf 'c-setup\nthe-secret' ;;
   "setup-client status") echo disabled ;; esac; }}
+install_cli() {{ {preflight}; }}
 {'trap() { [ "$BASH_SUBSHELL" = 0 ] && [ "${1:-}" != -p ] && echo "trap [$1] ${*:2}" >> ' + log + '; builtin trap "$@"; }' if log_traps else ""}
 {function()}
 {download_function()}
@@ -341,6 +360,13 @@ class TheDownloadIsAlwaysMadeSafe(unittest.TestCase):
             # The copy had finished before the Ctrl-C: like any call that already ran, its result stands.
             self.assertIn("rc=0", r.stdout, r.stderr)
 
+    def test_a_ctrl_c_before_the_session_starts_copies_nothing(self):
+        # Before the session takes signals over, an interruption ends the command: no client switched on, no copy.
+        with tempfile.TemporaryDirectory() as d:
+            r, calls, dest = run_download(d, preflight="kill -INT $$; sleep 0.2")
+            self.assertNotIn("kc setup-client on", calls, "the session went on after the Ctrl-C")
+            self.assertFalse(os.path.exists(dest), "the copy ran after the Ctrl-C")
+
     def test_signals_are_never_at_their_default_from_the_copy_until_the_pass_ends(self):
         # At the default, a Ctrl-C ends the shell and the pass never runs. The handoff from the session back to the
         # download caller goes straight from one handler to the next, and the pass starts with signals ignored.
@@ -348,9 +374,10 @@ class TheDownloadIsAlwaysMadeSafe(unittest.TestCase):
             r, calls, dest = run_download(d, log_traps=True)
             self.assertIn("rc=0", r.stdout, r.stderr)
             changes = [c for c in calls[:calls.index("pass-started")] if c.startswith("trap ")]
-            self.assertEqual(changes[0], "trap [noted=1] INT TERM HUP", changes)
             self.assertFalse([c for c in changes if c.startswith("trap [-]")], f"a signal went back to its default: {changes}")
-            self.assertEqual(changes[-1], "trap [] INT TERM HUP", f"the pass started with signals handled: {changes}")
+            # The session's handler, then the download caller's own for each signal, then ignored for the pass.
+            self.assertEqual(changes, ["trap [interrupted=1] INT TERM HUP", "trap [noted=1] INT", "trap [noted=1] TERM",
+                                       "trap [noted=1] HUP", "trap [] INT TERM HUP"])
 
     def test_a_failed_sign_in_still_hands_back_to_the_pass(self):
         with tempfile.TemporaryDirectory() as d:

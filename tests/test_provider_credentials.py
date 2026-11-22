@@ -10,6 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class ProviderCredentials(unittest.TestCase):
     setup_status = 'disabled'
     home_stays = False
+    call_exit = 0
 
     def test_model_credential_survives_gateway_admin_login(self):
         text = (ROOT / 'up.sh').read_text()
@@ -50,6 +51,7 @@ fake_cli() {
     'provider create '*)
       [[ $OPENSHELL_OIDC_CLIENT_SECRET == gateway-login-test-value ]] || return 98
       printf '%s' "${!CREDENTIAL_ENV}" > "$CAPTURE"
+      return "${CALL_EXIT:-0}"
       ;;
     *) return 97 ;;
   esac
@@ -62,8 +64,15 @@ printf '%s' model-credential-test-value | connect_cmd claude-code
                                      env={'PATH': '/usr/bin:/bin', 'DESKS_STATE': str(root),
                                           'CAPTURE': str(root / 'captured'), 'CREDENTIAL_ENV': env_name,
                                           'SETUP_STATUS': self.setup_status,
-                                          'HOME_STAYS': '1' if self.home_stays else ''},
+                                          'HOME_STAYS': '1' if self.home_stays else '',
+                                          'CALL_EXIT': str(self.call_exit)},
                                      capture_output=True, text=True)
+                if self.call_exit:
+                    # The call itself failed and the session closed cleanly: a failed call, nothing about the session.
+                    self.assertEqual(out.returncode, 1)
+                    self.assertIn('was not set', out.stderr)
+                    self.assertNotIn('did not close', out.stderr)
+                    continue
                 if self.setup_status != 'disabled' or self.home_stays:
                     # The key IS set, but the session did not close cleanly: the operator is told what to check,
                     # never that the key was not set, and never more than was seen.
@@ -90,3 +99,7 @@ class AKeySetWhileTheSignInFolderStayed(ProviderCredentials):
     """The same connect, with the setup client read back off but the sign-in folder left on disk (70)."""
     home_stays = True
 
+
+class ACallThatExitsWithTheSessionsOwnNumber(ProviderCredentials):
+    """NVIDIA's CLI exits 70 on its own, and the session closed cleanly: not a session left open."""
+    call_exit = 70
