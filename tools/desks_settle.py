@@ -1,7 +1,7 @@
 """Settle ONE unfinished desk change on this machine (EKKA regression coverage).
 
-    sudo ./up.sh desks settle <desk> --operation <request id> [--backend-id <uuid>]
-    sudo ./up.sh desks unhold <desk> --operation <request id>
+    sudo ekka-desk-host settle <desk> --operation <request id> [--backend-id <uuid>]
+    sudo ekka-desk-host unhold <desk> --operation <request id>
 
 EKKA does not settle an unfinished desk change on its own; this procedure does, for one named change, after it has
 seen that desk stop changing. The change is named by its request id, the lowercase UUID that `ekka desk status`
@@ -26,7 +26,7 @@ prints, that a `running` answer carries, and that the desk's lock holds. In orde
      at the next `ekka desk status`.
 
 If it stops anywhere after step 2, the hold STAYS and the change stays held. A person checks the desk, then removes
-the hold with `up.sh desks unhold`; the adapter may then re-issue the change, or it is settled again.
+the hold with `ekka-desk-host unhold`; the adapter may then re-issue the change, or it is settled again.
 
 Standard library only. Every Docker call goes through one function, so the tests replace it.
 """
@@ -53,8 +53,8 @@ DEFAULT_STOP_TIMEOUT = 10        # NVIDIA OpenShell's Docker driver, the same in
 QUIET_EXTRA = 30
 GIVE_UP_AFTER = 600
 POLL = 2
-USAGE = ("usage: sudo ./up.sh desks settle <desk> --operation <request id> [--backend-id <uuid>]\n"
-         "       sudo ./up.sh desks unhold <desk> --operation <request id>")
+USAGE = ("usage: sudo ekka-desk-host settle <desk> --operation <request id> [--backend-id <uuid>]\n"
+         "       sudo ekka-desk-host unhold <desk> --operation <request id>")
 
 
 class Refused(Exception):
@@ -221,7 +221,7 @@ def settle(desk, operation_id, backend_id=None, run=docker, clock=now, sleep=tim
                             poll, out, identity)
     except Refused as e:
         raise Refused(f"{e}. The hold stays, so change {operation_id} is not re-issued. Check the desk with "
-                      f"`ekka desk status {desk}`, then: sudo ./up.sh desks unhold {desk} --operation {operation_id}") from e
+                      f"`ekka desk status {desk}`, then: sudo ekka-desk-host unhold {desk} --operation {operation_id}") from e
 
 
 def _settle_held(desk, operation_id, backend_id, run, clock, sleep, restart, read_lock, window, give_up, poll, out,
@@ -283,7 +283,7 @@ def parse(argv):
 
 
 def unhold(argv, run=docker):
-    """`up.sh desks unhold <desk> --operation <request id>`: a person removes a hold a stopped settle left."""
+    """`ekka-desk-host unhold <desk> --operation <request id>`: a person removes a hold a stopped settle left."""
     args = parse(argv)
     if args is None or args[2] is not None:
         print(USAGE, file=sys.stderr)
@@ -309,7 +309,7 @@ def read_text(path):
         return f.read()
 
 
-def main(argv, run=docker, ekka=enclave_ekka, read=read_text):
+def main(argv, run=docker, ekka=enclave_ekka, read=read_text, state=None):
     if argv[:1] == ["--unhold"]:
         return unhold(argv[1:], run)
     args = parse(argv)
@@ -330,10 +330,12 @@ def main(argv, run=docker, ekka=enclave_ekka, read=read_text):
         def read_lock():
             try:
                 return read(lock_path)
-            except OSError:
+            except FileNotFoundError:
                 return ""
+            except OSError:
+                raise Refused("the desk lock could not be read; nothing was settled") from None
 
-        state = os.environ.get("DESKS_STATE", "/var/lib/ekka-agent-desks")
+        state = state if state is not None else os.environ.get("DESKS_STATE", "/var/lib/ekka-agent-desks")
         # The gateway's identity as the adapter itself has it, read before anything is held or restarted.
         config = os.path.join(state, "backend", "config.json")
         try:

@@ -127,7 +127,7 @@ class NativeHostTests(unittest.TestCase):
         with patch.dict(os.environ, {"SYSTEMD_HOST": "unwanted-host", "SECRET": "do-not-inherit"}):
             with patch("ekka_host.runtime.subprocess.run") as call:
                 call.return_value = subprocess.CompletedProcess([], 0, "active", "")
-                self.assertEqual(runtime.run(["/usr/bin/systemctl", "is-active", STACK]), "active")
+                self.assertEqual(runtime.run(["/usr/bin/systemctl", "is-active", STACK]).stdout, "active")
                 self.assertNotIn("SYSTEMD_HOST", call.call_args.kwargs["env"])
                 self.assertNotIn("SECRET", call.call_args.kwargs["env"])
                 self.assertNotIn("shell", call.call_args.kwargs)

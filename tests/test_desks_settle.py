@@ -304,7 +304,7 @@ class Hold(unittest.TestCase):
     def test_planted_a_desk_that_never_stops_changing_leaves_the_hold_and_says_how_to_clear_it(self):
         flip = [[(A, "running", SANDBOX)], [(A, "exited", SANDBOX)]] * 400
         docker = FakeDocker(flip)
-        with self.assertRaisesRegex(ds.Refused, rf"The hold stays.*desks unhold code-desk --operation {OP}"):
+        with self.assertRaisesRegex(ds.Refused, rf"The hold stays.*ekka-desk-host unhold code-desk --operation {OP}"):
             go(None, docker=docker)
         self.assertEqual(list(docker.files), [f"{OP}.hold"], "no marker, and the hold is still there")
 

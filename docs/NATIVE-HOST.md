@@ -10,6 +10,8 @@ From a trusted checkout on the installed Linux host:
 sudo ./ekka-desk-host status
 sudo ./ekka-desk-host stack start
 sudo ./ekka-desk-host stack stop
+sudo ./ekka-desk-host settle code-desk --operation <request-uuid>
+sudo ./ekka-desk-host unhold code-desk --operation <request-uuid>
 ```
 
 Help works without sudo: `./ekka-desk-host --help` and `./ekka-desk-host stack --help`.
@@ -32,9 +34,23 @@ Exit codes: 0 means the requested check or service change passed, 1 means refuse
 invalid arguments or a desk action requested through the host command. Desk actions are refused with their intended
 native EKKA command; that message does not enable commands absent from the installed runner.
 
+## Recovering one unfinished change
+
+`settle <desk> --operation <request-uuid> [--backend-id <sandbox-uuid>]` invokes the existing Python settlement
+procedure directly. It requires the default stack to be active and unmasked, writes a hold before restarting the
+gateway, observes the desk containers until they stop changing, and then writes one settle marker. Restarting the
+gateway can interrupt other connections to the default stack. The next governed `ekka desk status <desk>` consumes
+the marker and determines the change's outcome; completing the host procedure alone does not establish that outcome.
+
+If settlement stops, the hold stays. Inspect the desk before using `unhold <desk> --operation <request-uuid>`:
+removing a hold can permit the backend to reissue that operation. Neither command retries automatically. Settings
+come from fixed root-owned files and the existing state folder. The host command reads desk locks as the Enclave
+user and sends neither a caller's environment nor a shell expression to the host tools. Both commands audit before
+execution and after completion or failure. They do not invoke `up.sh`.
+
 ## Remaining migration
 
-Installation, upgrades, named instances, registry/image management, settlement, the full walk and the allow-listed
+Installation, upgrades, named instances, registry/image management, the full walk and the allow-listed
 NVIDIA recovery CLI still need native host implementations. Provider keys, people and grants belong in governed
 `ekka desk` commands. The old script and shadowing wrapper can be retired once all their actions have working
 replacements and the upgrade path preserves installed state. Do not use this preview to provision a second

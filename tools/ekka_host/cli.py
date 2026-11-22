@@ -4,6 +4,7 @@ import os
 import sys
 
 from .runtime import HostError, Runtime, stack_change, status
+from .settlement import recover
 
 DESK_COMMANDS = {"connect": "ekka desk connect", "invite": "ekka desk people invite",
                  "revoke": "ekka desk people revoke", "grant": "ekka desk grant",
@@ -21,6 +22,12 @@ def parser():
     actions = stack.add_subparsers(dest="verb", required=True)
     actions.add_parser("start", help="start the desks service")
     actions.add_parser("stop", help="stop the desks service")
+    for verb in ("settle", "unhold"):
+        recovery = commands.add_parser(verb, help="recover one unfinished desk change (restarts the default gateway)" if verb == "settle" else "remove one recovery hold after checking the desk")
+        recovery.add_argument("desk")
+        recovery.add_argument("--operation", required=True)
+        if verb == "settle":
+            recovery.add_argument("--backend-id")
     return cli
 
 
@@ -38,8 +45,11 @@ def main(argv=None, runtime=None, uid=None):
     try:
         if options.command == "status":
             status(runtime)
-        else:
+        elif options.command == "stack":
             stack_change(runtime, options.verb)
+        else:
+            recover(runtime, options.command, options.desk, options.operation,
+                    getattr(options, "backend_id", None))
         return 0
     except (HostError, OSError) as error:
         print("ekka-desk-host: " + str(error), file=sys.stderr)

@@ -27,23 +27,24 @@ class Runtime:
     def __init__(self, output=print):
         self.output = output
 
-    def run(self, args, allowed=(0,)):
+    def run(self, args, allowed=(0,), stdin=None, timeout=90):
         self.output("→ " + shlex.join(args))
         try:
-            result = subprocess.run(args, stdin=subprocess.DEVNULL,
+            result = subprocess.run(args, input=stdin,
+                                    stdin=subprocess.DEVNULL if stdin is None else None,
                                     capture_output=True, text=True, env=ENV,
-                                    timeout=90, check=False)
+                                    timeout=timeout, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             # A timeout is an unknown result; do not automatically retry a change.
             raise HostError("command did not finish; inspect the host before retrying") from error
         if result.returncode not in allowed:
             # Do not echo arbitrary service/tool output into operator logs.
             raise HostError("command failed with exit code " + str(result.returncode))
-        return result.stdout.strip()
+        return result
 
     def service(self, unit):
         raw = self.run(["/usr/bin/systemctl", "show", unit, "--no-pager",
-                        "--property=LoadState,ActiveState,SubState,UnitFileState,Result"])
+                        "--property=LoadState,ActiveState,SubState,UnitFileState,Result"]).stdout.strip()
         values = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
         if not {"LoadState", "ActiveState", "SubState"} <= values.keys():
             raise HostError("systemd returned an incomplete service status")
