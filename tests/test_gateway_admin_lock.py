@@ -1,5 +1,5 @@
 """up.sh as_gateway_admin: one temporary-admin session at a time on a machine, under one lock file, and NVIDIA's CLI
-sees no gateway registration but the one this session added.
+sees no gateway registration but the one this session wrote.
 
 The function runs from up.sh exactly, with Keycloak's script, NVIDIA's CLI and the port probe stubbed, as in
 test_as_gateway_admin. Another session is stood in for by holding flock on the same file.
@@ -28,8 +28,7 @@ def run(d):
         # What NVIDIA's CLI would see: the system registry folder it falls back to, and whether it holds anything.
         f.write(f'#!/bin/sh\necho "os $1 $2 system=${{OPENSHELL_SYSTEM_GATEWAY_DIR:-/etc/openshell}} '
                 f'entries=$(ls -A "${{OPENSHELL_SYSTEM_GATEWAY_DIR:-/etc/openshell}}" 2>/dev/null | wc -l | tr -d " ") '
-                f'xdg=${{XDG_CONFIG_HOME:-unset}}" >> "{log}"\n'
-                f'case "$1 $2" in "gateway add") {META_SH} ;; esac\nexit 0\n')
+                f'xdg=${{XDG_CONFIG_HOME:-unset}}" >> "{log}"\nexit 0\n')
     for name in ("openssl", "os"):
         os.chmod(os.path.join(stubs, name), 0o755)
     open(log, "w").close()
@@ -103,10 +102,11 @@ class OnlyThisSessionsRegistration(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "openshell-admin")), "the session's folder was kept")
 
 
-def run_session(d, action="echo did-the-call", status="disabled", add="keeps", on_hook=":", rm_fails=False,
+def run_session(d, action="echo did-the-call", status="disabled", on_hook=":", rm_fails=False,
                 login_hook=":", off_hook=":", caller='rc=0; as_gateway_admin action || rc=$?; echo "rc=$rc"'):
-    """as_gateway_admin with NVIDIA's CLI behaving as 0.1.9 does: `gateway add` refuses a name whose user registration
-    already exists (commands/gateway.rs), and `login` signs in with whatever registration its home holds."""
+    """as_gateway_admin with NVIDIA's CLI behaving as 0.1.9 does: `login` needs a registration in its home and signs
+    in with whatever registration that is (commands/gateway.rs, gateway_login). A `gateway add` is recorded, and keeps
+    what it was given as NVIDIA's CLI does."""
     log = os.path.join(d, "log")
     stubs = os.path.join(d, "bin")
     os.makedirs(stubs, exist_ok=True)
@@ -116,17 +116,11 @@ def run_session(d, action="echo did-the-call", status="disabled", add="keeps", o
     with open(os.path.join(stubs, "os"), "w") as f:
         f.write(f"""#!/bin/sh
 case "$1 $2" in
-  "gateway add")
-    echo "add secret=${{OPENSHELL_OIDC_CLIENT_SECRET:+set}} no-browser=${{OPENSHELL_NO_BROWSER:-}}" >> "{log}"
-    [ -e "{meta}" ] && exit 1
-    case "$ADD" in
-      keeps) {META_SH} ;;
-      elsewhere) mkdir -p "$(dirname "{meta}")"
-                 printf '{{"gateway_endpoint":"%s","auth_mode":"oidc","oidc_issuer":"https://elsewhere.example/r","oidc_client_id":"desks-setup"}}' "$3" > "{meta}" ;;
-    esac ;;
+  "gateway add") echo "add secret=${{OPENSHELL_OIDC_CLIENT_SECRET:+set}}" >> "{log}"; {META_SH} ;;
   "gateway login") [ -e "{meta}" ] || exit 1
     echo "sign-in secret=${{OPENSHELL_OIDC_CLIENT_SECRET:+set}}" >> "{log}"
     eval "$LOGIN_HOOK"
+    echo "registered $(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True))' "{meta}")" >> "{log}"
     echo "login $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["oidc_issuer"])' "{meta}")" >> "{log}" ;;
 esac
 exit 0
@@ -144,20 +138,21 @@ say() {{ echo "say: $*"; }}
 kc() {{ echo "kc $*" >> {log}; case "$1 $2" in "setup-client on") {on_hook}; printf 'c-setup\nthe-secret' ;;
   "setup-client off") {off_hook} ;;
   "setup-client status") echo "$STATUS" ;; esac; }}
-{"rm() { return 1; }" if rm_fails else ""}
+{"rm() { return 1; }" if rm_fails is True else ""}
+{'rm() { [ -e "$DESKS_STATE/rm-once" ] && return 1; : > "$DESKS_STATE/rm-once"; command rm "$@"; }' if rm_fails == "later" else ""}
 action() {{ {action}; }}
 {function()}
 {caller}
 """
-    env = dict(os.environ, PATH=stubs + os.pathsep + os.environ["PATH"], STATUS=status, ADD=add, LOGIN_HOOK=login_hook)
+    env = dict(os.environ, PATH=stubs + os.pathsep + os.environ["PATH"], STATUS=status, LOGIN_HOOK=login_hook)
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=30)
     with open(log) as f:
         return r, f.read().splitlines()
 
 
 class TheLegacySessionIsRecoverable(unittest.TestCase):
-    """A fresh home, the kept registration read back before sign-in, a switch-off that is read back, and Ctrl-C,
-    SIGTERM and SIGHUP handled: access is switched off and the caller gets 130 back, so its own cleanup runs."""
+    """A fresh home with a registration this session writes, a switch-off that is read back, and Ctrl-C, SIGTERM and
+    SIGHUP handled: access is switched off and the caller gets 130 back, so its own cleanup runs."""
 
     def test_a_home_an_interrupted_session_left_is_never_reused(self):
         with tempfile.TemporaryDirectory() as d:
@@ -165,24 +160,17 @@ class TheLegacySessionIsRecoverable(unittest.TestCase):
             os.makedirs(old)
             with open(os.path.join(old, "metadata.json"), "w") as f:
                 f.write('{"gateway_endpoint":"https://desks.example.com:8080","auth_mode":"oidc",'
-                        '"oidc_issuer":"https://elsewhere.example/r","oidc_client_id":"desks-setup"}')
+                        '"oidc_issuer":"https://other.example/realms/x","oidc_client_id":"desks-setup"}')
             r, calls = run_session(d)
             self.assertIn("rc=0", r.stdout, r.stderr)
             self.assertEqual([c for c in calls if c.startswith("login ")],
-                             ["login https://desks.example.com/realms/ekka-desks"], "the secret signed in elsewhere")
-
-    def test_a_kept_registration_naming_another_issuer_never_signs_in(self):
-        with tempfile.TemporaryDirectory() as d:
-            r, calls = run_session(d, add="elsewhere")
-            self.assertFalse([c for c in calls if c.startswith("login ")], "signed in with another issuer")
-            self.assertIn("could not sign in", r.stderr)
-            self.assertIn("kc setup-client off c-setup", calls)
+                             ["login https://desks.example.com/realms/ekka-desks"], "an old registration was used")
 
     def test_a_switch_off_that_does_not_read_back_is_never_done(self):
         with tempfile.TemporaryDirectory() as d:
             r, calls = run_session(d, status="enabled")
             self.assertNotIn("rc=0", r.stdout)
-            self.assertIn("not confirmed switched off", r.stderr)
+            self.assertIn("not confirmed off", r.stderr)
 
     def test_sigterm_during_the_call_switches_access_off_and_returns_to_the_caller(self):
         # The caller must get control back: `up.sh openshell sandbox download` makes the downloaded folder safe after
@@ -239,14 +227,36 @@ class TheLegacySessionIsRecoverable(unittest.TestCase):
             self.assertNotIn("kc setup-client on", calls)
 
 
+class EachEndOfSessionResultIsSaidAsItIs(unittest.TestCase):
+    def test_a_folder_left_on_disk_is_said_without_doubting_the_switch_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, calls = run_session(d, rm_fails="later")       # removed at the start, not at the end
+            self.assertIn("rc=70", r.stdout, r.stderr)
+            self.assertIn("could not be removed", r.stderr)
+            self.assertNotIn("switched on", r.stderr, "a setup client read back as off was said to be on")
+
+    def test_an_interrupted_session_whose_switch_off_did_not_read_back_never_says_it_is_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            r, calls = run_session(d, on_hook="kill -TERM $$", status="enabled")
+            self.assertIn("rc=70", r.stdout, r.stderr)
+            self.assertIn("interrupted: the call did not run", r.stdout)
+            self.assertNotIn("switched off again", r.stdout)
+
+
 class TheSecretOnlyReachesTheSignIn(unittest.TestCase):
-    def test_the_gateway_is_registered_without_the_secret_and_signed_in_with_it(self):
+    def test_the_gateway_is_registered_without_any_sign_in_and_signed_in_once_with_the_secret(self):
+        # No `gateway add`: in OpenShell 0.1.9 it signs in as it registers, with or without the secret. The session
+        # writes the registration itself, in the shape `gateway add` writes, and only `gateway login` gets the secret.
         with tempfile.TemporaryDirectory() as d:
             r, calls = run_session(d)
             self.assertIn("rc=0", r.stdout, r.stderr)
-            self.assertIn("add secret= no-browser=1", calls, "the registration step was handed the secret")
-            self.assertIn("sign-in secret=set", calls)
-            self.assertLess(calls.index("add secret= no-browser=1"), calls.index("sign-in secret=set"))
+            self.assertFalse([c for c in calls if c.startswith("add ")], "the registration step signs in")
+            self.assertEqual([c for c in calls if c.startswith("sign-in ")], ["sign-in secret=set"])
+            self.assertIn("registered " + json.dumps({
+                "auth_mode": "oidc", "gateway_endpoint": "https://desks.example.com:8080", "gateway_port": 0,
+                "is_remote": True, "name": "ekka-agent-desks", "oidc_audience": "ekka-desks",
+                "oidc_client_id": "desks-setup", "oidc_issuer": "https://desks.example.com/realms/ekka-desks"},
+                sort_keys=True), calls)
 
 
 def download_function():
@@ -263,11 +273,12 @@ def download_function():
     return "download_settled() {\n" + inline.replace("exit $rc", "return $rc") + "\n}\n"
 
 
-def run_download(d, login="ok", copy_exit=0, interrupt_the_pass=False):
+def run_download(d, login="ok", copy_exit=0, interrupt_the_pass=False, log_traps=False):
     """`up.sh openshell sandbox download` from as_gateway_admin through the safety pass, in a session of its own so a
     Ctrl-C reaches exactly this process group. The copy writes a plain file and a link into the destination; the
     real tools/openshell_allow.py --settle-download makes it safe. With interrupt_the_pass, the pass's own process
-    group gets SIGINT just as the pass starts, as a Ctrl-C would."""
+    group gets SIGINT just as the pass starts, as a Ctrl-C would. With log_traps, every change the main shell makes to
+    its signal handling is logged, in order, through a wrapper around bash's own `trap`."""
     log = os.path.join(d, "log")
     stubs = os.path.join(d, "bin")
     os.makedirs(stubs, exist_ok=True)
@@ -280,7 +291,7 @@ def run_download(d, login="ok", copy_exit=0, interrupt_the_pass=False):
 [ "$1" = -g ] && shift 2
 case "$1 $2" in
   "gateway add") {META_SH} ;;
-  "gateway login") [ "{login}" = ok ] || exit 1 ;;
+  "gateway login") [ -e "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json" ] && [ "{login}" = ok ] || exit 1 ;;
   "sandbox download") mkdir -p "{dest}"; echo data > "{dest}/plain.txt"; ln -s /etc/hosts "{dest}/link"
                       exit {copy_exit} ;;
 esac
@@ -307,6 +318,7 @@ getent() {{ return 0; }}
 say() {{ echo "say: $*"; }}
 kc() {{ echo "kc $*" >> {log}; case "$1 $2" in "setup-client on") printf 'c-setup\nthe-secret' ;;
   "setup-client status") echo disabled ;; esac; }}
+{'trap() { [ "$BASH_SUBSHELL" = 0 ] && [ "${1:-}" != -p ] && echo "trap [$1] ${*:2}" >> ' + log + '; builtin trap "$@"; }' if log_traps else ""}
 {function()}
 {download_function()}
 rc=0; download_settled sandbox download code-desk /sandbox/out "{dest}" || rc=$?
@@ -326,10 +338,19 @@ class TheDownloadIsAlwaysMadeSafe(unittest.TestCase):
             self.assertIn("pass-started", calls)
             self.assertTrue(os.path.exists(os.path.join(dest, "plain.txt")))
             self.assertFalse(os.path.lexists(os.path.join(dest, "link")), "the pass was stopped: a link is still there")
-            # The copy had finished before the Ctrl-C: like any call that already ran, its result stands, and the
-            # operator is told the folder was made safe.
-            self.assertIn("rc=0", r.stdout)
-            self.assertIn("interrupted: the folder was made safe", r.stdout)
+            # The copy had finished before the Ctrl-C: like any call that already ran, its result stands.
+            self.assertIn("rc=0", r.stdout, r.stderr)
+
+    def test_signals_are_never_at_their_default_from_the_copy_until_the_pass_ends(self):
+        # At the default, a Ctrl-C ends the shell and the pass never runs. The handoff from the session back to the
+        # download caller goes straight from one handler to the next, and the pass starts with signals ignored.
+        with tempfile.TemporaryDirectory() as d:
+            r, calls, dest = run_download(d, log_traps=True)
+            self.assertIn("rc=0", r.stdout, r.stderr)
+            changes = [c for c in calls[:calls.index("pass-started")] if c.startswith("trap ")]
+            self.assertEqual(changes[0], "trap [noted=1] INT TERM HUP", changes)
+            self.assertFalse([c for c in changes if c.startswith("trap [-]")], f"a signal went back to its default: {changes}")
+            self.assertEqual(changes[-1], "trap [] INT TERM HUP", f"the pass started with signals handled: {changes}")
 
     def test_a_failed_sign_in_still_hands_back_to_the_pass(self):
         with tempfile.TemporaryDirectory() as d:

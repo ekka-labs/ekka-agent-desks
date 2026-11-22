@@ -26,6 +26,9 @@ setup's own settings are only loaded that way.
 (`sudo WALK_PERSON_HOME=~/.ekka-walk-person ./up.sh walk`). Its person legs call the gateway directly with
 that person's own sign-in: starting a desk, running a command in it, and opening an SSH session into it.
 All three must stay refused. A new OpenShell version can change what a method requires.
+Also check that the new version still reads the gateway registration `up.sh` writes for its administrator session
+(`as_gateway_admin`, in the shape of OpenShell 0.1.9's `gateway add --oidc-issuer`): `sudo ./up.sh openshell
+provider list` must sign in and answer.
 
 ## The Enclave as a service, and restart recovery
 

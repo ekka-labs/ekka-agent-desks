@@ -12,7 +12,9 @@ import tempfile
 import unittest
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-# NVIDIA's CLI keeps what `gateway add` was given under $HOME/.config/openshell (bootstrap paths.rs, metadata.rs).
+META = ".config/openshell/gateways/ekka-agent-desks/metadata.json"   # where 0.1.9 reads a registration
+# A `gateway add` keeps what it was given under $HOME/.config/openshell, as NVIDIA's CLI does (metadata.rs), so a
+# version of up.sh that still calls it is measured on what it then does, not on a stub that refuses it.
 META_SH = 'mkdir -p "$HOME/.config/openshell/gateways/ekka-agent-desks"; printf \'{"gateway_endpoint":"%s","auth_mode":"oidc","oidc_issuer":"%s","oidc_client_id":"%s"}\' "$3" "$7" "$9" > "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json"'
 
 
@@ -32,8 +34,8 @@ def run(action="echo did-the-call; return 0", on="ok", login="ok", off="ok", fn=
         f.write("#!/bin/sh\nexit 0\n")   # the gateway answers on 8080 at once
     with open(os.path.join(stubs, "os"), "w") as f:
         f.write(f'#!/bin/sh\necho "os $*" >> "{log}"\n'
-                f'case "$1 $2" in "gateway login") [ "$LOGIN" = ok ] || exit 1 ;;\n'
-                f'  "gateway add") {META_SH} ;; esac\nexit 0\n')   # keeps the registration it was given
+                f'case "$1 $2" in "gateway login") [ -e "$HOME/{META}" ] && [ "$LOGIN" = ok ] || exit 1 ;;\n'
+                f'  "gateway add") {META_SH} ;; esac\nexit 0\n')   # login needs a registration in its home
     for name in ("openssl", "os"):
         os.chmod(os.path.join(stubs, name), 0o755)
     script = f"""
@@ -44,7 +46,8 @@ install_cli() {{ :; }}
 getent() {{ return 0; }}
 kc() {{ echo "kc $*" >> {log}
   case "$1 $2" in
-    "setup-client on") case "$ON" in ok) printf 'c-setup\nthe-secret' ;; named) printf 'c-setup\n'; return 1 ;; *) return 1 ;; esac ;;
+    "setup-client on") case "$ON" in ok) printf 'c-setup\nthe-secret' ;; named) printf 'c-setup\n'; return 1 ;;
+                                     whole-then-failed) printf 'c-setup\nthe-secret'; return 1 ;; *) return 1 ;; esac ;;
     "setup-client off") [ "$OFF" = ok ] || return 1 ;;
     "setup-client status") echo disabled ;;
   esac; }}
@@ -107,6 +110,14 @@ class EachStepIsChecked(unittest.TestCase):
         self.assertNotIn("did-the-call", r.stdout)
         self.assertIn("nothing was changed", r.stderr)
 
+    def test_a_switch_on_that_failed_after_writing_both_lines_never_signs_in(self):
+        # `on` exits 0 only once the client is enabled whole: its exit status counts, not only what it wrote.
+        r, calls = run(on="whole-then-failed")
+        self.assertFalse([c for c in calls if c.startswith("os gateway login")], "it signed in after a failed switch-on")
+        self.assertNotIn("did-the-call", r.stdout)
+        self.assertIn("kc setup-client off c-setup", calls)
+        self.assertIn("kc setup-client status c-setup", calls)
+
     def test_a_setup_client_left_on_is_never_reported_as_done(self):
         # The caller gets control back (its own cleanup still runs), with 70: never an answer of the call it guards.
         r, _ = run(off="fails")
@@ -116,7 +127,7 @@ class EachStepIsChecked(unittest.TestCase):
 
     def test_planted_the_unchecked_steps_pass_a_failed_sign_in_and_a_client_left_on(self):
         old = function().replace('if (( signin == 1 && interrupted == 0 )); then', 'if (( interrupted == 0 )); then') \
-                        .replace('(( closed == 1 )) || return 70', ':')
+                        .replace('(( client_off == 1 && home_gone == 1 )) || return 70', ':')
         self.assertNotEqual(old, function())
         r, _ = run(login="fails", fn=old)
         self.assertIn("did-the-call", r.stdout, "PLANTED: without the check the call ran with no sign-in")
