@@ -594,6 +594,34 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual(r.returncode, 5, r.stderr)
         self.assertEqual(r.stdout, b"")
 
+    @unittest.skipUnless(hasattr(os, "O_PATH"), "the look before the open needs O_PATH (Linux)")
+    def test_the_lock_read_is_the_one_looked_at_even_when_its_name_moves(self):
+        # Between the look and the read, the name is given to a FIFO. The reader reads the file it looked at, through
+        # that look; it never opens what the name now points to.
+        folder = os.path.realpath(tempfile.mkdtemp())
+        lock = os.path.join(folder, "code-desk.lock")
+        with open(lock, "wb") as f:
+            f.write(f"admin:{OP}".encode())
+        real_open = os.open
+
+        def swapping_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_PATH:
+                os.rename(lock, lock + ".moved")
+                os.mkfifo(lock)
+            return fd
+
+        class Out:
+            buffer = io.BytesIO()
+        code = 0
+        with mock.patch.object(os, "open", swapping_open), mock.patch.object(sys, "argv", ["reader", lock]), \
+                mock.patch.object(sys, "stdout", Out()):
+            try:
+                exec(ds.LOCK_READER, {"__name__": "reader"})
+            except SystemExit as e:
+                code = e.code
+        self.assertEqual((code, Out.buffer.getvalue()), (0, f"admin:{OP}".encode()))
+
     def lock_bytes_through_the_reader(self, data, argv, docker):
         """ds.main with its default reader, run for real as this user, on a lock file holding exactly `data`."""
         folder = os.path.realpath(tempfile.mkdtemp())
@@ -623,6 +651,18 @@ class ReviewFixes(unittest.TestCase):
                 rc, out = self.lock_bytes_through_the_reader(data, ["code-desk", "--operation", OP], docker)
                 self.assertEqual(docker.files, {}, "a settle started on a damaged claim")
                 self.assertFalse(any(c[0] == "restart" for c in docker.calls))
+
+    def test_a_line_ending_on_the_command_line_is_refused_before_any_lock_is_read(self):
+        # The same comparison from the other side: an id or a desk name given with a line ending is refused at the
+        # door, so it can never match a lock that carries the same line ending.
+        for desk, op in (("code-desk", OP + "\n"), ("code-desk\n", OP)):
+            with self.subTest(desk=desk, op=op):
+                docker = FakeDocker([STOPPED], files={f"{OP}.hold": "{}"})
+                rc, out = self.lock_bytes_through_the_reader(f"admin:{OP}\n".encode(),
+                                                             ["--unhold", desk, "--operation", op], docker)
+                self.assertEqual(rc, 1, out)
+                self.assertEqual(list(docker.files), [f"{OP}.hold"], "a hold was released for a malformed id")
+                self.assertEqual(docker.calls, [], "something ran before the arguments were checked")
 
     def settle_reading_for_real(self, desks, argv=None, docker=None):
         """up.sh's own path: ds.main with its default reader, run for real as this user (runuser and its clean

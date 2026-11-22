@@ -66,8 +66,9 @@ ADMIN_LOCK = re.compile(r"admin:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-
 JOB_LOCK = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 # Read as the Enclave's user, by a bounded reader that follows no link at ANY level: it walks from / one folder at a
 # time, each opened with O_NOFOLLOW | O_DIRECTORY. Where the system has O_PATH it first looks at the lock itself
-# without opening it for reading, so only a regular file with one link is ever opened; the file opened must then be
-# that same file. It writes the lock's bytes unchanged. Exit 3: the lock file itself is absent (nothing holds the
+# without opening it for reading, and only a regular file with one link is then opened, through that same look
+# (/proc/self/fd), never by its name again; a look that cannot be reopened is unreadable, never absent. Either way
+# the file read must be a regular file with one link. It writes the lock's bytes unchanged. Exit 3: the lock file itself is absent (nothing holds the
 # desk). Any other non-zero exit (7: a folder on the way is missing or not a real folder) means it could not be read.
 LOCK_READER = (
     "import os, stat, sys\n"
@@ -91,10 +92,15 @@ LOCK_READER = (
     "    seen = os.fstat(look)\n"
     "    if not stat.S_ISREG(seen.st_mode) or seen.st_nlink != 1:\n"
     "        sys.exit(5)\n"
+    "    name, at = '/proc/self/fd/%d' % look, None\n"
+    "    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY\n"
+    "else:\n"
+    "    name, at = parts[-1], fd\n"
+    "    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY\n"
     "try:\n"
-    "    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY, dir_fd=fd)\n"
+    "    fd = os.open(name, flags, dir_fd=at)\n"
     "except FileNotFoundError:\n"
-    "    sys.exit(3)\n"
+    "    sys.exit(3 if at is not None else 4)\n"
     "except OSError:\n"
     "    sys.exit(4)\n"
     "info = os.fstat(fd)\n"
@@ -307,11 +313,11 @@ def gateway_identity(config_text):
 def settle(desk, operation_id, backend_id=None, run=docker, clock=now, sleep=time.sleep,
            restart=None, read_lock=None, gateway_toml="", give_up=GIVE_UP_AFTER, poll=POLL, out=print, identity=None, unhold_command="sudo ./up.sh desks unhold"):
     """The whole procedure. Returns the marker written, or None when there was nothing to settle."""
-    if not DESK.match(desk):
+    if not DESK.fullmatch(desk):
         raise Refused(f"'{desk}' is not a desk name")
-    if not UUID.match(operation_id):
+    if not UUID.fullmatch(operation_id):
         raise Refused("the operation is its request id, a lowercase UUID, as `ekka desk status` prints it")
-    if backend_id is not None and not UUID.match(backend_id):
+    if backend_id is not None and not UUID.fullmatch(backend_id):
         raise Refused("--backend-id is the sandbox's id, a lowercase UUID")
     if not identity:
         raise Refused("no gateway identity from the backend adapter's configuration; nothing was changed")
@@ -365,7 +371,7 @@ def _settle_held(desk, operation_id, backend_id, run, clock, sleep, restart, rea
     # No desk found by its labels and no --backend-id: a create that never reached the desk. The marker says so with
     # a null backend id and no containers. The adapter accepts that only for a create, and only when its own read-back
     # after the restart finds no desk either; for a deleted desk, pass --backend-id from `ekka desk status`.
-    if sandbox is not None and not UUID.match(sandbox):
+    if sandbox is not None and not UUID.fullmatch(sandbox):
         raise Refused("the containers name a sandbox id that is not a lowercase UUID; no marker was written")
     if backend_id is not None and sandbox != backend_id:
         raise Refused(f"the containers belong to sandbox {sandbox}, not {backend_id}; no marker was written")
@@ -425,9 +431,9 @@ def main(argv, run=docker, ekka=enclave_ekka, read=read_as_enclave, state=None,
     desk, op, backend_id = args
     try:
         # The desk name and the change are checked before either is part of any path.
-        if not DESK.match(desk):
+        if not DESK.fullmatch(desk):
             raise Refused(f"'{desk}' is not a desk name")
-        if not UUID.match(op):
+        if not UUID.fullmatch(op):
             raise Refused("the operation is its request id, a lowercase UUID, as `ekka desk status` prints it")
         rc, listing = ekka(["desk", "list"])
         m = re.search(r"/var/lib/ekka/\S*/desks", listing) if rc == 0 else None
