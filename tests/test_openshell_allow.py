@@ -150,11 +150,10 @@ class UpSh(unittest.TestCase):
         unsets = list(re.finditer(r"unset ([A-Z_ ]+)\n", body))
         self.assertTrue(unsets, "as_gateway_admin clears NVIDIA's gateway environment")
         for unset in unsets:
-            self.assertEqual(set(unset.group(1).split()),
-                             {"OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
-                              "XDG_CONFIG_HOME"})
+            self.assertLessEqual({"OPENSHELL_GATEWAY", "OPENSHELL_GATEWAY_ENDPOINT", "OPENSHELL_GATEWAY_INSECURE",
+                                  "XDG_CONFIG_HOME"}, set(unset.group(1).split()))
         self.assertLess(unsets[-1].start(), call.start(), "cleared before the call runs")
-        self.assertLess(unsets[0].start(), body.find('gateway login'), "cleared before the sign-in")
+        self.assertLess(unsets[0].start(), body.find('"$OS" gateway login'), "cleared before the sign-in")
 
 
 if __name__ == "__main__":
@@ -306,9 +305,12 @@ class TheFolderIsMadeSafe(unittest.TestCase):
             up = f.read()
         block = up[up.index('if [[ "${1:-} ${2:-}" == "sandbox download" ]]; then'):]
         block = block[:block.index("\n    fi\n")]
-        self.assertIn('as_gateway_admin "$OS" -g ekka-agent-desks "$@" || rc=$?', block, "a failed copy does not skip the next line")
-        self.assertIn('python3 tools/openshell_allow.py --settle-download "${@: -1}" || rc=1', block)
-        self.assertLess(block.index("as_gateway_admin"), block.index("--settle-download"))
+        self.assertIn('download_settled "$@"', block, "a download goes through the function that always settles it")
+        fn = up[up.index("download_settled() {"):]
+        fn = fn[:fn.index("\n}\n")]
+        self.assertIn('as_gateway_admin "$OS" -g ekka-agent-desks "$@" || rc=$?', fn, "a failed copy does not skip the pass")
+        self.assertIn("--settle-download", fn)
+        self.assertLess(fn.index("as_gateway_admin"), fn.index("--settle-download"))
 
 
 def stat_mode(path):

@@ -562,29 +562,42 @@ except BlockingIOError:
   # ended). Keycloak's own commands run shielded: signals are ignored in their subshell, and they inherit that.
   # A session interrupted before its call returns 130; a call that already ran keeps its own result, so the caller
   # never reports as undone what was done. Either way access is switched off first, and the caller's own cleanup runs.
-  local called=0 closed=1
+  # The caller's own signal handling is put back afterwards, never replaced by the default.
+  local called=0 closed=1 signin=0 id="" out="" caller_traps
+  caller_traps=$(trap -p INT TERM HUP)
   trap 'interrupted=1' INT TERM HUP
-  # `on` enables the client before it reads the secret, so a failed `on` may have left it enabled: it is switched off
-  # again and read back, and a failure there too is said, never "nothing was changed".
-  setup_client_secret=$(trap '' INT TERM HUP; kc setup-client on) && [[ -n $setup_client_secret ]] || {
-    ( trap '' INT TERM HUP; kc setup-client off >/dev/null 2>&1 ) && st=$(trap '' INT TERM HUP; kc setup-client status 2>/dev/null) \
-      && [[ $st == disabled ]] \
-      || die "Keycloak did not switch the gateway's setup client on, and it may still be switched on; run the same command again"
-    trap - INT TERM HUP; exec 87>&-
+  # `on` writes the client's id on its first line, then its secret. The id is kept: the switch-off and its read-back
+  # address that very client, read directly by its id.
+  # A failed `on` that already named its client leaves the id alone on that line, and the id is still used.
+  out=$(trap '' INT TERM HUP; kc setup-client on) || out=${out:-}
+  id=${out%%$'\n'*}; setup_client_secret=""
+  [[ $out != *$'\n'* ]] || setup_client_secret=${out#*$'\n'}
+  [[ $id =~ ^[0-9A-Za-z-]{1,64}$ ]] || { id=""; setup_client_secret=""; }
+  out=""
+  [[ -n $id && -n $setup_client_secret ]] || {
+    # `on` may have enabled the client before it failed. Switched off and read back, each tried on its own, by the
+    # client's id when `on` reported one.
+    local off_ok=0 st_ok=0
+    ( trap '' INT TERM HUP; kc setup-client off ${id:+"$id"} >/dev/null 2>&1 ) && off_ok=1
+    st=$(trap '' INT TERM HUP; kc setup-client status ${id:+"$id"} 2>/dev/null) && [[ $st == disabled ]] && st_ok=1
+    trap - INT TERM HUP; eval "$caller_traps"; exec 87>&-
+    (( off_ok == 1 && st_ok == 1 )) \
+      || die "Keycloak did not switch the gateway's setup client on, and it may still be switched on; check desks-setup in Keycloak, then run the same command again"
     (( interrupted == 0 )) || return 130
     die "Keycloak did not switch the gateway's setup client on; nothing was changed"; }
   # NVIDIA's gateway flags read these too; one kept by `sudo -E` would send the calls, and this sign-in, elsewhere.
-  # NVIDIA's CLI falls back to /etc/openshell for a registration its own home lacks, as it does after a `gateway add`
-  # whose sign-in failed (it removes its registration and still exits 0). An empty system folder of this session's own
-  # leaves no registration but the one just added, and that one is read back before the secret signs in anywhere.
-  # Sign-in and the call run in two steps, so an interruption during sign-in stops the call from starting.
+  # The gateway is registered in this session's private folder, with an empty system registry folder of its own and
+  # without the secret (OPENSHELL_NO_BROWSER=1: no sign-in at registration). The registration is read back, and only
+  # then does `gateway login` get the secret. Sign-in and the call are two steps, so an interruption during sign-in
+  # stops the call from starting; a failed sign-in is told apart from the call's own exit status.
   if (( interrupted == 0 )); then (
-    unset OPENSHELL_GATEWAY OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_INSECURE XDG_CONFIG_HOME
-    export OPENSHELL_OIDC_CLIENT_SECRET=$setup_client_secret SSL_CERT_FILE=$DESKS_STATE/tls/ca.crt HOME=$home
+    unset OPENSHELL_GATEWAY OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_INSECURE XDG_CONFIG_HOME OPENSHELL_OIDC_CLIENT_SECRET
+    export SSL_CERT_FILE=$DESKS_STATE/tls/ca.crt HOME=$home
     export OPENSHELL_SYSTEM_GATEWAY_DIR=$HOME/system
-    install -d -m 0700 "$HOME" "$OPENSHELL_SYSTEM_GATEWAY_DIR" || exit 97
-    "$OS" gateway add "https://$NAME:8080" --name ekka-agent-desks --oidc-issuer "https://$NAME/realms/ekka-desks" \
-      --oidc-client-id desks-setup --oidc-audience ekka-desks >/dev/null 2>&1 || true
+    install -d -m 0700 "$HOME" "$OPENSHELL_SYSTEM_GATEWAY_DIR" || exit 1
+    OPENSHELL_NO_BROWSER=1 "$OS" gateway add "https://$NAME:8080" --name ekka-agent-desks \
+      --oidc-issuer "https://$NAME/realms/ekka-desks" --oidc-client-id desks-setup --oidc-audience ekka-desks \
+      </dev/null >/dev/null 2>&1 || true
     python3 -c '
 import json, os, stat, sys
 fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -594,10 +607,10 @@ kept = json.loads(os.read(fd, 65536))
 want = {"gateway_endpoint": sys.argv[2], "auth_mode": "oidc", "oidc_issuer": sys.argv[3], "oidc_client_id": "desks-setup"}
 sys.exit(0 if isinstance(kept, dict) and all(kept.get(k) == v for k, v in want.items()) else 1)' \
       "$HOME/.config/openshell/gateways/ekka-agent-desks/metadata.json" "https://$NAME:8080" \
-      "https://$NAME/realms/ekka-desks" 2>/dev/null || exit 97
-    "$OS" gateway login ekka-agent-desks >/dev/null || exit 97  # 97: never an answer of the call it guards
-  ) || rc=$?; fi
-  if (( rc == 0 && interrupted == 0 )); then
+      "https://$NAME/realms/ekka-desks" 2>/dev/null || exit 1
+    OPENSHELL_OIDC_CLIENT_SECRET=$setup_client_secret "$OS" gateway login ekka-agent-desks >/dev/null || exit 1
+  ) && signin=1; fi
+  if (( signin == 1 && interrupted == 0 )); then
     called=1
     ( unset OPENSHELL_GATEWAY OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_INSECURE XDG_CONFIG_HOME
       export OPENSHELL_OIDC_CLIENT_SECRET=$setup_client_secret SSL_CERT_FILE=$DESKS_STATE/tls/ca.crt HOME=$home
@@ -606,22 +619,43 @@ sys.exit(0 if isinstance(kept, dict) and all(kept.get(k) == v for k, v in want.i
     ) || rc=$?
   fi
   unset setup_client_secret
-  # The switch-off, its read-back (exit status and answer) and the folder's removal are each attempted whatever the
-  # others did; the caller always gets control back, so its own cleanup (the download safety pass) still runs.
-  ( trap '' INT TERM HUP; kc setup-client off >/dev/null ) \
+  # The switch-off of this very client, its read-back by id (exit status and answer) and the folder's removal are each
+  # attempted whatever the others did; the caller always gets control back, so its own cleanup still runs.
+  ( trap '' INT TERM HUP; kc setup-client off "$id" >/dev/null ) \
     || { closed=0; printf 'up: %s\n' "the gateway's setup client may still be switched on; run the same command again" >&2; }
-  st=$(trap '' INT TERM HUP; kc setup-client status) && [[ $st == disabled ]] \
+  st=$(trap '' INT TERM HUP; kc setup-client status "$id") && [[ $st == disabled ]] \
     || { closed=0; printf 'up: %s\n' "the gateway's setup client is not confirmed switched off; run the same command again" >&2; }
   rm -rf "$home"; [[ ! -e $home && ! -L $home ]] \
     || { closed=0; printf 'up: %s\n' "the gateway's sign-in folder ($home) could not be removed; remove it before anything else" >&2; }
-  trap - INT TERM HUP
   exec 87>&-
-  (( closed == 1 )) || return 70   # 70: the session did not close; never an answer of the call it guards
   if (( interrupted == 1 )); then
-    (( called == 1 )) || { say "interrupted: the call did not run, and the gateway's setup client is switched off again"; return 130; }
-    say "interrupted: the call had already finished; its result stands, and the setup client is switched off again"
+    if (( called == 1 )); then
+      say "interrupted: the call had already finished; its result stands, and the setup client is switched off again"
+    else
+      say "interrupted: the call did not run, and the gateway's setup client is switched off again"; rc=130
+    fi
   fi
-  (( rc != 97 )) || die "could not sign in to NVIDIA's gateway as its administrator; nothing was changed there"
+  trap - INT TERM HUP; eval "$caller_traps"
+  (( closed == 1 )) || return 70   # 70: the session did not close; never an answer of the call it guards
+  (( called == 1 || interrupted == 1 )) || {
+    printf 'up: %s\n' "could not sign in to NVIDIA's gateway as its administrator; nothing was changed there" >&2; return 69; }
+  return $rc
+}
+
+download_settled() {  # download_settled sandbox download <desk> ... <folder>: the copy, then the folder made safe
+  # What a download brings was packed inside the desk. Whatever the copy's result, and whatever signal arrives, the
+  # folder is made safe before anybody reads it: links and special files removed, setuid and write-by-others bits
+  # cleared (tools/openshell_allow.py says why). Signals are noted from before the copy until the pass has finished,
+  # and the pass itself runs with them ignored, so neither an interruption nor the session's own result can skip it.
+  local rc=0 pass=0 noted=0
+  trap 'noted=1' INT TERM HUP
+  OPENSHELL_WORKSPACE=${OPENSHELL_WORKSPACE:-desks} as_gateway_admin "$OS" -g ekka-agent-desks "$@" || rc=$?
+  trap 'noted=1' INT TERM HUP     # as_gateway_admin put back this function's handling; kept through the pass
+  ( trap '' INT TERM HUP; exec python3 tools/openshell_allow.py --settle-download "${@: -1}" ) || pass=1
+  trap - INT TERM HUP
+  (( pass == 0 )) || { printf 'up: %s\n' "the downloaded folder was not made safe; do not use what is in it" >&2; return 1; }
+  # As with any call that already ran, an interruption does not undo it: the copy's own result stands.
+  (( noted == 0 )) || say "interrupted: the folder was made safe; the copy's own result stands"
   return $rc
 }
 
@@ -662,7 +696,7 @@ connect_cmd() {  # connect_cmd <provider>: a provider's one key, read from stdin
   # The key is never an argument, never printed and never logged. It is read from a pipe (a terminal is refused, so
   # it never sits on a screen) into a variable no other process sees, and handed to NVIDIA's CLI alone, in the
   # environment variable the provider's profile names. An argument is never echoed back: it may be a key.
-  local p key secret
+  local p key secret rc
   (( $# == 1 )) || die "usage: <key source> | sudo ekka desk connect <provider>   (the key comes on stdin, never as an argument)"
   p=$1
   profile_names | grep -xF -- "$p" >/dev/null || die "that is not a provider this install knows; they are: $(profile_names | tr '\n' ' ')"
@@ -673,7 +707,10 @@ connect_cmd() {  # connect_cmd <provider>: a provider's one key, read from stdin
   if python3 tools/provider_connect.py keyless "$(profile_source "$p")" </dev/null; then
     if [[ ! -t 0 ]]; then IFS= read -r -t 1 -d '' secret || true; fi
     [[ -z ${secret:-} ]] || { secret=; die "$p takes no key; nothing was changed. Run it with nothing on stdin: sudo ekka desk connect $p </dev/null"; }
-    OPENSHELL_WORKSPACE=desks as_gateway_admin connect_keyless "$p" || die "the provider $p was not made; nothing else was changed"
+    rc=0; OPENSHELL_WORKSPACE=desks as_gateway_admin connect_keyless "$p" || rc=$?
+    # 70: the call ran, but the setup client was not confirmed off (said above). The provider may well exist.
+    (( rc != 70 )) || die "the provider $p may have been made, but the gateway's setup client is not confirmed switched off (see above). Check desks-setup in Keycloak and the provider (sudo ./up.sh openshell provider get $p), then run this again"
+    (( rc == 0 )) || die "the provider $p was not made; nothing else was changed"
     ok "$p is connected: it takes no key"
     ( step_desk_grant ) || die "the provider $p IS made; the desks grant was not refreshed, so a desk naming $p is refused until it is: sudo ./up.sh server $NAME"
     return 0
@@ -684,8 +721,10 @@ connect_cmd() {  # connect_cmd <provider>: a provider's one key, read from stdin
   secret=${secret%$'\n'}
   [[ -n $secret && $secret != *[[:space:]]* && ${#secret} -le 8192 ]] \
     || { secret=; die "stdin must carry exactly one key: no spaces, no second line; nothing was changed"; }
-  OPENSHELL_WORKSPACE=desks as_gateway_admin connect_provider "$p" "$key" \
-    || { secret=; die "the key for $p was not set; nothing else was changed"; }
+  rc=0; OPENSHELL_WORKSPACE=desks as_gateway_admin connect_provider "$p" "$key" || rc=$?
+  # 70: the call ran, but the setup client was not confirmed off (said above). The key may well be set.
+  (( rc != 70 )) || { secret=; die "the key for $p may have been set, but the gateway's setup client is not confirmed switched off (see above). Check desks-setup in Keycloak and the provider (sudo ./up.sh openshell provider get $p), then run this again"; }
+  (( rc == 0 )) || { secret=; die "the key for $p was not set; nothing else was changed"; }
   secret=
   ok "$p is connected: its key is in the gateway"
   # The desks grant names each provider this gateway holds, by its digest (read by the EKKA CLI). Refreshed now, add
@@ -1539,11 +1578,7 @@ case "${1:-}" in
     NAME=$(sed -n 's/^DESKS_NAME=//p' "$DESKS_STATE/up.env" 2>/dev/null); [[ -n $NAME ]] || die "not installed yet"
     shift; python3 tools/openshell_allow.py "$DESKS_STATE/openshell-admin.log" "$@" || exit 1   # an allow-list, logged
     if [[ "${1:-} ${2:-}" == "sandbox download" ]]; then
-      # What a download brings was packed inside the desk. Whatever the copy's result, the folder is made safe before
-      # anybody reads it: links and special files removed, setuid and write-by-others bits cleared (the tool says why).
-      rc=0; OPENSHELL_WORKSPACE=${OPENSHELL_WORKSPACE:-desks} as_gateway_admin "$OS" -g ekka-agent-desks "$@" || rc=$?
-      python3 tools/openshell_allow.py --settle-download "${@: -1}" || rc=1
-      exit $rc
+      download_settled "$@"; exit $?
     fi
     OPENSHELL_WORKSPACE=${OPENSHELL_WORKSPACE:-desks} as_gateway_admin "$OS" -g ekka-agent-desks "$@"; exit $? ;;   # the desks' workspace unless told otherwise
   *) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 2 ;;

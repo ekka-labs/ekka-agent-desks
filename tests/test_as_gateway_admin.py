@@ -44,7 +44,7 @@ install_cli() {{ :; }}
 getent() {{ return 0; }}
 kc() {{ echo "kc $*" >> {log}
   case "$1 $2" in
-    "setup-client on") [ "$ON" = ok ] && printf the-secret || return 1 ;;
+    "setup-client on") case "$ON" in ok) printf 'c-setup\nthe-secret' ;; named) printf 'c-setup\n'; return 1 ;; *) return 1 ;; esac ;;
     "setup-client off") [ "$OFF" = ok ] || return 1 ;;
     "setup-client status") echo disabled ;;
   esac; }}
@@ -65,7 +65,8 @@ class EachStepIsChecked(unittest.TestCase):
         r, calls = run()
         self.assertIn("did-the-call", r.stdout)
         self.assertIn("rc=0", r.stdout)
-        self.assertEqual(calls[-2:], ["kc setup-client off", "kc setup-client status"], "switched off, then read back")
+        self.assertEqual(calls[-2:], ["kc setup-client off c-setup", "kc setup-client status c-setup"],
+                         "this very client switched off, then read back by its id")
 
     def test_the_calls_own_answer_comes_back(self):
         r, _ = run(action="return 1")
@@ -74,9 +75,10 @@ class EachStepIsChecked(unittest.TestCase):
     def test_a_failed_sign_in_never_runs_the_call(self):
         r, calls = run(login="fails")
         self.assertNotIn("did-the-call", r.stdout)
-        self.assertNotIn("rc=", r.stdout, "it stops: never an rc a caller could read as an answer")
+        # 69 goes back to the caller (whose own cleanup runs): never an answer of the call, which did not run.
+        self.assertIn("rc=69", r.stdout)
         self.assertIn("could not sign in to NVIDIA's gateway", r.stderr)
-        self.assertIn("kc setup-client off", calls, "switched off even then")
+        self.assertIn("kc setup-client off c-setup", calls, "switched off even then")
 
     def test_a_setup_client_that_is_not_switched_on_runs_nothing(self):
         r, calls = run(on="fails")
@@ -92,6 +94,19 @@ class EachStepIsChecked(unittest.TestCase):
         self.assertIn("may still be switched on", r.stderr)
         self.assertNotIn("nothing was changed", r.stderr)
 
+    def test_a_failed_switch_on_is_still_read_back_when_the_switch_off_fails(self):
+        r, calls = run(on="fails", off="fails")
+        self.assertIn("kc setup-client status", calls, "the read-back was skipped because the switch-off failed")
+        self.assertIn("may still be switched on", r.stderr)
+
+    def test_a_switch_on_that_failed_after_naming_its_client_switches_off_that_client(self):
+        # `on` wrote the id line, then failed before the secret: the switch-off and its read-back use that id.
+        r, calls = run(on="named")
+        self.assertIn("kc setup-client off c-setup", calls)
+        self.assertIn("kc setup-client status c-setup", calls)
+        self.assertNotIn("did-the-call", r.stdout)
+        self.assertIn("nothing was changed", r.stderr)
+
     def test_a_setup_client_left_on_is_never_reported_as_done(self):
         # The caller gets control back (its own cleanup still runs), with 70: never an answer of the call it guards.
         r, _ = run(off="fails")
@@ -100,8 +115,7 @@ class EachStepIsChecked(unittest.TestCase):
         self.assertIn("may still be switched on", r.stderr)
 
     def test_planted_the_unchecked_steps_pass_a_failed_sign_in_and_a_client_left_on(self):
-        old = function().replace(' || exit 97  # 97: never an answer of the call it guards', '') \
-                        .replace('if (( rc == 0 && interrupted == 0 )); then', 'if (( interrupted == 0 )); then') \
+        old = function().replace('if (( signin == 1 && interrupted == 0 )); then', 'if (( interrupted == 0 )); then') \
                         .replace('(( closed == 1 )) || return 70', ':')
         self.assertNotEqual(old, function())
         r, _ = run(login="fails", fn=old)
