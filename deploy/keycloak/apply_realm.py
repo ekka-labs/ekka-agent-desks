@@ -107,6 +107,10 @@ def find_client(api, spec, client_id):
 
 
 SETUP_ID = re.compile(r"[0-9A-Za-z-]{1,64}")
+# How the setup client signs in: confidential, its own service account only, no person's sign-in flow. Created with
+# these, and an existing client must still have them before it is given its scope and role.
+SETUP_SETTINGS = {"publicClient": False, "serviceAccountsEnabled": True, "standardFlowEnabled": False,
+                  "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "protocol": "openid-connect"}
 
 
 def setup_client_by_id(api, spec, client_id):
@@ -478,8 +482,7 @@ def main(argv):
             # Created disabled: it is enabled below, only once its scope and role are in place.
             api.write("POST", realm_path(spec, "/clients"), {
                 "clientId": "desks-setup", "name": "up.sh: the gateway's one-time setup", "enabled": False,
-                "publicClient": False, "serviceAccountsEnabled": True, "standardFlowEnabled": False,
-                "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "protocol": "openid-connect",
+                **SETUP_SETTINGS,
                 "protocolMappers": [{"name": AUDIENCE_MAPPER, "protocol": "openid-connect",
                                      "protocolMapper": "oidc-audience-mapper",
                                      "config": {"included.custom.audience": "ekka-desks",
@@ -493,6 +496,12 @@ def main(argv):
             raise SystemExit("keycloak: the setup client's id is not one up.sh can read back; it was not switched on")
         sys.stdout.write(c["id"] + "\n")
         sys.stdout.flush()
+        # Read by its id, its sign-in settings must be the ones it was created with.
+        c = setup_client_by_id(api, spec, c["id"])
+        drifted = sorted(k for k, v in SETUP_SETTINGS.items() if c.get(k) != v)
+        if drifted:
+            raise SystemExit("keycloak: the setup client's sign-in settings are not the ones up.sh creates ("
+                             + ", ".join(drifted) + "); it was not switched on")
         # Its scope and its role, checked on every `on` and read back before it is enabled: an `on` stopped between
         # creating the client and assigning them left a client that signs in but cannot do the setup.
         # Each is matched by its id as well as its name: a record that only shares the name is not the one meant.

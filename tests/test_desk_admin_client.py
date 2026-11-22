@@ -378,7 +378,10 @@ class SetupKeycloak:
             raise AssertionError(f"unexpected {method} {path}")
 
 
-RECORD = {"id": "c-setup", "clientId": "desks-setup"}
+# The sign-in settings up.sh creates the client with, written here from the Keycloak client representation.
+SIGN_IN = {"publicClient": False, "serviceAccountsEnabled": True, "standardFlowEnabled": False,
+           "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "protocol": "openid-connect"}
+RECORD = {"id": "c-setup", "clientId": "desks-setup", **SIGN_IN}
 
 
 class TheSetupClientIsReadStrictly(unittest.TestCase):
@@ -482,6 +485,15 @@ class TheSetupClientIsWholeBeforeItIsEnabled(unittest.TestCase):
                     run(["setup-client", "on"], kc)
                 self.assertFalse(any(w[0] == "PUT" and w[1].endswith("/clients/c-setup") for w in kc.writes),
                                  "it was enabled on an assignment that only shares the name")
+
+    def test_an_existing_client_whose_sign_in_settings_changed_is_never_given_its_role_or_enabled(self):
+        for setting, value in (("directAccessGrantsEnabled", True), ("publicClient", True),
+                               ("standardFlowEnabled", True), ("serviceAccountsEnabled", False)):
+            with self.subTest(setting=setting):
+                kc = SetupKeycloak({**RECORD, setting: value, "enabled": False})
+                with self.assertRaises(SystemExit):
+                    run(["setup-client", "on"], kc)
+                self.assertEqual(kc.writes, [], "a client with other sign-in settings was changed")
 
     def test_a_terminal_is_refused_before_anything_changes(self):
         class Tty(io.StringIO):
