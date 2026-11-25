@@ -55,9 +55,9 @@ RUN set -eu; \
 # of every other job's. It comes from EKKA's signed runner release, pinned by version and by the release tarball's
 # SHA-256 for each architecture (published beside it as <tarball>.sha256 on get.ekka.ai). The hash, not the server,
 # decides what is installed. A changed version without new hashes fails.
-ARG EKKA_VERSION=0.6.18
-ARG EKKA_TARBALL_SHA256_X64=1e9108c29cb4d9f1d2c9e045564b6b160e8f96ffa52c5f0a712306462becbc08
-ARG EKKA_TARBALL_SHA256_ARM64=6b6621c163171e3362511af13ce0dda4889d4ec3f9bff7cd8e38e53bedb71853
+ARG EKKA_VERSION=0.6.19
+ARG EKKA_TARBALL_SHA256_X64=9aa8f1aa52dc2fa4f0955a744e32b1c19b89107a9bdf9a1e94e825b3816755e9
+ARG EKKA_TARBALL_SHA256_ARM64=d3f7892b6518b54ff8bd77c77049549588e6d963a50ccff2542bb6da52e9b1a9
 RUN set -eu; \
     case "$(dpkg --print-architecture)" in \
       amd64) target=x86_64-unknown-linux-musl;  want="$EKKA_TARBALL_SHA256_X64" ;; \
