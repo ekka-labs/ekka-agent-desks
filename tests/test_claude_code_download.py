@@ -40,8 +40,26 @@ class ClaudeCodeIsPinnedRetriedAndChecked(unittest.TestCase):
         text = dockerfile()
         for plant in (text.replace(" --retry-all-errors", ""), text.replace('echo "${want}  /tmp/claude" | sha256sum -c -; \\\n', "")):
             self.assertNotEqual(plant, text)
-            failed = ("--retry-all-errors" not in plant) or ("sha256sum -c -" not in plant)
+            failed = ("--retry-all-errors" not in plant) or ('echo "${want}  /tmp/claude" | sha256sum -c -' not in plant)
             self.assertTrue(failed)
+
+
+class EkkaSessionIsPinnedAndChecked(unittest.TestCase):
+    """ekka-session, the wall a shared job starts inside: from the signed runner release, by version and hash."""
+
+    def test_each_architecture_has_a_pinned_tarball_sha256(self):
+        text = dockerfile()
+        self.assertRegex(text, r"ARG EKKA_VERSION=\d+\.\d+\.\d+\n")
+        for arch in ("X64", "ARM64"):
+            self.assertRegex(text, rf"ARG EKKA_TARBALL_SHA256_{arch}=[0-9a-f]{{64}}\n")
+
+    def test_it_comes_from_the_release_and_the_hash_decides(self):
+        text = dockerfile()
+        fetch = text.index("https://get.ekka.ai/runner/v${EKKA_VERSION}/${pkg}.tar.gz")
+        check = text.index('echo "${want}  /tmp/ekka.tar.gz" | sha256sum -c -')
+        install = text.index('install -o root -g root -m 0755 "/tmp/${pkg}/bin/ekka-session" /usr/local/bin/ekka-session')
+        self.assertLess(fetch, check)
+        self.assertLess(check, install)
 
 
 if __name__ == "__main__":
