@@ -51,6 +51,29 @@ RUN set -eu; \
     rm -f /tmp/claude; \
     /usr/local/bin/claude --version
 
+# ekka-session: the wall every shared job on this desk starts inside. It gives each job its own folder and keeps it out
+# of every other job's. It comes from EKKA's signed runner release, pinned by version and by the release tarball's
+# SHA-256 for each architecture (published beside it as <tarball>.sha256 on get.ekka.ai). The hash, not the server,
+# decides what is installed. A changed version without new hashes fails.
+ARG EKKA_VERSION=0.6.19
+ARG EKKA_TARBALL_SHA256_X64=9aa8f1aa52dc2fa4f0955a744e32b1c19b89107a9bdf9a1e94e825b3816755e9
+ARG EKKA_TARBALL_SHA256_ARM64=d3f7892b6518b54ff8bd77c77049549588e6d963a50ccff2542bb6da52e9b1a9
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) target=x86_64-unknown-linux-musl;  want="$EKKA_TARBALL_SHA256_X64" ;; \
+      arm64) target=aarch64-unknown-linux-musl; want="$EKKA_TARBALL_SHA256_ARM64" ;; \
+      *) echo "no pinned ekka-session for $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    pkg="ekka-${EKKA_VERSION}-${target}"; \
+    curl -fsSL --retry 10 --retry-all-errors --retry-delay 10 --retry-max-time 600 \
+      -o /tmp/ekka.tar.gz "https://get.ekka.ai/runner/v${EKKA_VERSION}/${pkg}.tar.gz"; \
+    echo "${want}  /tmp/ekka.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/ekka.tar.gz -C /tmp "${pkg}/bin/ekka-session"; \
+    install -o root -g root -m 0755 "/tmp/${pkg}/bin/ekka-session" /usr/local/bin/ekka-session; \
+    rm -rf /tmp/ekka.tar.gz "/tmp/${pkg}"; \
+    rc=0; /usr/local/bin/ekka-session read-job >/dev/null 2>&1 || rc=$?; \
+    [ "$rc" -eq 10 ] || { echo "ekka-session ${EKKA_VERSION} answered read-job with ${rc}, not 10" >&2; exit 1; }
+
 # Git's credential helper for the desk's GitHub and Bitbucket connections, as a root-owned file. A clone names it with
 # -c credential.helper=...; an inline shell-function helper is held for approval, and nobody can approve one.
 COPY ekka-git-credential /usr/local/bin/ekka-git-credential
