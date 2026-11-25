@@ -56,8 +56,8 @@ RUN set -eu; \
 # SHA-256 for each architecture (published beside it as <tarball>.sha256 on get.ekka.ai). The hash, not the server,
 # decides what is installed. A changed version without new hashes fails.
 ARG EKKA_VERSION=0.6.18
-ARG EKKA_TARBALL_SHA256_X64=PENDING_RELEASE
-ARG EKKA_TARBALL_SHA256_ARM64=PENDING_RELEASE
+ARG EKKA_TARBALL_SHA256_X64=1e9108c29cb4d9f1d2c9e045564b6b160e8f96ffa52c5f0a712306462becbc08
+ARG EKKA_TARBALL_SHA256_ARM64=6b6621c163171e3362511af13ce0dda4889d4ec3f9bff7cd8e38e53bedb71853
 RUN set -eu; \
     case "$(dpkg --print-architecture)" in \
       amd64) target=x86_64-unknown-linux-musl;  want="$EKKA_TARBALL_SHA256_X64" ;; \
