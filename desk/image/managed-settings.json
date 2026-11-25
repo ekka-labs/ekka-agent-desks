@@ -21,7 +21,9 @@
       "Bash(rm -rf -- /sandbox/ekka-workspace/* *)",
       "Bash(rm -rf -- *..*)",
       "Bash(rm -rf -- *$*)",
-      "Bash(rm -rf -- *`*)"
+      "Bash(rm -rf -- *`*)",
+      "Read(/proc/**)",
+      "Read(//proc/**)"
     ]
   }
 }

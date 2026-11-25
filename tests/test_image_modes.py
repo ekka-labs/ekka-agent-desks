@@ -22,7 +22,7 @@ class ImageModes(unittest.TestCase):
             'Edit(//sandbox/ekka-workspace/.ekka/**)',
             'Bash(git remote get-url origin)',
             'Bash(' + lines.pop().replace(' <address> <folder>', ' *') + ')',
-            'Bash(rm -rf -- /sandbox/ekka-workspace/*)'], 'deny': RM_DENY})
+            'Bash(rm -rf -- /sandbox/ekka-workspace/*)'], 'deny': RM_DENY + PROC_DENY})
 
     def test_claude_code_sends_nothing_of_its_own(self):
         # On a discovery desk auto approval OPENS Claude Code's telemetry host, which changes the wall mid-run and the
@@ -113,6 +113,14 @@ RM_DENY = [
     'Bash(rm -rf -- *..*)',
     'Bash(rm -rf -- *$*)',
     'Bash(rm -rf -- *`*)',
+]
+
+# On a desk that runs several jobs at once, every job shares the desk's process list, and NVIDIA OpenShell gives a
+# job no process list of its own. The agent's own tools are refused /proc, so it cannot read another job's command
+# lines from there (measured on a live desk, 24 Nov 2026). See docs/SECURITY.md.
+PROC_DENY = [
+    'Read(/proc/**)',
+    'Read(//proc/**)',
 ]
 
 
