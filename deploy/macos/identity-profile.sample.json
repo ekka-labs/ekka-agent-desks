@@ -1,26 +1,5 @@
 {
-  "schema": "ekka-desk-host.identity-profile/v1",
+  "schema": "ekka-desk-host.identity-profile/v2",
   "org": "7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
-  "gateway": {
-    "issuer": "https://govern.example.com/oidc/orgs/7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
-    "audience": "urn:ekka:desk-gateway:development:0b6f4a52-1c3d-4e5f-8a9b-0c1d2e3f4a5b",
-    "roles_claim": "ekka_roles.development",
-    "admin_role": "openshell-admin",
-    "user_role": "openshell-user",
-    "scopes_claim": "scope",
-    "jwks_ttl_secs": 300
-  },
-  "callers": {
-    "enclave": {
-      "subject": "enclave/2f8e7d6c-5b4a-4392-8170-6e5d4c3b2a19",
-      "token": {
-        "kind": "client_credentials",
-        "client_id": "ekka-enclave",
-        "secret_name": "OPENSHELL_EXECUTOR_CLIENT_SECRET"
-      }
-    },
-    "adapter": {
-      "subject": "adapter/5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d"
-    }
-  }
+  "gateway_id": "urn:ekka:desk-gateway:development:0b6f4a52-1c3d-4e5f-8a9b-0c1d2e3f4a5b"
 }

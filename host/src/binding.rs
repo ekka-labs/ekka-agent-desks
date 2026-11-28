@@ -1,6 +1,8 @@
 //! The installation binding: which organization, developer, environment, profile and runtime this Mac's install
-//! serves. Root writes it once and it never changes; an install for anything else is refused before any change.
-//! A second install with the same binding is the same installation and changes nothing that is already right.
+//! serves. One installation per Mac in this release: the binding is machine-wide (the records, the release and its
+//! `current` link are shared by every user on the Mac), root writes it once, and an install for any other
+//! organization, developer or environment is refused before any change. A second install with the same binding is
+//! the same installation and changes nothing that is already right.
 
 use std::path::Path;
 
@@ -52,6 +54,7 @@ impl Want {
         if !is_env(&self.env) {
             return Err(refused("--env must be an environment name (lowercase letters, digits and -)"));
         }
+        crate::identity::govern_origin(&self.env)?;
         if self.profile != PROFILE {
             return Err(refused(format!("only --profile {PROFILE} is installed by this release")));
         }
@@ -106,8 +109,8 @@ impl Binding {
     pub fn check_same(&self, want: &Want) -> Result<()> {
         if self.org != want.org {
             return Err(refused(format!(
-                "this Mac's desk host for uid {} is bound to organization {}; refusing organization {} before any \
-                 change. One installation serves one organization",
+                "this Mac's desk host (uid {}) is bound to organization {}; refusing organization {} before any \
+                 change. One installation per Mac, for one organization",
                 self.uid, self.org, want.org
             )));
         }
@@ -126,7 +129,7 @@ impl Binding {
         }
         if !differ.is_empty() {
             return Err(refused(format!(
-                "this Mac's desk host is bound to {}; nothing was changed",
+                "this Mac's desk host is bound to {}; nothing was changed. One installation per Mac",
                 differ.join(", ")
             )));
         }

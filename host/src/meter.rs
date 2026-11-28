@@ -102,31 +102,89 @@ pub fn container(image: &str) -> Value {
     })
 }
 
-/// Whether a running container is the meter this release makes: its image, no TTY, no network, read-only, no
-/// mounts. Each difference is named.
+/// Every way a container differs from the meter this release makes: its exact image, entrypoint and arguments,
+/// user, no TTY, no network, a read-only root, no privilege, every capability dropped and none added, no new
+/// privileges, and no mounts. Each difference is named; none means it is exactly this release's meter.
 pub fn differences(inspect: &Value, image: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let mut differ = |ok: bool, what: &str| {
+        if !ok {
+            out.push(what.to_string());
+        }
+    };
     let c = &inspect["Config"];
     let h = &inspect["HostConfig"];
-    if c["Image"].as_str() != Some(image) {
-        out.push("it runs another image than the pinned one".to_string());
-    }
-    if c["Tty"].as_bool() != Some(false) {
-        out.push("it has a TTY (the reader needs Tty=false)".to_string());
-    }
-    if h["NetworkMode"].as_str() != Some("none") {
-        out.push("it has a network".to_string());
-    }
-    if h["ReadonlyRootfs"].as_bool() != Some(true) {
-        out.push("its root is writable".to_string());
-    }
-    if inspect["Mounts"].as_array().is_some_and(|m| !m.is_empty()) {
-        out.push("it has mounts".to_string());
-    }
-    if c["Cmd"].get(0).and_then(Value::as_str) != Some(script("/proc", None).as_str()) {
-        out.push("it runs another command than this release's meter".to_string());
-    }
+    let empty = |v: &Value| v.is_null() || v.as_array().is_some_and(|a| a.is_empty());
+    differ(c["Image"].as_str() == Some(image), "it runs another image than the pinned one");
+    differ(c["Entrypoint"] == json!(["/bin/sh", "-c"]), "its entrypoint is not this release's");
+    differ(c["Cmd"] == json!([script("/proc", None)]), "its command is not this release's meter");
+    differ(c["User"].as_str() == Some("65534:65534"), "it does not run as nobody");
+    differ(c["Tty"].as_bool() == Some(false), "it has a TTY (the reader needs Tty=false)");
+    differ(h["NetworkMode"].as_str() == Some("none"), "it has a network");
+    differ(h["ReadonlyRootfs"].as_bool() == Some(true), "its root is writable");
+    differ(h["Privileged"].as_bool() == Some(false), "it is privileged");
+    differ(h["CapDrop"] == json!(["ALL"]), "it keeps capabilities");
+    differ(empty(&h["CapAdd"]), "it adds capabilities");
+    differ(h["SecurityOpt"] == json!(["no-new-privileges:true"]), "its security options are not this release's");
+    differ(empty(&h["Binds"]) && empty(&h["Mounts"]) && empty(&inspect["Mounts"]), "it has mounts");
+    differ(empty(&h["Devices"]), "it has devices");
+    differ(h["PidMode"].as_str().unwrap_or("").is_empty(), "it shares another process namespace");
     out
+}
+
+/// What the meter needs from Docker, so its replacement can be checked without one.
+pub trait MeterDocker {
+    fn pull(&self, image: &str) -> crate::error::Result<()>;
+    fn container(&self, name: &str) -> crate::error::Result<Option<Value>>;
+    fn remove(&self, id: &str) -> crate::error::Result<()>;
+    fn create(&self, name: Option<&str>, body: &Value) -> crate::error::Result<String>;
+    fn start(&self, id: &str) -> crate::error::Result<()>;
+}
+
+impl MeterDocker for crate::runtime::docker::Docker {
+    fn pull(&self, image: &str) -> crate::error::Result<()> {
+        crate::runtime::docker::Docker::pull(self, image)
+    }
+    fn container(&self, name: &str) -> crate::error::Result<Option<Value>> {
+        crate::runtime::docker::Docker::container(self, name)
+    }
+    fn remove(&self, id: &str) -> crate::error::Result<()> {
+        crate::runtime::docker::Docker::remove(self, id)
+    }
+    fn create(&self, name: Option<&str>, body: &Value) -> crate::error::Result<String> {
+        crate::runtime::docker::Docker::create(self, name, body)
+    }
+    fn start(&self, id: &str) -> crate::error::Result<()> {
+        crate::runtime::docker::Docker::start(self, id)
+    }
+}
+
+/// A fresh meter, every install. A container already named `ekka-vm-meter` is never reused or started, whatever
+/// it looks like: it is removed, and a new one is made from this release's exact settings, read back, and only
+/// then started. Returns what changed.
+pub fn replace(docker: &impl MeterDocker, image: &str) -> crate::error::Result<Vec<String>> {
+    docker.pull(image)?;
+    let mut changes = Vec::new();
+    if let Some(old) = docker.container(NAME)? {
+        let id = old["Id"].as_str().unwrap_or(NAME).to_string();
+        docker.remove(&id)?;
+        changes.push(format!("removed the existing {NAME} (a meter is never reused)"));
+    }
+    let id = docker.create(Some(NAME), &container(image))?;
+    let made = docker
+        .container(&id)?
+        .ok_or_else(|| crate::error::failed(format!("Docker made {NAME} and then did not have it")))?;
+    let diff = differences(&made, image);
+    if !diff.is_empty() {
+        docker.remove(&id)?;
+        return Err(crate::error::refused(format!(
+            "Docker made {NAME} with other settings than asked ({}); it was removed, not started",
+            diff.join(", ")
+        )));
+    }
+    docker.start(&id)?;
+    changes.push(format!("started a fresh {NAME}"));
+    Ok(changes)
 }
 
 /// The newest complete sample in the meter's last lines.
@@ -262,6 +320,74 @@ mod tests {
         );
     }
 
+    /// What Docker's inspect shows for a container created from `body`.
+    fn inspect_of(body: &Value) -> Value {
+        json!({"Id": "x", "Config": body, "HostConfig": body["HostConfig"], "Mounts": [], "State": {"Running": false}})
+    }
+
+    /// A Docker in memory: records every call, holds containers by id.
+    #[derive(Default)]
+    struct FakeDocker {
+        containers: std::cell::RefCell<Vec<Value>>,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl MeterDocker for FakeDocker {
+        fn pull(&self, _: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn container(&self, name: &str) -> crate::error::Result<Option<Value>> {
+            Ok(self.containers.borrow().iter().find(|c| c["Id"] == name || c["Name"] == name).cloned())
+        }
+        fn remove(&self, id: &str) -> crate::error::Result<()> {
+            self.calls.borrow_mut().push(format!("remove {id}"));
+            self.containers.borrow_mut().retain(|c| c["Id"] != id);
+            Ok(())
+        }
+        fn create(&self, name: Option<&str>, body: &Value) -> crate::error::Result<String> {
+            let id = format!("fresh-{}", self.calls.borrow().len());
+            let mut c = inspect_of(body);
+            c["Id"] = id.clone().into();
+            c["Name"] = name.unwrap_or("").into();
+            self.containers.borrow_mut().push(c);
+            self.calls.borrow_mut().push(format!("create {id}"));
+            Ok(id)
+        }
+        fn start(&self, id: &str) -> crate::error::Result<()> {
+            self.calls.borrow_mut().push(format!("start {id}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_planted_meter_is_replaced_never_started() {
+        let img = "docker.io/library/busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec";
+        // A stopped container with the meter's name, image, command, no TTY, no network, read-only and no mounts,
+        // and a different entrypoint, privileged, with every capability: what the old check let through.
+        let mut planted = inspect_of(&container(img));
+        planted["Id"] = "planted".into();
+        planted["Name"] = NAME.into();
+        planted["Config"]["Entrypoint"] = json!(["/bin/evil"]);
+        planted["HostConfig"]["Privileged"] = true.into();
+        planted["HostConfig"]["CapAdd"] = json!(["ALL"]);
+        assert!(differences(&planted, img).len() >= 3, "{:?}", differences(&planted, img));
+        let docker = FakeDocker { containers: std::cell::RefCell::new(vec![planted]), ..Default::default() };
+        let changes = replace(&docker, img).unwrap();
+        let calls = docker.calls.borrow().clone();
+        assert_eq!(calls[0], "remove planted");
+        assert!(!calls.contains(&"start planted".to_string()), "{calls:?}");
+        assert!(calls.last().unwrap().starts_with("start fresh-"), "{calls:?}");
+        assert_eq!(changes.len(), 2);
+        // Even a planted container identical in every setting is replaced, not reused.
+        let same = FakeDocker::default();
+        let mut twin = inspect_of(&container(img));
+        twin["Id"] = "twin".into();
+        twin["Name"] = NAME.into();
+        same.containers.borrow_mut().push(twin);
+        replace(&same, img).unwrap();
+        assert_eq!(same.calls.borrow()[0], "remove twin");
+    }
+
     #[test]
     fn the_container_is_sealed_and_recognised() {
         let img =
@@ -272,11 +398,10 @@ mod tests {
         assert_eq!(c["HostConfig"]["ReadonlyRootfs"], true);
         assert_eq!(c["HostConfig"]["Mounts"], json!([]));
         assert_eq!(c["HostConfig"]["LogConfig"]["Config"]["max-file"], "3");
-        let inspect = json!({"Config": {"Image": img, "Tty": false, "Cmd": c["Cmd"]}, "HostConfig": c["HostConfig"], "Mounts": []});
-        assert!(differences(&inspect, img).is_empty());
-        let mut tty = inspect.clone();
+        assert!(differences(&inspect_of(&c), img).is_empty(), "{:?}", differences(&inspect_of(&c), img));
+        let mut tty = inspect_of(&c);
         tty["Config"]["Tty"] = true.into();
-        assert!(differences(&tty, img)[0].contains("TTY"));
+        assert_eq!(differences(&tty, img), ["it has a TTY (the reader needs Tty=false)"]);
     }
 
     /// The real meter in Docker Desktop's VM, with this crate's own Engine API client: pinned busybox, nobody, no
@@ -303,6 +428,8 @@ mod tests {
         let inspect = docker.container(&id).unwrap().unwrap();
         let lines = docker.stdout_tail(&id, READER_LINES).unwrap();
         docker.remove(&id).unwrap();
+        // Docker reads back every setting as made; only the two-sample command differs from the real meter's.
+        assert_eq!(differences(&inspect, &pins.meter_image), ["its command is not this release's meter"]);
         assert_eq!(inspect["State"]["ExitCode"], 0, "{inspect}");
         assert_eq!(inspect["Config"]["Tty"], false);
         assert_eq!(inspect["HostConfig"]["NetworkMode"], "none");

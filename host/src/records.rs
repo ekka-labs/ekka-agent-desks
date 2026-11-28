@@ -14,6 +14,7 @@ use crate::apply::Ctx;
 use crate::error::{refused, Result};
 use crate::fsx::Owner;
 use crate::kit;
+use crate::release::DeskImagePin;
 use crate::util::is_digest;
 
 /// Where the records live on a Mac, by their real path.
@@ -21,8 +22,6 @@ pub const RECORDS_DIR: &str = "/private/var/lib/ekka-agent-desks/backend";
 pub const BASELINE: &str = "baseline-policy.json";
 pub const IMAGE: &str = "desk-image.json";
 pub const CEILING: &str = "provider-ceiling.json";
-/// The desk image this machine builds; the record pins it by content id.
-pub const DESK_IMAGE_TAG: &str = "ekka-desk:local";
 const MAX_POLICY: usize = 1024 * 1024;
 
 /// The largest CPU and memory a single desk may be given. The runner refuses a ceiling outside these ranges.
@@ -33,22 +32,32 @@ pub struct Resources {
     pub max_memory_mib: u64,
 }
 
+/// The most one desk may ever be given on a developer Mac, compiled in and enforced by the root step: a request
+/// above these is refused, whatever the VM has.
+pub const MAX_DESK_CPU_MILLICORES: u64 = 8_000;
+pub const MAX_DESK_MEMORY_MIB: u64 = 16_384;
+
 impl Resources {
     pub fn check(&self) -> Result<()> {
-        if !(100..=256_000).contains(&self.max_cpu_millicores) {
-            return Err(refused("the desk CPU ceiling must be 100 to 256000 millicores"));
+        if !(100..=MAX_DESK_CPU_MILLICORES).contains(&self.max_cpu_millicores) {
+            return Err(refused(format!(
+                "the desk CPU ceiling must be 100 to {MAX_DESK_CPU_MILLICORES} millicores on a developer Mac"
+            )));
         }
-        if !(256..=4_194_304).contains(&self.max_memory_mib) {
-            return Err(refused("the desk memory ceiling must be 256 to 4194304 MiB"));
+        if !(256..=MAX_DESK_MEMORY_MIB).contains(&self.max_memory_mib) {
+            return Err(refused(format!(
+                "the desk memory ceiling must be 256 to {MAX_DESK_MEMORY_MIB} MiB on a developer Mac"
+            )));
         }
         Ok(())
     }
 
-    /// Half of what Docker's VM has, so one desk can never take the whole VM, within the runner's ranges.
+    /// Half of what Docker's VM has, so one desk can never take the whole VM, and never above the compiled-in
+    /// maxima.
     pub fn half_of(vm_cpus: u64, vm_memory_bytes: u64) -> Result<Self> {
         let r = Resources {
-            max_cpu_millicores: (vm_cpus.saturating_mul(1000) / 2).min(256_000),
-            max_memory_mib: (vm_memory_bytes / (1024 * 1024) / 2).min(4_194_304),
+            max_cpu_millicores: (vm_cpus.saturating_mul(1000) / 2).min(MAX_DESK_CPU_MILLICORES),
+            max_memory_mib: (vm_memory_bytes / (1024 * 1024) / 2).min(MAX_DESK_MEMORY_MIB),
         };
         r.check().map_err(|e| refused(format!("Docker's VM is too small for one desk: {}", e.reason)))?;
         Ok(r)
@@ -128,16 +137,17 @@ pub fn baseline_bytes() -> Result<Vec<u8>> {
     }
 }
 
-pub fn image_bytes(image_id: &str) -> Result<Vec<u8>> {
-    if !is_digest(image_id) {
-        return Err(refused(format!("{image_id:?} is not an image id (sha256:<64 lowercase hex>)")));
+/// The desk image record, from a published image pinned by digest: never from an image built on this Mac.
+pub fn image_bytes(pin: &DeskImagePin) -> Result<Vec<u8>> {
+    if !is_digest(&pin.image_id) || !pin.image.rsplit_once('@').is_some_and(|(_, d)| is_digest(d)) {
+        return Err(refused("the desk image pin is not an image pinned by digest with its content id"));
     }
     #[derive(Serialize)]
     struct Image<'a> {
         image: &'a str,
         id: &'a str,
     }
-    pretty(&Image { image: DESK_IMAGE_TAG, id: image_id })
+    pretty(&Image { image: &pin.image, id: &pin.image_id })
 }
 
 #[derive(Debug, Serialize, serde::Deserialize, PartialEq)]
@@ -204,8 +214,20 @@ fn pretty<T: Serialize>(v: &T) -> Result<Vec<u8>> {
 }
 
 /// Writes (or, checking, compares) the three records under `dir`, reached from `top`, all owned by `root`.
-pub fn write(ctx: &mut Ctx, top: &Path, dir: &Path, root: Owner, image_id: &str, resources: Resources) -> Result<()> {
-    let files = [(BASELINE, baseline_bytes()?), (IMAGE, image_bytes(image_id)?), (CEILING, ceiling_bytes(resources)?)];
+/// Writes (or, checking, compares) the records under `dir`, reached from `top`, all owned by `root`. Without a
+/// published desk image pinned, the image record is not written: desks wait, closed, until one is.
+pub fn write(
+    ctx: &mut Ctx,
+    top: &Path,
+    dir: &Path,
+    root: Owner,
+    desk_image: Option<&DeskImagePin>,
+    resources: Resources,
+) -> Result<()> {
+    let mut files = vec![(BASELINE, baseline_bytes()?), (CEILING, ceiling_bytes(resources)?)];
+    if let Some(pin) = desk_image {
+        files.push((IMAGE, image_bytes(pin)?));
+    }
     let fd = ctx.trusted_dir(top, dir, root.uid, 0o755)?;
     for (name, data) in files {
         ctx.file(fd.as_ref(), dir, name, &data, 0o644, root)?;
@@ -224,6 +246,10 @@ mod tests {
     }
 
     const ID: &str = "sha256:e1063b44e1063b44e1063b44e1063b44e1063b44e1063b44e1063b44e1063b44";
+
+    fn pin() -> DeskImagePin {
+        DeskImagePin { image: format!("ghcr.io/example/desk@sha256:{}", "1".repeat(64)), image_id: ID.into() }
+    }
     const RES: Resources = Resources { max_cpu_millicores: 4000, max_memory_mib: 8192 };
 
     #[test]
@@ -254,6 +280,11 @@ mod tests {
         let half = Resources::half_of(8, 16 * 1024 * 1024 * 1024).unwrap();
         assert_eq!(half, Resources { max_cpu_millicores: 4000, max_memory_mib: 8192 });
         assert!(Resources { max_cpu_millicores: 9000, max_memory_mib: 1024 }.fits(8, 16 << 30).is_err());
+        // The compiled-in maxima hold whatever the VM has.
+        let big = Resources::half_of(64, 512 << 30).unwrap();
+        assert_eq!((big.max_cpu_millicores, big.max_memory_mib), (MAX_DESK_CPU_MILLICORES, MAX_DESK_MEMORY_MIB));
+        assert!(Resources { max_cpu_millicores: MAX_DESK_CPU_MILLICORES + 1, max_memory_mib: 1024 }.check().is_err());
+        assert!(Resources { max_cpu_millicores: 1000, max_memory_mib: MAX_DESK_MEMORY_MIB + 1 }.check().is_err());
     }
 
     #[test]
@@ -264,11 +295,11 @@ mod tests {
     }
 
     #[test]
-    fn the_image_record_holds_only_a_content_id() {
-        assert!(image_bytes("ekka-desk:local").is_err());
-        assert!(image_bytes(&format!("{ID}\n")).is_err());
-        let v: serde_json::Value = serde_json::from_slice(&image_bytes(ID).unwrap()).unwrap();
-        assert_eq!(v, serde_json::json!({"image": "ekka-desk:local", "id": ID}));
+    fn the_image_record_holds_only_a_pinned_image_and_its_content_id() {
+        assert!(image_bytes(&DeskImagePin { image: "ekka-desk:local".into(), image_id: ID.into() }).is_err());
+        assert!(image_bytes(&DeskImagePin { image: pin().image, image_id: format!("{ID}\n") }).is_err());
+        let v: serde_json::Value = serde_json::from_slice(&image_bytes(&pin()).unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"image": pin().image, "id": ID}));
     }
 
     #[test]
@@ -276,7 +307,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("private/var/lib/ekka-agent-desks/backend");
         let mut ctx = Ctx::apply();
-        write(&mut ctx, t.path(), &dir, me(), ID, RES).unwrap();
+        write(&mut ctx, t.path(), &dir, me(), Some(&pin()), RES).unwrap();
         assert_eq!(ctx.changes.len(), 8, "{:?}", ctx.changes); // five folders made, three records
         for name in [BASELINE, IMAGE, CEILING] {
             let m = std::fs::metadata(dir.join(name)).unwrap();
@@ -288,10 +319,10 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(BASELINE)).unwrap(), kit::BASELINE_POLICY);
 
         let mut again = Ctx::apply();
-        write(&mut again, t.path(), &dir, me(), ID, RES).unwrap();
+        write(&mut again, t.path(), &dir, me(), Some(&pin()), RES).unwrap();
         assert!(again.changes.is_empty(), "{:?}", again.changes);
         let mut check = Ctx::check();
-        write(&mut check, t.path(), &dir, me(), ID, Resources { max_cpu_millicores: 2000, ..RES }).unwrap();
+        write(&mut check, t.path(), &dir, me(), Some(&pin()), Resources { max_cpu_millicores: 2000, ..RES }).unwrap();
         assert_eq!(check.changes.len(), 1, "a changed ceiling is one change: {:?}", check.changes);
         assert_eq!(std::fs::read(dir.join(CEILING)).unwrap(), ceiling_bytes(RES).unwrap(), "checking wrote nothing");
     }
@@ -305,7 +336,7 @@ mod tests {
         std::fs::write(t.path().join("wide-open.json"), b"{}").unwrap();
         std::os::unix::fs::symlink(t.path().join("wide-open.json"), dir.join(CEILING)).unwrap();
         let mut ctx = Ctx::apply();
-        let e = write(&mut ctx, t.path(), &dir, me(), ID, RES).unwrap_err();
+        let e = write(&mut ctx, t.path(), &dir, me(), Some(&pin()), RES).unwrap_err();
         assert!(e.reason.contains("provider-ceiling.json is a link"), "{e}");
         assert_eq!(std::fs::read(t.path().join("wide-open.json")).unwrap(), b"{}");
     }
@@ -317,8 +348,8 @@ mod tests {
         std::fs::create_dir_all(t.path().join("private/var")).unwrap();
         std::os::unix::fs::symlink(t.path().join("private/var"), t.path().join("var")).unwrap();
         let mut ctx = Ctx::apply();
-        let e =
-            write(&mut ctx, t.path(), &t.path().join("var/lib/ekka-agent-desks/backend"), me(), ID, RES).unwrap_err();
+        let e = write(&mut ctx, t.path(), &t.path().join("var/lib/ekka-agent-desks/backend"), me(), Some(&pin()), RES)
+            .unwrap_err();
         assert!(e.reason.contains("is a link or not a folder"), "{e}");
         assert!(!t.path().join("private/var/lib").exists());
     }

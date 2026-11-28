@@ -4,7 +4,7 @@
 //!
 //! Every value comes from this machine: the organization (the binding), the Enclave's API gate (from its node id),
 //! Govern's gate-token keys (Govern's own published configuration), and the gateway as the adapter reaches it here
-//! (`https://127.0.0.1:8080`, this installation's CA, the identity profile's issuer).
+//! (`https://127.0.0.1:8080`, this installation's CA, EKKA's issuer for the organization).
 
 use std::path::{Path, PathBuf};
 
@@ -56,8 +56,11 @@ pub fn enclave_values(text: &str) -> Result<EnclaveValues> {
     if !is_uuid(&tenant_id) || !is_uuid(&node_id) {
         return Err(refused("the Enclave's organization or node id is not a lowercase UUID"));
     }
-    if !crate::identity::is_issuer(govern_url.trim_end_matches('/')) {
-        return Err(refused("the Enclave's Govern URL is not a plain https address"));
+    let origin = govern_url.trim_end_matches('/');
+    if !origin.strip_prefix("https://").is_some_and(|h| {
+        !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':')
+    }) {
+        return Err(refused("the Enclave's Govern URL is not a plain https origin"));
     }
     Ok(EnclaveValues { tenant_id, node_id, govern_url })
 }
@@ -145,8 +148,8 @@ pub fn config_bytes(l: &Layout, org: &str, inputs: &AdapterInputs, issuer: &str)
         return Err(refused("the adapter's organization or the Enclave's node id is not a lowercase UUID"));
     }
     check_keys(&inputs.govern_keys)?;
-    if !crate::identity::is_issuer(issuer) {
-        return Err(refused("the adapter's issuer is not a plain https address"));
+    if !issuer.starts_with("https://") || issuer.contains(char::is_whitespace) {
+        return Err(refused("the adapter's issuer is not an https address"));
     }
     let paths = [l.tls_dir().join(CA_CERT), l.adapter_socket(), l.backend_dir()];
     if paths.iter().any(|p| !is_plain_absolute_path(&p.display().to_string())) {

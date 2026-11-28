@@ -14,9 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{failed, refused, usage, Result};
-use crate::identity::{EnclaveToken, Profile};
 use crate::kit;
-use crate::tls::GATEWAY_IP;
 use crate::util::is_plain_absolute_path;
 
 pub const LABEL_ENCLAVE: &str = "com.ekka.desks.enclave";
@@ -58,8 +56,9 @@ impl Layout {
     pub fn d(&self) -> PathBuf {
         self.ekka_dev().join(self.uid.to_string())
     }
+    /// The machine-wide installation binding (one installation per Mac).
     pub fn binding(&self) -> PathBuf {
-        self.d().join("binding.json")
+        self.ekka_dev().join("binding.json")
     }
     pub fn enclave_home(&self) -> PathBuf {
         self.d().join("enclave")
@@ -207,7 +206,8 @@ pub struct ServiceInputs<'a> {
     pub ekka: &'a Path,
     pub env: &'a str,
     pub gateway_key_b64: &'a str,
-    pub profile: &'a Profile,
+    /// This installation's id: the adapter's subject is `adapter/<installation id>`, as Govern issues it.
+    pub installation_id: &'a str,
 }
 
 fn s(p: impl AsRef<Path>) -> String {
@@ -229,23 +229,12 @@ pub fn enclave_agent(l: &Layout, i: &ServiceInputs) -> Agent {
         ("EKKA_OPENSHELL_INTERCEPTOR_AUDIENCE".into(), INTERCEPTOR_AUDIENCE.into()),
         ("EKKA_OPENSHELL_DISCOVERY_PERMITS_DIR".into(), s(l.permits_dir())),
     ];
-    if let Some(e) = &i.profile.callers.enclave {
-        let EnclaveToken::ClientCredentials { client_id, secret_name } = &e.token;
-        env.extend([
-            ("EKKA_OPENSHELL_EXECUTOR_URL".into(), format!("https://{GATEWAY_IP}:{GATEWAY_PORT}")),
-            ("EKKA_OPENSHELL_EXECUTOR_CA_PEM_PATH".into(), s(l.tls_dir().join(CA_CERT))),
-            ("EKKA_OPENSHELL_EXECUTOR_WORKSPACE".into(), WORKSPACE.into()),
-            ("EKKA_OPENSHELL_EXECUTOR_SUBJECT".into(), format!("user:oidc:{}", e.subject)),
-            ("EKKA_OPENSHELL_EXECUTOR_ISSUER".into(), i.profile.gateway.issuer.clone()),
-            ("EKKA_OPENSHELL_EXECUTOR_CLIENT_ID".into(), client_id.clone()),
-            ("EKKA_OPENSHELL_EXECUTOR_CLIENT_SECRET_NAME".into(), secret_name.clone()),
-            // Desks made through EKKA register on their own, with no `ekka desk add` (needs the executor).
-            ("EKKA_DESKS_AUTO".into(), "true".into()),
-        ]);
-    }
-    if let Some(a) = &i.profile.callers.adapter {
-        env.push(("EKKA_OPENSHELL_BACKEND_SUBJECT".into(), format!("user:oidc:{}", a.subject)));
-    }
+    // The one caller the interceptor lets create a desk: the adapter, by the subject Govern gives this
+    // installation's adapter. Derived, never configured.
+    env.push(("EKKA_OPENSHELL_BACKEND_SUBJECT".into(), format!("user:oidc:adapter/{}", i.installation_id)));
+    // No executor keys, and so no EKKA_DESKS_AUTO (it needs the executor): the gateway's issuer is Govern's, which
+    // issues the Enclave's own pass only in exchange for its runner session, and the shipped Enclave cannot make
+    // that exchange yet. Install says so; the keys come with the ekka release that can.
     Agent {
         label: LABEL_ENCLAVE,
         program: vec![s(i.ekka), "enclave".into(), "start".into()],
@@ -407,16 +396,63 @@ pub fn write_plist(path: &Path, text: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Runs this same binary once as root (`sudo`), with the root plan on its standard input; sudo asks for the
-/// password on the terminal. Returns what the root step printed (its changes, as JSON).
-pub fn run_elevated(plan_json: &[u8]) -> Result<Vec<u8>> {
-    let me = std::env::current_exe().map_err(|e| failed(format!("finding this program: {e}")))?;
-    let me = me.canonicalize().map_err(|e| failed(format!("finding this program: {e}")))?;
-    let mut child = Command::new("/usr/bin/sudo")
-        .arg("--prompt=ekka-desk-host needs your password once, for the files root owns: ")
+/// Where `ekka-desk-host` must be, root's, before it may ask for root. sudo runs this path and nothing else.
+pub const HOST_BINARY: &str = "/usr/local/libexec/ekka-desk-host/ekka-desk-host";
+
+fn place_it(why: &str) -> String {
+    format!(
+        "ekka-desk-host asks for root only when it runs from {HOST_BINARY}, a root-owned copy nobody else can change \
+         ({why}). Nothing was changed. Check the program you downloaded against the sha256 published with its \
+         release, then put it there and run it from there:\n\
+         \x20   shasum -a 256 <downloaded ekka-desk-host>\n\
+         \x20   sudo install -d -o root -g wheel -m 0755 /usr/local/libexec/ekka-desk-host\n\
+         \x20   sudo install -o root -g wheel -m 0755 <downloaded ekka-desk-host> {HOST_BINARY}\n\
+         \x20   {HOST_BINARY} install ..."
+    )
+}
+
+/// The running program is `fixed` (after resolving links), a regular file owned by `owner` in folders that only
+/// `owner` can change, from `top` down: no link, no group or other write, no ACL grant. On a real install
+/// `fixed` is `HOST_BINARY`, `top` is `/` and `owner` is root, so code running as the developer cannot replace
+/// the program the password prompt will authorize.
+pub fn trusted_self(exe: &Path, fixed: &Path, top: &Path, owner: u32) -> Result<()> {
+    let real = exe.canonicalize().map_err(|e| refused(place_it(&format!("this program cannot be found: {e}"))))?;
+    if real != fixed {
+        return Err(refused(place_it(&format!("this program is {}", real.display()))));
+    }
+    let (Some(parent), Some(name)) = (fixed.parent(), fixed.file_name().and_then(|n| n.to_str())) else {
+        return Err(refused(place_it("its path has no folder")));
+    };
+    let dir = crate::fsx::open_trusted_dir(parent, top, owner, None).map_err(|e| refused(place_it(&e.reason)))?;
+    let fd = crate::fsx::open_file_at(&dir, name)?.ok_or_else(|| refused(place_it("it is not there")))?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| refused(place_it(&e.to_string())))?;
+    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile
+        || st.st_uid != owner
+        || crate::fsx::mode_bits(st.st_mode) & 0o022 != 0
+    {
+        return Err(refused(place_it("it is not a regular file that only root can change")));
+    }
+    if let Some(why) = crate::acl::unsafe_grant(&fd, crate::acl::Guard::Writes)? {
+        return Err(refused(place_it(&why)));
+    }
+    Ok(())
+}
+
+/// The one command that asks for root: sudo, then `HOST_BINARY` by its fixed path. Never this process's own path.
+fn elevation() -> Command {
+    let mut c = Command::new("/usr/bin/sudo");
+    c.arg("--prompt=ekka-desk-host needs your password once, for the files root owns: ")
         .arg("--")
-        .arg(&me)
-        .arg("__apply-root")
+        .arg(HOST_BINARY)
+        .arg("__apply-root");
+    c
+}
+
+/// Runs `HOST_BINARY` once as root (`sudo`), with the root plan on its standard input; sudo asks for the
+/// password on the terminal. Returns what the root step printed (its changes, as JSON). The caller has checked
+/// `trusted_self` first.
+pub fn run_elevated(plan_json: &[u8]) -> Result<Vec<u8>> {
+    let mut child = elevation()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -441,14 +477,68 @@ pub fn run_elevated(plan_json: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::Profile;
 
     pub(crate) fn sample_layout() -> Layout {
         Layout::system(501, PathBuf::from("/Users/dev"))
     }
 
-    fn inputs(p: &Profile) -> ServiceInputs<'_> {
-        ServiceInputs { ekka: Path::new("/usr/local/bin/ekka"), env: "prod", gateway_key_b64: "AAAA", profile: p }
+    fn me() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    #[test]
+    fn a_host_program_anywhere_the_developer_can_change_is_refused_before_sudo() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("ekka-desk-host");
+        std::fs::write(&exe, b"x").unwrap();
+        let e = trusted_self(&exe, Path::new(HOST_BINARY), Path::new("/"), 0).unwrap_err();
+        assert_eq!(e.kind, crate::error::Kind::Refused);
+        assert!(e.reason.contains(HOST_BINARY) && e.reason.contains("shasum -a 256"), "{e}");
+        assert!(e.reason.contains("sudo install -o root -g wheel -m 0755"), "{e}");
+    }
+
+    #[test]
+    fn only_the_fixed_root_owned_path_passes_and_sudo_runs_that_path_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let top = t.path().canonicalize().unwrap();
+        let dir = top.join("usr/local/libexec/ekka-desk-host");
+        std::fs::create_dir_all(&dir).unwrap();
+        for d in ["usr", "usr/local", "usr/local/libexec", "usr/local/libexec/ekka-desk-host"] {
+            std::fs::set_permissions(top.join(d), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::set_permissions(&top, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fixed = dir.join("ekka-desk-host");
+        std::fs::write(&fixed, b"x").unwrap();
+        std::fs::set_permissions(&fixed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The owner stands in for root here: the same rules, on a tree this test owns.
+        trusted_self(&fixed, &fixed, &top, me()).unwrap();
+        let link = top.join("link");
+        std::os::unix::fs::symlink(&fixed, &link).unwrap();
+        trusted_self(&link, &fixed, &top, me()).unwrap();
+        std::fs::set_permissions(&fixed, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(trusted_self(&fixed, &fixed, &top, me()).is_err(), "group-writable program");
+        std::fs::set_permissions(&fixed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::acl::tests::plant(&dir, "everyone allow add_file,delete_child");
+        assert!(trusted_self(&fixed, &fixed, &top, me()).is_err(), "a folder an ACL lets others change");
+
+        let c = elevation();
+        assert_eq!(c.get_program(), "/usr/bin/sudo");
+        let args: Vec<_> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args[2..], [HOST_BINARY.to_string(), "__apply-root".to_string()]);
+        let me_path = std::env::current_exe().unwrap().display().to_string();
+        assert!(!args.contains(&me_path), "never this process's own path");
+    }
+
+    const INSTALLATION: &str = "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d";
+
+    fn inputs() -> ServiceInputs<'static> {
+        ServiceInputs {
+            ekka: Path::new("/usr/local/bin/ekka"),
+            env: "prod",
+            gateway_key_b64: "AAAA",
+            installation_id: INSTALLATION,
+        }
     }
 
     fn env_of<'a>(a: &'a Agent, k: &str) -> Option<&'a str> {
@@ -467,18 +557,15 @@ mod tests {
     #[test]
     fn the_enclave_and_the_adapter_meet_in_one_owner_only_folder() {
         let l = sample_layout();
-        let p = Profile::parse(include_str!("../../../deploy/macos/identity-profile.sample.json")).unwrap();
-        let e = enclave_agent(&l, &inputs(&p));
+        let e = enclave_agent(&l, &inputs());
         assert_eq!(env_of(&e, "EKKA_BACKEND_SOCKET_DIR"), Some("/private/var/db/ekka-dev/501/run/backend"));
         assert_eq!(l.adapter_socket().parent().unwrap(), Path::new(env_of(&e, "EKKA_BACKEND_SOCKET_DIR").unwrap()));
     }
 
     #[test]
-    fn the_enclave_registers_desks_by_itself_behind_an_owner_only_interceptor() {
+    fn the_enclave_serves_an_owner_only_interceptor_and_names_the_adapter_by_derivation() {
         let l = sample_layout();
-        let p = Profile::parse(include_str!("../../../deploy/macos/identity-profile.sample.json")).unwrap();
-        let e = enclave_agent(&l, &inputs(&p));
-        assert_eq!(env_of(&e, "EKKA_DESKS_AUTO"), Some("true"));
+        let e = enclave_agent(&l, &inputs());
         assert_eq!(env_of(&e, "EKKA_OPENSHELL_INTERCEPTOR_SOCKET_MODE"), Some("0600"));
         assert_eq!(
             env_of(&e, "EKKA_OPENSHELL_INTERCEPTOR_SOCKET"),
@@ -487,21 +574,19 @@ mod tests {
         assert_eq!(env_of(&e, "EKKA_OPENSHELL_INTERCEPTOR_AUDIENCE"), Some(INTERCEPTOR_AUDIENCE));
         assert_eq!(env_of(&e, "EKKA_OPENSHELL_GATEWAY_KEY_B64"), Some("AAAA"));
         assert!(e.env.iter().all(|(k, _)| k != "EKKA_OPENSHELL_INTERCEPTOR_GROUP"), "never a group on a Mac");
-        assert_eq!(env_of(&e, "EKKA_OPENSHELL_EXECUTOR_URL"), Some("https://127.0.0.1:8080"));
-        assert_eq!(env_of(&e, "EKKA_OPENSHELL_EXECUTOR_ISSUER"), Some(p.gateway.issuer.as_str()));
-        assert!(env_of(&e, "EKKA_OPENSHELL_BACKEND_SUBJECT").unwrap().starts_with("user:oidc:adapter/"));
-        // Without the Enclave's caller the executor keys (and auto registration, which needs them) are left out.
-        let mut bare = p.clone();
-        bare.callers.enclave = None;
-        let e = enclave_agent(&l, &inputs(&bare));
+        assert_eq!(
+            env_of(&e, "EKKA_OPENSHELL_BACKEND_SUBJECT").unwrap(),
+            format!("user:oidc:adapter/{INSTALLATION}"),
+            "the adapter's subject is derived from this installation, never configured"
+        );
+        // No executor, and no auto registration (it needs the executor), until the Enclave can get Govern's pass.
         assert!(e.env.iter().all(|(k, _)| !k.starts_with("EKKA_OPENSHELL_EXECUTOR_") && k != "EKKA_DESKS_AUTO"));
     }
 
     #[test]
     fn the_enclave_trusts_the_system_roots_plus_the_installation_ca() {
         let l = sample_layout();
-        let p = Profile::parse(include_str!("../../../deploy/macos/identity-profile.sample.json")).unwrap();
-        let e = enclave_agent(&l, &inputs(&p));
+        let e = enclave_agent(&l, &inputs());
         assert_eq!(env_of(&e, "SSL_CERT_FILE"), Some("/private/var/db/ekka-dev/501/tls/ca-bundle.crt"));
     }
 

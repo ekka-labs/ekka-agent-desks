@@ -50,13 +50,6 @@ pub const PROVIDERS: [ProviderFiles; 4] = [
     },
 ];
 
-/// The desk image's recipe (desk/image), each file with its mode in git.
-pub const DESK_IMAGE: [(&str, &[u8], u32); 3] = [
-    ("Dockerfile", include_bytes!("../../desk/image/Dockerfile"), 0o644),
-    ("ekka-git-credential", include_bytes!("../../desk/image/ekka-git-credential"), 0o755),
-    ("managed-settings.json", include_bytes!("../../desk/image/managed-settings.json"), 0o644),
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,18 +58,6 @@ mod tests {
 
     fn repo() -> &'static Path {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
-    }
-
-    #[test]
-    fn every_desk_image_file_is_embedded() {
-        let mut on_disk: Vec<String> = std::fs::read_dir(repo().join("desk/image"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        on_disk.sort();
-        let mut embedded: Vec<String> = DESK_IMAGE.iter().map(|(n, _, _)| n.to_string()).collect();
-        embedded.sort();
-        assert_eq!(on_disk, embedded, "desk/image changed: embed every file of the recipe");
     }
 
     #[test]

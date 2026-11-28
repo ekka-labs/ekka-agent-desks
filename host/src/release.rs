@@ -41,7 +41,16 @@ pub struct Pins {
     pub supervisor: ImagePin,
     pub sandbox: ImagePin,
     pub meter_image: String,
+    /// A published desk image for linux/arm64, by digest and content id; `None` until one is published.
+    pub desk_image: Option<DeskImagePin>,
     pub openshell_version: String,
+}
+
+/// A published desk image: pulled by `image` (repository@digest), and recorded by its content id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeskImagePin {
+    pub image: String,
+    pub image_id: String,
 }
 
 /// An image pinned by digest, and the program inside it with its own sha256 for linux/arm64.
@@ -127,6 +136,16 @@ impl Pins {
             supervisor: img("supervisor")?,
             sandbox: img("sandbox")?,
             meter_image: image_ref(&text(&p["macos"]["meter"]["image"], "macos.meter.image")?, "the meter image")?,
+            desk_image: match (
+                p["macos"]["desk_image"]["image"].as_str(),
+                p["macos"]["desk_image"]["image_id"].as_str(),
+            ) {
+                (Some(image), Some(id)) if crate::util::is_digest(id) => {
+                    Some(DeskImagePin { image: image_ref(image, "macos.desk_image.image")?, image_id: id.to_string() })
+                }
+                (None, None) => None,
+                _ => return Err(failed("deploy/pins.json: macos.desk_image is half pinned or not a content id")),
+            },
             openshell_version: version,
         })
     }
@@ -324,6 +343,7 @@ mod tests {
         assert!(p.gateway.archive_url.starts_with("https://github.com/NVIDIA/OpenShell/releases/download/v0.1.9/"));
         assert_eq!(p.gateway.archive_sha256, "b348a57b97dc755d6a668631d328dd03fa88dc1b3565f16a094c9c59a420c51a");
         assert!(p.adapter.is_none(), "the Darwin adapter is not published yet; pin it when it is");
+        assert!(p.desk_image.is_none(), "no published desk image for a Mac yet; pin it when there is");
         assert_eq!(
             p.meter_image,
             "docker.io/library/busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"

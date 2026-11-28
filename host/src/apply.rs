@@ -1,10 +1,10 @@
 //! The one step that runs as root, and the same step as a check that changes nothing.
 //!
-//! `install` works out everything as the developer first: downloads checked, images pulled, the desk image built.
+//! `install` works out everything as the developer first: downloads checked, images pulled by digest.
 //! It then runs this step as a check (as the developer, reading only what anyone may read) and asks for root only
 //! when something root owns would change. So a second install with the same organization asks for nothing and
-//! changes nothing. As root, this step takes a lock, refuses a foreign binding before any change, and then writes
-//! the binding, the developer's folders, the certificates, the gateway and adapter configuration, the verified
+//! changes nothing. As root, this step takes a lock, refuses a foreign binding (one installation per Mac) before
+//! any change, and then writes the binding, the developer's folders, the certificates, the gateway and adapter configuration, the verified
 //! programs, the `current` link and the records. Root never runs a staged program: it copies the bytes and hashes
 //! the copy it made against the pin embedded in this binary.
 
@@ -20,14 +20,13 @@ use crate::binding::{Binding, Want};
 use crate::error::{errno, failed, refused, Result};
 use crate::fsx::{self, ensure_dir, walk_trusted, Owner, Walk, Wrote, DIR_FLAGS};
 use crate::gateway_config;
-use crate::identity::Gateway;
+use crate::identity;
 use crate::platform::macos::{
     Layout, BUNDLE, CA_CERT, CA_KEY, JWT_KID, JWT_PUBLIC, JWT_SIGNING, LEAF_CERT, LEAF_KEY, LEAF_META,
 };
 use crate::records::{self, Resources};
 use crate::release::{verify_binary, Pinned, Pins};
 use crate::tls::{bundle, Ca, JwtKeys, LeafMeta};
-use crate::util::is_digest;
 
 const MAX_PROGRAM: u64 = 256 * 1024 * 1024;
 
@@ -199,13 +198,17 @@ pub struct RootPlan {
     pub want: Want,
     pub gateway_staged: PathBuf,
     pub adapter_staged: Option<PathBuf>,
-    pub desk_image_id: String,
     pub resources: Resources,
-    pub oidc: Gateway,
+    /// The registered gateway's id, once it is registered. Root computes every sign-in value from it, the
+    /// environment and the organization; nothing else about sign-in is taken from the plan.
+    pub gateway_id: Option<String>,
     pub adapter: Option<AdapterInputs>,
+    /// Replace an installation CA whose key is no longer root's alone, and the gateway certificate with it.
+    #[serde(default)]
+    pub rotate_ca: bool,
 }
 
-pub const PLAN_SCHEMA: &str = "ekka-desk-host.root-plan/v1";
+pub const PLAN_SCHEMA: &str = "ekka-desk-host.root-plan/v2";
 
 impl RootPlan {
     pub fn check(&self, pins: &Pins) -> Result<()> {
@@ -213,9 +216,8 @@ impl RootPlan {
             return Err(refused(format!("the root plan is not {PLAN_SCHEMA}")));
         }
         self.want.check()?;
-        self.oidc.check(&self.want.org)?;
-        if !is_digest(&self.desk_image_id) {
-            return Err(refused("the desk image id is not sha256:<64 lowercase hex>"));
+        if let Some(g) = &self.gateway_id {
+            identity::gateway_class(g)?;
         }
         self.resources.check()?;
         if let Some(a) = &self.adapter {
@@ -272,6 +274,30 @@ struct ReleaseRecord<'a> {
 }
 
 /// Does (or, checking, lists) every root-owned part of the installation. Returns the binding in force.
+/// The CA key, when one exists, may be used again only while it is root's alone: owner root, mode 0600, and no
+/// ACL letting anyone else read or change it. Checking, as the developer, this reads the key's metadata only.
+fn ca_key_problem(ctx: &Ctx, tls: Option<&OwnedFd>, tls_path: &Path, root: Owner) -> Result<Option<String>> {
+    let Some(dir) = tls else { return Ok(None) };
+    if !exists(Some(dir), CA_KEY)? {
+        return Ok(None);
+    }
+    let what = tls_path.join(CA_KEY).display().to_string();
+    let found = if ctx.checking() {
+        let st = statat(dir, CA_KEY, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| errno(format!("reading {what}"), e))?;
+        if st.st_uid != root.uid || fsx::mode_bits(st.st_mode) != 0o600 {
+            Some(format!("{what} is uid {} mode {:o}", st.st_uid, fsx::mode_bits(st.st_mode)))
+        } else {
+            crate::acl::unsafe_grant_path(&tls_path.join(CA_KEY), crate::acl::Guard::ReadsAndWrites)?
+                .map(|why| format!("{what}: {why}"))
+        }
+    } else {
+        let fd = fsx::open_file_at(dir, CA_KEY)?.ok_or_else(|| failed("the CA key went missing"))?;
+        fsx::check_secret(&fd, &what, root.uid, 0o600).err().map(|e| e.reason)
+    };
+    Ok(found)
+}
+
+/// Does (or, checking, lists) every root-owned part of the installation. Returns the binding in force.
 pub fn root_apply(
     plan: &RootPlan,
     l: &Layout,
@@ -284,11 +310,13 @@ pub fn root_apply(
     let (root, dev) = (owners.root, owners.dev);
     let top = &l.top;
 
-    // Refused before any change: an installation bound to anything else.
+    // One installation per Mac: the machine-wide binding names the organization, the developer's uid and the
+    // environment. Anything else is refused here, before any path, shared or not, is changed.
     let existing = Binding::read(&l.binding())?;
     if let Some(b) = &existing {
         b.check_same(&plan.want)?;
     }
+    let mut lock_dir = None;
     let _lock = if ctx.checking() {
         None
     } else {
@@ -302,9 +330,10 @@ pub fn root_apply(
         .map_err(|e| errno("taking the install lock", e))?;
         rustix::fs::flock(&fd, rustix::fs::FlockOperation::LockExclusive)
             .map_err(|e| errno("taking the install lock", e))?;
+        lock_dir = Some(dev_dir);
         Some(fd)
     };
-    // Again under the lock: another install may have bound it in between.
+    // Again under the lock: another install may have bound this Mac in between.
     let existing = match (existing, Binding::read(&l.binding())?) {
         (_, Some(now)) => {
             now.check_same(&plan.want)?;
@@ -316,10 +345,14 @@ pub fn root_apply(
         Some(b) => b,
         None => plan.want.new_binding()?,
     };
+    let ekka_dev = match lock_dir {
+        Some(fd) => Some(fd),
+        None => ctx.trusted_dir(top, &l.ekka_dev(), root.uid, 0o755)?,
+    };
+    ctx.file(ekka_dev.as_ref(), &l.ekka_dev(), "binding.json", &binding.bytes(), 0o644, root)?;
 
     let d = l.d();
     let dfd = ctx.trusted_dir(top, &d, root.uid, 0o755)?;
-    ctx.file(dfd.as_ref(), &d, "binding.json", &binding.bytes(), 0o644, root)?;
 
     // The developer's folders, each 0700: the services' state and their sockets.
     ctx.sub_dir(dfd.as_ref(), &d, "enclave", 0o700, dev)?;
@@ -332,13 +365,24 @@ pub fn root_apply(
     let run = ctx.sub_dir(dfd.as_ref(), &d, "run", 0o700, dev)?;
     ctx.sub_dir(run.as_ref(), &l.run_dir(), "backend", 0o700, dev)?;
 
-    // Certificates: the CA key root's alone; the gateway's key the developer's, who runs the gateway.
+    // Certificates: the CA key root's alone; the gateway's key the developer's, who runs the gateway. A CA key
+    // that is not root's alone any more is never used again: it is refused, or replaced with --rotate-ca.
     let tls_path = l.tls_dir();
     let tls = ctx.sub_dir(dfd.as_ref(), &d, "tls", 0o755, root)?;
     let jwt = ctx.sub_dir(tls.as_ref(), &tls_path, "jwt", 0o755, root)?;
+    let exposed = ca_key_problem(ctx, tls.as_ref(), &tls_path, root)?;
+    if let Some(why) = &exposed {
+        if !plan.rotate_ca {
+            return Err(refused(format!(
+                "the installation CA's key may have been seen by someone else ({why}); it is not used again. Run \
+                 install again with --rotate-ca to make a new CA and gateway certificate"
+            )));
+        }
+    }
     let mut ca: Option<Ca> = None;
     let mut ca_pem: Option<Vec<u8>> = read(tls.as_ref(), CA_CERT, 64 * 1024)?;
-    if !exists(tls.as_ref(), CA_KEY)? {
+    let make_ca = !exists(tls.as_ref(), CA_KEY)? || (plan.rotate_ca && exposed.is_some());
+    if make_ca {
         if ctx.checking() {
             ctx.note(format!("make the installation CA in {}", tls_path.display()));
             ca_pem = None;
@@ -418,11 +462,16 @@ pub fn root_apply(
         None => ctx.note(format!("write {}", tls_path.join(BUNDLE).display())),
     }
 
-    // The gateway's and the adapter's configuration: root's, so a developer's process cannot widen them.
-    let gateway_toml = gateway_config::render(l, &plan.oidc, &l.docker_socket(), pins)?;
-    ctx.file(dfd.as_ref(), &d, "gateway.toml", gateway_toml.as_bytes(), 0o644, root)?;
+    // The gateway's and the adapter's configuration: root's, from computed values only. The issuer is Govern's
+    // for this environment and organization; the audience and roles claim follow the registered gateway's id.
+    if let Some(gateway_id) = &plan.gateway_id {
+        let oidc = identity::gateway_oidc(&binding.env, &binding.org, gateway_id)?;
+        let gateway_toml = gateway_config::render(l, &oidc, &l.docker_socket(), pins)?;
+        ctx.file(dfd.as_ref(), &d, "gateway.toml", gateway_toml.as_bytes(), 0o644, root)?;
+    }
     if let Some(inputs) = &plan.adapter {
-        let cfg = adapter::config_bytes(l, &binding.org, inputs, &plan.oidc.issuer)?;
+        let issuer = identity::issuer(&binding.env, &binding.org)?;
+        let cfg = adapter::config_bytes(l, &binding.org, inputs, &issuer)?;
         ctx.file(dfd.as_ref(), &d, "backend-config.json", &cfg, 0o644, root)?;
     }
 
@@ -451,8 +500,8 @@ pub fn root_apply(
     ctx.file(rel.as_ref(), &rel_path, "release.json", &rec, 0o644, root)?;
     ctx.link(ofd.as_ref(), &opt, "current", &format!("releases/{release}"))?;
 
-    // The records EKKA's desk commands build a grant from.
-    records::write(ctx, top, &l.records(), root, &plan.desk_image_id, plan.resources)?;
+    // The records EKKA's desk commands build a grant from. The desk image only by a published, pinned digest.
+    records::write(ctx, top, &l.records(), root, pins.desk_image.as_ref(), plan.resources)?;
     Ok(binding)
 }
 
@@ -464,6 +513,7 @@ pub(crate) mod tests {
 
     pub(crate) const ORG: &str = "7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";
     const FOREIGN: &str = "0d0e0f10-1112-4314-8516-171819202122";
+    const GATEWAY: &str = "urn:ekka:desk-gateway:development:0b6f4a52-1c3d-4e5f-8a9b-0c1d2e3f4a5b";
 
     pub(crate) fn me() -> Owner {
         Owner { uid: rustix::process::getuid().as_raw(), gid: rustix::process::getgid().as_raw() }
@@ -495,8 +545,6 @@ pub(crate) mod tests {
         let mut pins = Pins::embedded().unwrap();
         pins.gateway.binary_sha256 = crate::util::sha256_hex(&fake_program());
         let layout = Layout { top, uid: me().uid, home };
-        let profile =
-            crate::identity::Profile::parse(include_str!("../../deploy/macos/identity-profile.sample.json")).unwrap();
         let plan = RootPlan {
             schema: PLAN_SCHEMA.into(),
             want: Want {
@@ -508,10 +556,10 @@ pub(crate) mod tests {
             },
             gateway_staged: staged,
             adapter_staged: None,
-            desk_image_id: format!("sha256:{}", "e".repeat(64)),
             resources: Resources { max_cpu_millicores: 4000, max_memory_mib: 8192 },
-            oidc: profile.gateway,
+            gateway_id: Some(GATEWAY.into()),
             adapter: None,
+            rotate_ca: false,
         };
         let roots = std::fs::read(crate::net::system_roots_path()).unwrap();
         Rig { dir, layout, pins, plan, roots }
@@ -565,8 +613,7 @@ pub(crate) mod tests {
         let before = snapshot(r.dir.path());
         let mut foreign = r.plan.clone();
         foreign.want.org = FOREIGN.into();
-        foreign.oidc.issuer = format!("https://govern.example.com/oidc/orgs/{FOREIGN}");
-        foreign.desk_image_id = format!("sha256:{}", "f".repeat(64));
+        foreign.resources.max_memory_mib = 1024;
         for mut ctx in [Ctx::check(), Ctx::apply()] {
             let e = root_apply(&foreign, &r.layout, owners(), &r.pins, &r.roots, &mut ctx).unwrap_err();
             assert_eq!(e.kind, crate::error::Kind::Refused);
@@ -604,9 +651,10 @@ pub(crate) mod tests {
             std::fs::read_link(l.opt().join("current")).unwrap(),
             PathBuf::from(format!("releases/{}", r.pins.release_id()))
         );
-        for rec in [records::BASELINE, records::IMAGE, records::CEILING] {
+        for rec in [records::BASELINE, records::CEILING] {
             assert_eq!(mode(l.records().join(rec)), 0o644);
         }
+        assert!(!l.records().join(records::IMAGE).exists(), "no published desk image pinned: no image record");
         // The gateway's certificate chains to the CA on disk and names both of its addresses.
         let meta: LeafMeta = serde_json::from_slice(&std::fs::read(l.tls_dir().join(LEAF_META)).unwrap()).unwrap();
         assert_eq!(meta.ca_sha256, crate::util::sha256_hex(&std::fs::read(l.tls_dir().join(CA_CERT)).unwrap()));
@@ -669,14 +717,125 @@ pub(crate) mod tests {
     fn a_plan_that_is_not_well_formed_is_refused() {
         let r = rig();
         let mut p = r.plan.clone();
-        p.desk_image_id = "ekka-desk:local".into();
+        p.gateway_id = Some("urn:ekka:desk-gateway:production:0b6f4a52-1c3d-4e5f-8a9b-0c1d2e3f4a5b".into());
         assert!(root_apply(&p, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::check()).is_err());
         let mut p = r.plan.clone();
         p.gateway_staged = PathBuf::from("relative/path");
         assert!(root_apply(&p, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::check()).is_err());
         let mut p = r.plan.clone();
-        p.oidc.issuer = "http://insecure.example.com".into();
+        p.want.env = "local".into();
         assert!(root_apply(&p, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::check()).is_err());
+    }
+
+    /// The gateway's issuer, roles and audience in an installed gateway.toml.
+    fn oidc_of(l: &Layout) -> toml::Table {
+        let t: toml::Table = std::fs::read_to_string(l.gateway_toml()).unwrap().parse().unwrap();
+        t["openshell"]["gateway"]["oidc"].as_table().unwrap().clone()
+    }
+
+    #[test]
+    fn the_gateway_trusts_only_the_computed_issuer_and_a_plan_naming_another_changes_nothing() {
+        let r = rig();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let o = oidc_of(&r.layout);
+        assert_eq!(o["issuer"].as_str(), Some(format!("https://govern.ekka.ai/oidc/orgs/{ORG}").as_str()));
+        assert_eq!(o["audience"].as_str(), Some(GATEWAY));
+        assert_eq!(o["roles_claim"].as_str(), Some("ekka_roles.development"));
+        let before = std::fs::read(r.layout.gateway_toml()).unwrap();
+        // A plan carrying its own issuer, as the previous plan format did, is not a plan root reads.
+        let mut forged = serde_json::to_value(&r.plan).unwrap();
+        forged["oidc"] = serde_json::json!({"issuer": "https://attacker.example.com/oidc/orgs/x", "audience": "x",
+            "roles_claim": "r", "admin_role": "a", "user_role": "u", "scopes_claim": "scope", "jwks_ttl_secs": 300});
+        assert!(serde_json::from_value::<RootPlan>(forged).is_err());
+        assert_eq!(std::fs::read(r.layout.gateway_toml()).unwrap(), before, "gateway.toml unchanged");
+    }
+
+    #[test]
+    fn a_ceiling_above_the_compiled_in_maxima_is_refused_and_no_local_image_is_ever_recorded() {
+        let r = rig();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let ceiling = std::fs::read(r.layout.records().join(records::CEILING)).unwrap();
+        let mut wide = r.plan.clone();
+        wide.resources = Resources { max_cpu_millicores: 64_000, max_memory_mib: 262_144 };
+        for mut ctx in [Ctx::check(), Ctx::apply()] {
+            assert!(root_apply(&wide, &r.layout, owners(), &r.pins, &r.roots, &mut ctx).is_err());
+        }
+        assert_eq!(std::fs::read(r.layout.records().join(records::CEILING)).unwrap(), ceiling);
+        // The plan has no way to name a desk image: only a pinned, published one is ever recorded.
+        let mut forged = serde_json::to_value(&r.plan).unwrap();
+        forged["desk_image_id"] = format!("sha256:{}", "e".repeat(64)).into();
+        assert!(serde_json::from_value::<RootPlan>(forged).is_err());
+        assert!(!r.layout.records().join(records::IMAGE).exists());
+        let mut pins = r.pins.clone();
+        pins.desk_image = Some(crate::release::DeskImagePin {
+            image: format!("ghcr.io/example/desk@sha256:{}", "1".repeat(64)),
+            image_id: format!("sha256:{}", "2".repeat(64)),
+        });
+        root_apply(&r.plan, &r.layout, owners(), &pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let rec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(r.layout.records().join(records::IMAGE)).unwrap()).unwrap();
+        assert_eq!(rec["id"], format!("sha256:{}", "2".repeat(64)), "the pinned content id, and only that");
+    }
+
+    #[test]
+    fn a_second_developer_or_organization_is_refused_before_any_shared_path_changes() {
+        let r = rig();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let before = snapshot(r.dir.path());
+        // Another developer on the same Mac (another uid, so another D), even for the same organization, and
+        // another developer for another organization: both would share the records, the release and `current`.
+        let other_uid = me().uid + 1;
+        for org in [ORG, FOREIGN] {
+            let mut second = r.plan.clone();
+            second.want.uid = other_uid;
+            second.want.org = org.into();
+            second.resources.max_memory_mib = 1024;
+            let layout = Layout { uid: other_uid, ..r.layout.clone() };
+            for mut ctx in [Ctx::check(), Ctx::apply()] {
+                let e = root_apply(&second, &layout, owners(), &r.pins, &r.roots, &mut ctx).unwrap_err();
+                assert_eq!(e.kind, crate::error::Kind::Refused, "{e}");
+                assert!(e.reason.contains("One installation per Mac"), "{e}");
+                assert!(ctx.changes.is_empty());
+            }
+        }
+        assert_eq!(snapshot(r.dir.path()), before, "no shared record, release or link changed");
+    }
+
+    #[test]
+    fn an_exposed_ca_key_is_never_used_again_and_rotation_replaces_ca_and_certificate() {
+        let r = rig();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let key = r.layout.tls_dir().join(CA_KEY);
+        let (old_key, old_ca) =
+            (std::fs::read(&key).unwrap(), std::fs::read(r.layout.tls_dir().join(CA_CERT)).unwrap());
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = snapshot(r.dir.path());
+        for mut ctx in [Ctx::check(), Ctx::apply()] {
+            let e = root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut ctx).unwrap_err();
+            assert!(e.reason.contains("--rotate-ca") && e.reason.contains("mode 644"), "{e}");
+        }
+        assert_eq!(snapshot(r.dir.path()), before, "refused: nothing used, nothing changed");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        crate::acl::tests::plant(&key, "everyone allow read");
+        assert!(root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::check())
+            .unwrap_err()
+            .reason
+            .contains("read or change"));
+        let mut rotate = r.plan.clone();
+        rotate.rotate_ca = true;
+        root_apply(&rotate, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert_ne!(std::fs::read(&key).unwrap(), old_key, "a new CA key");
+        let ca = std::fs::read(r.layout.tls_dir().join(CA_CERT)).unwrap();
+        assert_ne!(ca, old_ca, "a new CA certificate");
+        let fd = std::fs::File::open(&key).unwrap();
+        assert!(!crate::acl::has_entries(&fd).unwrap(), "the new key carries no ACL");
+        let meta: LeafMeta =
+            serde_json::from_slice(&std::fs::read(r.layout.tls_dir().join(LEAF_META)).unwrap()).unwrap();
+        assert_eq!(meta.ca_sha256, crate::util::sha256_hex(&ca), "the gateway certificate is from the new CA");
+        // And once rotated, an ordinary install changes nothing.
+        let mut again = Ctx::apply();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut again).unwrap();
+        assert!(again.changes.is_empty(), "{:?}", again.changes);
     }
 
     /// As root (CI runs this with sudo; never on a developer's Mac): what root writes, the developer who ran

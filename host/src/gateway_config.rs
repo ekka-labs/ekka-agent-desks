@@ -1,6 +1,6 @@
 //! The Mac gateway's `gateway.toml`, rendered from the same template the Linux installer uses, so the 31 governed
 //! bindings have one source. Only what a native Mac gateway needs differs: loopback addresses, this
-//! installation's certificate and token-key paths, the identity profile's OIDC settings, Docker Desktop's
+//! installation's certificate and token-key paths, the computed sign-in settings (`identity`), Docker Desktop's
 //! socket, and the Enclave's interceptor socket under `D/run`.
 //!
 //! `findings` names anything in a gateway configuration that would let the gateway hand credentials out, take an
@@ -197,11 +197,12 @@ mod tests {
     use crate::identity::Profile;
     use std::path::PathBuf;
 
-    fn render_sample() -> (Layout, Profile, String) {
+    fn render_sample() -> (Layout, Gateway, String) {
         let l = Layout::system(501, PathBuf::from("/Users/dev"));
         let p = Profile::parse(include_str!("../../deploy/macos/identity-profile.sample.json")).unwrap();
-        let text = render(&l, &p.gateway, &l.docker_socket(), &Pins::embedded().unwrap()).unwrap();
-        (l, p, text)
+        let g = crate::identity::gateway_oidc("prod", &p.org, p.gateway_id.as_deref().unwrap()).unwrap();
+        let text = render(&l, &g, &l.docker_socket(), &Pins::embedded().unwrap()).unwrap();
+        (l, g, text)
     }
 
     fn bindings(t: &Table) -> Vec<(String, String, String)> {
@@ -248,8 +249,9 @@ mod tests {
         let (_, p, text) = render_sample();
         let t: Table = text.parse().unwrap();
         let o = get(&t, &["openshell", "gateway", "oidc"]).unwrap().as_table().unwrap();
-        assert_eq!(o["issuer"].as_str(), Some(p.gateway.issuer.as_str()));
-        assert_eq!(o["audience"].as_str(), Some(p.gateway.audience.as_str()));
+        assert_eq!(o["issuer"].as_str(), Some(p.issuer.as_str()));
+        assert!(p.issuer.starts_with("https://govern.ekka.ai/oidc/orgs/"));
+        assert_eq!(o["audience"].as_str(), Some(p.audience.as_str()));
         assert_eq!(o["roles_claim"].as_str(), Some("ekka_roles.development"));
         assert_eq!(o["scopes_claim"].as_str(), Some("scope"));
         assert_eq!(o["jwks_ttl_secs"].as_integer(), Some(300));

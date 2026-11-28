@@ -4,7 +4,9 @@
 //! real folder (never a link), owned by the trusted owner (root on a real install), writable by nobody else. A
 //! folder anyone else could write would let them swap the whole path. A file is written beside under a new name and
 //! renamed over the old one, so a reader sees the old file or the new one, never half of one. A file that already
-//! holds the same bytes, mode and owner is left alone: running the install again changes nothing.
+//! holds the same bytes, mode and owner is left alone: running the install again changes nothing. A macOS access
+//! control list that lets anyone else change a trusted folder is refused like a group-writable mode, and every
+//! folder and file made here has its ACL cleared, so nothing is inherited from the folder above (`acl`).
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -17,6 +19,7 @@ use rustix::fs::{
 };
 use rustix::io::Errno;
 
+use crate::acl::{self, Guard};
 use crate::error::{errno, failed, refused, Result};
 use crate::util::{hex, is_plain_name, random_bytes};
 
@@ -53,7 +56,40 @@ fn check_trusted_dir(fd: &OwnedFd, what: &Path, owner: u32) -> Result<()> {
     if mode_bits(st.st_mode) & 0o022 != 0 {
         return Err(refused(format!("{} can be written by users other than its owner", what.display())));
     }
+    if let Some(why) = acl::unsafe_grant(fd, Guard::Writes)? {
+        return Err(refused(format!("{}: {why}", what.display())));
+    }
     Ok(())
+}
+
+/// The open file is owned by `uid`, has exactly `mode`, and no ACL lets anyone else read or change it: what a
+/// private key must be before it is used again.
+pub fn check_secret(fd: &OwnedFd, what: &str, uid: u32, mode: u32) -> Result<()> {
+    let st = fstat(fd).map_err(|e| errno(format!("reading {what}"), e))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(refused(format!("{what} is not a regular file")));
+    }
+    if st.st_uid != uid || mode_bits(st.st_mode) != mode {
+        return Err(refused(format!(
+            "{what} is uid {} mode {:o}; it must be uid {uid} mode {mode:o}",
+            st.st_uid,
+            mode_bits(st.st_mode)
+        )));
+    }
+    if let Some(why) = acl::unsafe_grant(fd, Guard::ReadsAndWrites)? {
+        return Err(refused(format!("{what}: {why}")));
+    }
+    Ok(())
+}
+
+/// Opens the regular file `name` in `dir` without following a link; `None` when absent.
+pub fn open_file_at(dir: &OwnedFd, name: &str) -> Result<Option<OwnedFd>> {
+    match openat(dir, name, FILE_FLAGS, Mode::empty()) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(Errno::LOOP) => Err(refused(format!("{name} is a link; it must be a regular file"))),
+        Err(e) => Err(errno(format!("opening {name}"), e)),
+    }
 }
 
 /// What a walk down to a folder found.
@@ -100,6 +136,7 @@ pub fn walk_trusted(path: &Path, top: &Path, owner: u32, make: Option<u32>) -> R
             // A folder made just now takes the mode asked for, whatever the umask removed.
             fchmod(&next, Mode::from_raw_mode(mode as rustix::fs::RawMode))
                 .map_err(|e| errno(format!("setting the mode of {}", here.display()), e))?;
+            acl::clear(&next)?;
             made.push(here.clone());
         }
         check_trusted_dir(&next, &here, owner)?;
@@ -142,6 +179,10 @@ pub fn ensure_dir(parent: &OwnedFd, name: &str, mode: u32, owner: Owner, what: &
     if wrote == Wrote::Changed || mode_bits(st.st_mode) != mode {
         fchmod(&fd, Mode::from_raw_mode(mode as rustix::fs::RawMode))
             .map_err(|e| errno(format!("setting the mode of {what}"), e))?;
+        wrote = Wrote::Changed;
+    }
+    if wrote == Wrote::Changed || acl::has_entries(&fd)? {
+        acl::clear(&fd)?;
         wrote = Wrote::Changed;
     }
     Ok((fd, wrote))
@@ -189,8 +230,8 @@ pub fn write_at(dir: &OwnedFd, name: &str, data: &[u8], mode: u32, owner: Owner)
                 && mode_bits(st.st_mode) == mode
                 && st.st_size as u64 == data.len() as u64
             {
-                if let Some(old) = read_at(dir, name, data.len() as u64)? {
-                    if old == data {
+                if let Some(fd) = open_file_at(dir, name)? {
+                    if !acl::has_entries(&fd)? && read_regular(fd, name, data.len() as u64)? == data {
                         return Ok(Wrote::Unchanged);
                     }
                 }
@@ -208,6 +249,8 @@ pub fn write_at(dir: &OwnedFd, name: &str, data: &[u8], mode: u32, owner: Owner)
     )
     .map_err(|e| errno(format!("writing {name}"), e))?;
     let result = (|| {
+        // Nothing is inherited: a new file takes no ACL entry from the folder it is made in.
+        acl::clear(&fd)?;
         let mut f = File::from(fd);
         f.write_all(data).map_err(|e| failed(format!("writing {name}: {e}")))?;
         fchown(f.as_fd(), Some(Uid::from_raw(owner.uid)), Some(Gid::from_raw(owner.gid)))
@@ -263,7 +306,12 @@ pub fn holds(dir: &OwnedFd, name: &str, data: &[u8], mode: u32, owner: Owner) ->
             {
                 return Ok(false);
             }
-            Ok(read_at(dir, name, data.len() as u64).ok().flatten().as_deref() == Some(data))
+            match open_file_at(dir, name)? {
+                Some(fd) if !acl::has_entries(&fd)? => {
+                    Ok(read_regular(fd, name, data.len() as u64).ok().as_deref() == Some(data))
+                }
+                _ => Ok(false),
+            }
         }
         Err(Errno::NOENT) => Ok(false),
         Err(e) => Err(errno(format!("reading {name}"), e)),
@@ -358,6 +406,52 @@ mod tests {
         assert_eq!(ensure_dir(&top, "run", 0o700, me(), "run").unwrap().1, Wrote::Unchanged);
         std::os::unix::fs::symlink("/tmp", t.path().join("gateway")).unwrap();
         assert!(ensure_dir(&top, "gateway", 0o700, me(), "gateway").is_err());
+    }
+
+    #[test]
+    fn a_trusted_folder_whose_acl_lets_another_user_add_or_delete_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let backend = t.path().join("backend");
+        std::fs::create_dir(&backend).unwrap();
+        std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o755)).unwrap();
+        open_trusted_dir(&backend, t.path(), me().uid, None).unwrap();
+        crate::acl::tests::plant(&backend, "everyone allow add_file,delete_child");
+        let e = open_trusted_dir(&backend, t.path(), me().uid, None).unwrap_err();
+        assert!(e.reason.contains("access control list"), "{e}");
+    }
+
+    #[test]
+    fn a_record_with_an_acl_is_rewritten_clean_and_a_new_file_inherits_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = open_trusted_dir(t.path(), t.path(), me().uid, None).unwrap();
+        write_at(&dir, "r.json", b"{}\n", 0o644, me()).unwrap();
+        crate::acl::tests::plant(&t.path().join("r.json"), "everyone allow write");
+        assert!(!holds(&dir, "r.json", b"{}\n", 0o644, me()).unwrap(), "a check sees the ACL as a change");
+        assert_eq!(write_at(&dir, "r.json", b"{}\n", 0o644, me()).unwrap(), Wrote::Changed);
+        let f = std::fs::File::open(t.path().join("r.json")).unwrap();
+        assert!(!crate::acl::has_entries(&f).unwrap(), "the same bytes, and no ACL any more");
+        // A folder whose ACL hands read to everyone on everything made in it (no write, so it is still trusted).
+        crate::acl::tests::plant(t.path(), "everyone allow read,file_inherit,directory_inherit");
+        let dir = open_trusted_dir(t.path(), t.path(), me().uid, None).unwrap();
+        write_at(&dir, "ca.key", b"secret", 0o600, me()).unwrap();
+        let k = std::fs::File::open(t.path().join("ca.key")).unwrap();
+        assert!(!crate::acl::has_entries(&k).unwrap(), "a new key inherits no read grant");
+        let (sub, _) = ensure_dir(&dir, "tls", 0o755, me(), "tls").unwrap();
+        assert!(!crate::acl::has_entries(&sub).unwrap(), "a new folder inherits nothing either");
+    }
+
+    #[test]
+    fn a_secret_must_be_its_owners_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = open_trusted_dir(t.path(), t.path(), me().uid, None).unwrap();
+        write_at(&dir, "ca.key", b"k", 0o600, me()).unwrap();
+        check_secret(&open_file_at(&dir, "ca.key").unwrap().unwrap(), "ca.key", me().uid, 0o600).unwrap();
+        std::fs::set_permissions(t.path().join("ca.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(check_secret(&open_file_at(&dir, "ca.key").unwrap().unwrap(), "ca.key", me().uid, 0o600).is_err());
+        std::fs::set_permissions(t.path().join("ca.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        crate::acl::tests::plant(&t.path().join("ca.key"), "everyone allow read");
+        let e = check_secret(&open_file_at(&dir, "ca.key").unwrap().unwrap(), "ca.key", me().uid, 0o600).unwrap_err();
+        assert!(e.reason.contains("read or change"), "{e}");
     }
 
     #[test]

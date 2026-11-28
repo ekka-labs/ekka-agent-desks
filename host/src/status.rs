@@ -102,7 +102,13 @@ fn check_binding(l: &Layout) -> (Check, Option<Binding>) {
     match Binding::read(&l.binding()) {
         Ok(Some(b)) => match expect(&l.binding(), 0, 0o644) {
             Ok(()) if b.uid == l.uid => (pass("binding"), Some(b)),
-            Ok(()) => (fail("binding", format!("the binding is for uid {}, not {}", b.uid, l.uid)), Some(b)),
+            Ok(()) => (
+                fail(
+                    "binding",
+                    format!("this Mac's desk host is installed for uid {}, not {} (one per Mac)", b.uid, l.uid),
+                ),
+                Some(b),
+            ),
             Err(e) => (fail("binding", e), Some(b)),
         },
         Ok(None) => (fail("binding", "not installed: run ekka-desk-host install"), None),
@@ -140,29 +146,37 @@ fn check_release(l: &Layout, pins: &Pins) -> Check {
 }
 
 /// The records as the runner reads them: a walk from `/` that refuses links, root-owned, nobody else may write.
-fn check_records(l: &Layout) -> Check {
+fn check_records(l: &Layout, pins: &Pins) -> Check {
     from(
         "records",
         (|| {
             let dir = fsx::open_trusted_dir(&l.records(), &l.top, 0, None).map_err(|e| e.reason)?;
-            for name in [records::BASELINE, records::IMAGE, records::CEILING] {
+            for name in [records::BASELINE, records::CEILING] {
                 expect(&l.records().join(name), 0, 0o644)?;
             }
             let baseline = fsx::read_at(&dir, records::BASELINE, 1 << 20).map_err(|e| e.reason)?.unwrap_or_default();
             if baseline != records::baseline_bytes().map_err(|e| e.reason)? {
                 return Err("baseline-policy.json is not this release's reviewed baseline".into());
             }
-            let image = fsx::read_at(&dir, records::IMAGE, 4096).map_err(|e| e.reason)?.unwrap_or_default();
-            let image: serde_json::Value = serde_json::from_slice(&image).map_err(|_| "desk-image.json is not JSON")?;
-            if image["image"] != records::DESK_IMAGE_TAG || !crate::util::is_digest(image["id"].as_str().unwrap_or(""))
-            {
-                return Err("desk-image.json does not name the desk image by its content id".into());
-            }
             let ceiling = fsx::read_at(&dir, records::CEILING, 64 * 1024).map_err(|e| e.reason)?.unwrap_or_default();
             let c: Ceiling = serde_json::from_slice(&ceiling).map_err(|e| format!("provider-ceiling.json: {e}"))?;
             c.check().map_err(|e| e.reason)?;
             if c != records::ceiling(c.resources).map_err(|e| e.reason)? {
                 return Err("provider-ceiling.json does not name exactly this release's profiles".into());
+            }
+            // The desk image only by a published, pinned digest; without one, desks wait (closed).
+            match (fsx::read_at(&dir, records::IMAGE, 4096).map_err(|e| e.reason)?, &pins.desk_image) {
+                (None, None) => {
+                    return Err("waiting: no published desk image is pinned for a Mac yet; desks wait, closed".into())
+                }
+                (Some(_), None) => return Err("desk-image.json names an image this release did not pin".into()),
+                (None, Some(_)) => return Err("desk-image.json is missing: run install again".into()),
+                (Some(have), Some(pin)) => {
+                    expect(&l.records().join(records::IMAGE), 0, 0o644)?;
+                    if have != records::image_bytes(pin).map_err(|e| e.reason)? {
+                        return Err("desk-image.json is not the pinned published desk image".into());
+                    }
+                }
             }
             Ok(())
         })(),
@@ -195,6 +209,11 @@ fn check_tls(l: &Layout) -> Check {
         (|| {
             let t = l.tls_dir();
             expect(&t.join(CA_KEY), 0, 0o600)?;
+            if let Some(why) = crate::acl::unsafe_grant_path(&t.join(CA_KEY), crate::acl::Guard::ReadsAndWrites)
+                .map_err(|e| e.reason)?
+            {
+                return Err(format!("{}: {why}; run install --rotate-ca", t.join(CA_KEY).display()));
+            }
             expect(&t.join(CA_CERT), 0, 0o644)?;
             expect(&t.join(LEAF_KEY), l.uid, 0o600)?;
             expect(&t.join(BUNDLE), 0, 0o644)?;
@@ -301,14 +320,24 @@ fn check_docker(docker: &Docker) -> Check {
     )
 }
 
+/// The program itself: the root-owned copy at its fixed path, the only one that may ask for root.
+fn check_host_binary() -> Check {
+    from(
+        "host_binary",
+        std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| {
+            macos::trusted_self(&exe, Path::new(macos::HOST_BINARY), Path::new("/"), 0).map_err(|e| e.reason)
+        }),
+    )
+}
+
 /// The status of this Mac's desk host for the developer `l.uid`.
 pub fn status(l: &Layout, pins: &Pins, env: Option<&str>) -> Status {
     let (b, binding) = check_binding(l);
-    let mut checks = vec![b];
+    let mut checks = vec![check_host_binary(), b];
     if binding.is_some() {
         checks.extend([
             check_release(l, pins),
-            check_records(l),
+            check_records(l, pins),
             check_folders(l),
             check_tls(l),
             check_gateway_config(l),
@@ -426,7 +455,9 @@ mod tests {
         assert!(!s.ok);
         assert_eq!(s.schema, STATUS_SCHEMA);
         assert!(s.checks.iter().all(|c| c.ok || c.reason.is_some()), "every failure has a reason");
-        assert_eq!(s.checks[0].reason.as_deref(), Some("not installed: run ekka-desk-host install"));
+        let by_id = |id: &str| s.checks.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(by_id("binding").reason.as_deref(), Some("not installed: run ekka-desk-host install"));
+        assert!(by_id("host_binary").reason.as_deref().unwrap().contains(macos::HOST_BINARY));
         assert!(!s.bootstrap.ok && s.bootstrap.reason.as_deref().unwrap().starts_with("pending"));
     }
 

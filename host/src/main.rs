@@ -3,6 +3,7 @@
 //! OpenShell gateway and EKKA's backend adapter as verified programs, writes the root-owned records EKKA's desk
 //! commands read, and runs the Enclave, the gateway and the adapter as the developer's own services.
 
+mod acl;
 mod adapter;
 mod apply;
 mod binding;
@@ -34,10 +35,11 @@ const HELP: &str = "ekka-desk-host: installs and checks one EKKA desk host (this
 
   ekka-desk-host install --profile developer-native --runtime docker-desktop \\
       --env <env> --org <tenant id> --identity-profile <file> \\
-      [--ekka <absolute path>] [--desk-cpu-millicores <n> --desk-memory-mib <n>]
-      Installs for the developer running it. Asks for the password once, and only when something root owns
-      must change. Running it again with the same organization changes nothing that is already right; another
-      organization is refused before any change.
+      [--ekka <absolute path>] [--desk-cpu-millicores <n> --desk-memory-mib <n>] [--rotate-ca]
+      Installs for the developer running it, run from /usr/local/libexec/ekka-desk-host/ekka-desk-host (root's).
+      Asks for the password once, and only when something root owns must change. One installation per Mac:
+      another organization, developer or environment is refused before any change. --rotate-ca replaces an
+      installation CA whose key is no longer root's alone, and the gateway certificate with it.
 
   ekka-desk-host status [--json]     what this host observes, with a reason for each failure
   ekka-desk-host doctor [--json]     status, and live probes that change nothing
@@ -69,6 +71,7 @@ fn parse_install(args: &[String]) -> Result<install::Args> {
             "--ekka" => a.ekka = Some(PathBuf::from(value(args, &mut i, "--ekka")?)),
             "--desk-cpu-millicores" => a.cpu_millicores = Some(number(args, &mut i, "--desk-cpu-millicores")?),
             "--desk-memory-mib" => a.memory_mib = Some(number(args, &mut i, "--desk-memory-mib")?),
+            "--rotate-ca" => a.rotate_ca = true,
             other => return Err(usage(format!("install does not take {other:?}"))),
         }
         i += 1;
@@ -112,6 +115,13 @@ fn apply_root() -> Result<()> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(refused("the root step runs only as root, from install"));
     }
+    let exe = std::env::current_exe().map_err(|e| refused(format!("finding this program: {e}")))?;
+    platform::macos::trusted_self(
+        &exe,
+        std::path::Path::new(platform::macos::HOST_BINARY),
+        std::path::Path::new("/"),
+        0,
+    )?;
     let mut input = Vec::new();
     std::io::stdin()
         .take(1024 * 1024 + 1)

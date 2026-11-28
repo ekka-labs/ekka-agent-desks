@@ -2,7 +2,6 @@
 //! as the developer. No `docker` command is run. Every image is named by digest; what an image holds is checked
 //! against its pin before the gateway is allowed to use it.
 
-use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -274,40 +273,6 @@ impl Docker {
         let raw = resp.bytes(MAX_JSON)?;
         Ok(demux_stdout(&raw)?.lines().map(str::to_string).collect())
     }
-
-    /// Builds the desk image from its recipe, tagged and labelled; returns its content id.
-    pub fn build(&self, files: &[(&str, &[u8], u32)], tag: &str, labels: &BTreeMap<String, String>) -> Result<String> {
-        let mut b = tar::Builder::new(Vec::new());
-        for (name, data, mode) in files {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
-            h.set_mode(*mode);
-            h.set_entry_type(tar::EntryType::Regular);
-            h.set_path(name).map_err(|e| failed(format!("the desk image recipe: {e}")))?;
-            h.set_cksum();
-            b.append(&h, *data).map_err(|e| failed(format!("the desk image recipe: {e}")))?;
-        }
-        let context = b.into_inner().map_err(|e| failed(format!("the desk image recipe: {e}")))?;
-        let labels = serde_json::to_string(labels).unwrap_or_default();
-        let target = format!(
-            "/build?t={}&labels={}&rm=1&forcerm=1&pull=0&version=1&platform={}",
-            query_escape(tag),
-            query_escape(&labels),
-            query_escape(PLATFORM)
-        );
-        let resp = self.request("POST", &target, Some(("application/x-tar", &context)), Duration::from_secs(1800))?;
-        let aux = Self::stream(resp, "build the desk image")?;
-        let id = aux
-            .iter()
-            .filter_map(|a| a["ID"].as_str())
-            .next_back()
-            .map(str::to_string)
-            .ok_or_else(|| failed("Docker built the desk image and named no id"))?;
-        if !is_digest(&id) {
-            return Err(failed("Docker named the desk image with something that is not an image id"));
-        }
-        Ok(id)
-    }
 }
 
 /// The stdout frames of a non-TTY log stream: each frame is 8 bytes (stream, 0, 0, 0, size big-endian) then data.
@@ -330,15 +295,6 @@ pub fn demux_stdout(raw: &[u8]) -> Result<String> {
         i += size;
     }
     String::from_utf8(out).map_err(|_| failed("the container's output is not text"))
-}
-
-/// The label the desk image carries: the first 16 hex of the sha256 of its recipe's files, in name order (the
-/// same value the Linux installer computes).
-pub fn recipe_source(files: &[(&str, &[u8], u32)]) -> String {
-    let mut sorted: Vec<_> = files.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
-    let all: Vec<u8> = sorted.iter().flat_map(|(_, d, _)| d.iter().copied()).collect();
-    sha256_hex(&all)[..16].to_string()
 }
 
 #[cfg(test)]
@@ -369,19 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn the_recipe_label_matches_the_linux_installers() {
-        // find desk/image -type f | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16
-        let files = crate::kit::DESK_IMAGE;
-        let mut all = Vec::new();
-        for name in ["Dockerfile", "ekka-git-credential", "managed-settings.json"] {
-            all.extend_from_slice(files.iter().find(|f| f.0 == name).unwrap().1);
-        }
-        assert_eq!(recipe_source(&files), sha256_hex(&all)[..16]);
-    }
-
-    /// The pinned supervisor and sandbox runtime, pulled by digest for linux/arm64 into Docker Desktop, hold the
-    /// programs pinned for aarch64; a wrong pin is refused. Needs Docker Desktop; never in CI.
-    #[test]
     #[ignore = "needs Docker Desktop on this Mac"]
     fn docker_desktop_pinned_images_hold_their_programs() {
         let home = std::env::var("HOME").unwrap();
@@ -392,25 +335,5 @@ mod tests {
         let mut wrong = pins.sandbox.clone();
         wrong.binary_sha256 = "0".repeat(64);
         assert!(docker.verify_image(&wrong).unwrap_err().reason.contains("not the pinned"));
-    }
-
-    /// The Engine API build this crate uses for the desk image, on a two-line recipe: the returned id is the image
-    /// Docker then holds under the tag, with the label. Needs Docker Desktop; never in CI. The image is left for
-    /// the caller to remove (tag `ekka-desk-host-selftest`).
-    #[test]
-    #[ignore = "needs Docker Desktop on this Mac"]
-    fn docker_desktop_builds_a_recipe_and_names_its_id() {
-        let home = std::env::var("HOME").unwrap();
-        let docker = Docker::new(&Path::new(&home).join(".docker/run/docker.sock"));
-        let pins = crate::release::Pins::embedded().unwrap();
-        docker.pull(&pins.meter_image).unwrap();
-        let recipe = format!("FROM {}\nRUN true\n", pins.meter_image);
-        let files: [(&str, &[u8], u32); 1] = [("Dockerfile", recipe.as_bytes(), 0o644)];
-        let labels = BTreeMap::from([("ekka.desk.source".to_string(), recipe_source(&files))]);
-        let id = docker.build(&files, "ekka-desk-host-selftest:latest", &labels).unwrap();
-        let img = docker.image("ekka-desk-host-selftest:latest").unwrap().unwrap();
-        assert_eq!(img["Id"].as_str(), Some(id.as_str()));
-        assert_eq!(img["Config"]["Labels"]["ekka.desk.source"].as_str(), Some(recipe_source(&files).as_str()));
-        assert_eq!(img["Architecture"], "arm64");
     }
 }

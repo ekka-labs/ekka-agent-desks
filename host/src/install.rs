@@ -1,15 +1,15 @@
 //! `ekka-desk-host install --profile developer-native --runtime docker-desktop --env <env> --org <tenant id>
 //! --identity-profile <file>`: one native Mac desk host for the developer running it.
 //!
-//! In order: refuse a foreign organization before any change; check every download and image as the developer;
+//! In order: run only from the root-owned copy of this program; refuse another organization, developer or
+//! environment before any change (one installation per Mac); check every download and image as the developer;
 //! work out what root must change, and ask for the password once only when something does; then, as the
-//! developer, write the three LaunchAgents and start them in the login session (the gateway only after the
-//! Enclave's interceptor answers), start the memory meter, and run the gateway's one-time setup when it can.
-//! Every step reads first and changes only what differs, so running it again is safe and, when nothing changed,
-//! a no-op. What cannot be done yet is named, with what it waits for.
+//! developer, write the LaunchAgents and start them in the login session (the gateway only after the Enclave's
+//! interceptor answers), start a fresh memory meter, and run the gateway's one-time setup when it can. Every
+//! other step reads first and changes only what differs. What cannot be done yet is named, with what it waits for.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,14 +18,13 @@ use crate::apply::{self, Ctx, Owners, RootPlan, PLAN_SCHEMA};
 use crate::binding::{Binding, Want};
 use crate::bootstrap::{self, Desired, GatewayAdmin, GovernExchangeNotYetAvailable, Pass, Stop};
 use crate::error::{failed, refused, usage, Result};
-use crate::fsx::Owner;
-use crate::identity::Profile;
-use crate::kit;
+use crate::fsx::{self, Owner};
+use crate::identity::{self, Profile};
 use crate::meter;
 use crate::platform::macos::{self, Layout, ServiceInputs, LABEL_BACKEND, LABEL_ENCLAVE, LABEL_GATEWAY};
-use crate::records::{Resources, DESK_IMAGE_TAG};
+use crate::records::Resources;
 use crate::release::{self, Pins};
-use crate::runtime::docker::{recipe_source, Docker};
+use crate::runtime::docker::Docker;
 use crate::tls;
 use crate::util::is_plain_absolute_path;
 
@@ -39,6 +38,7 @@ pub struct Args {
     pub ekka: Option<PathBuf>,
     pub cpu_millicores: Option<u64>,
     pub memory_mib: Option<u64>,
+    pub rotate_ca: bool,
 }
 
 /// What an install did and what it still waits for.
@@ -52,9 +52,11 @@ fn say(s: impl AsRef<str>) {
     println!("   {}", s.as_ref());
 }
 
-/// The `ekka` program the Enclave runs: an absolute path, a regular file (through any link) that only its owner
-/// may change, in a folder only its owner may change.
-pub fn resolve_ekka(given: Option<&Path>) -> Result<PathBuf> {
+/// The `ekka` program the Enclave's LaunchAgent runs, by its real path: every link resolved, a regular executable
+/// file owned by `owner`, in folders from `top` down that only `owner` can change (no link, no group or other
+/// write, no ACL grant). On a real install `owner` is root and `top` is `/`, so nothing running as the developer
+/// can swap the program the Enclave starts at login. The returned path is the real one, never a link.
+pub fn resolve_ekka(given: Option<&Path>, top: &Path, owner: u32) -> Result<PathBuf> {
     let path = match given {
         Some(p) if p.is_absolute() => p.to_path_buf(),
         Some(_) => return Err(usage("--ekka must be an absolute path")),
@@ -63,25 +65,43 @@ pub fn resolve_ekka(given: Option<&Path>) -> Result<PathBuf> {
             .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
             .filter(|d| d.is_absolute())
             .map(|d| d.join("ekka"))
-            .find(|p| p.is_file())
+            .find(|p| p.exists())
             .ok_or_else(|| {
                 refused("the ekka program is not on PATH; install EKKA, or name it with --ekka <absolute path>")
             })?,
     };
-    if !is_plain_absolute_path(&path.display().to_string()) {
-        return Err(refused(format!("{} is not a plain absolute path", path.display())));
+    let why = |reason: String| {
+        refused(format!(
+            "{}: {reason}. The Enclave runs ekka only from a root-owned program in root-owned folders; install EKKA \
+             so (for example with `sudo install -o root -g wheel -m 0755 <ekka> /usr/local/bin/ekka`) and run \
+             install again",
+            path.display()
+        ))
+    };
+    let real = path.canonicalize().map_err(|e| why(e.to_string()))?;
+    if !is_plain_absolute_path(&real.display().to_string()) {
+        return Err(why(format!("its real path {} is not a plain absolute path", real.display())));
     }
-    let real = path.canonicalize().map_err(|e| refused(format!("{}: {e}", path.display())))?;
-    for p in [real.as_path(), real.parent().unwrap_or(Path::new("/"))] {
-        let m = std::fs::metadata(p).map_err(|e| refused(format!("{}: {e}", p.display())))?;
-        if m.permissions().mode() & 0o022 != 0 {
-            return Err(refused(format!("{} can be changed by users other than its owner", p.display())));
-        }
+    let (Some(parent), Some(name)) = (real.parent(), real.file_name().and_then(|n| n.to_str())) else {
+        return Err(why("it has no folder".into()));
+    };
+    let dir = fsx::open_trusted_dir(parent, top, owner, None).map_err(|e| why(e.reason))?;
+    let fd = fsx::open_file_at(&dir, name)?.ok_or_else(|| why("it is not there".into()))?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| why(e.to_string()))?;
+    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(why("it is not a regular file".into()));
     }
-    if !std::fs::metadata(&real).map(|m| m.is_file() && m.mode() & 0o111 != 0).unwrap_or(false) {
-        return Err(refused(format!("{} is not a program", path.display())));
+    if st.st_uid != owner {
+        return Err(why(format!("it is owned by uid {}, not uid {owner}", st.st_uid)));
     }
-    Ok(path)
+    let mode = fsx::mode_bits(st.st_mode);
+    if mode & 0o022 != 0 || mode & 0o111 == 0 {
+        return Err(why(format!("its mode is {mode:o}; it must be executable and writable by its owner only")));
+    }
+    if let Some(g) = crate::acl::unsafe_grant(&fd, crate::acl::Guard::Writes)? {
+        return Err(why(g));
+    }
+    Ok(real)
 }
 
 fn wait_for(what: &str, limit: Duration, mut ready: impl FnMut() -> bool) -> bool {
@@ -96,54 +116,41 @@ fn wait_for(what: &str, limit: Duration, mut ready: impl FnMut() -> bool) -> boo
     false
 }
 
-/// Puts the meter in place on the developer's Docker Desktop: unchanged when this release's meter already runs.
-pub fn ensure_meter(docker: &Docker, pins: &Pins, out: &mut Outcome) -> Result<()> {
-    docker.pull(&pins.meter_image)?;
-    if let Some(c) = docker.container(meter::NAME)? {
-        let id = c["Id"].as_str().unwrap_or(meter::NAME).to_string();
-        if meter::differences(&c, &pins.meter_image).is_empty() {
-            if c["State"]["Running"].as_bool() != Some(true) {
-                docker.start(&id)?;
-                out.changes.push("started the memory meter".into());
-            }
-            return Ok(());
-        }
-        docker.remove(&id)?;
-        out.changes.push("removed a memory meter that was not this release's".into());
-    }
-    let id = docker.create(Some(meter::NAME), &meter::container(&pins.meter_image))?;
-    docker.start(&id)?;
-    out.changes.push(format!("started the memory meter ({})", meter::NAME));
-    Ok(())
-}
-
 /// The gateway calls for setup are made with Govern's setup pass, which this release cannot obtain; until then
 /// no call is ever made (the pass source stops first).
 struct GatewayNotCalled;
 
+fn no_pass<T>() -> std::result::Result<T, Stop> {
+    Err(Stop::Pending("no gateway call without a setup pass".into()))
+}
+
 impl GatewayAdmin for GatewayNotCalled {
     fn workspace_exists(&mut self, _: &Pass, _: &str) -> std::result::Result<bool, Stop> {
-        Err(Stop::Pending("no gateway call without a setup pass".into()))
+        no_pass()
     }
     fn create_workspace(&mut self, _: &Pass, _: &str) -> std::result::Result<(), Stop> {
-        Err(Stop::Pending("no gateway call without a setup pass".into()))
+        no_pass()
     }
     fn members(&mut self, _: &Pass, _: &str) -> std::result::Result<Vec<bootstrap::Member>, Stop> {
-        Err(Stop::Pending("no gateway call without a setup pass".into()))
+        no_pass()
     }
     fn add_member(&mut self, _: &Pass, _: &str, _: &bootstrap::Member) -> std::result::Result<(), Stop> {
-        Err(Stop::Pending("no gateway call without a setup pass".into()))
+        no_pass()
     }
     fn profiles(&mut self, _: &Pass) -> std::result::Result<Vec<bootstrap::ProviderProfile>, Stop> {
-        Err(Stop::Pending("no gateway call without a setup pass".into()))
+        no_pass()
     }
     fn import_profiles(&mut self, _: &Pass, _: &[bootstrap::ProviderProfile]) -> std::result::Result<(), Stop> {
-        Err(Stop::Pending("no gateway call without a setup pass".into()))
+        no_pass()
     }
 }
 
 pub fn run(args: &Args) -> Result<Outcome> {
     let mut out = Outcome::default();
+    // Before anything else: the program that will ask for the password is the root-owned copy, and nothing the
+    // developer's processes can change.
+    let exe = std::env::current_exe().map_err(|e| failed(format!("finding this program: {e}")))?;
+    macos::trusted_self(&exe, Path::new(macos::HOST_BINARY), Path::new("/"), 0)?;
     let user = macos::developer()?;
     let want = Want {
         org: args.org.clone(),
@@ -167,6 +174,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
         b.check_same(&want)?;
         say(format!("bound to organization {} (installation {}): the same, continuing", b.org, b.installation_id));
     }
+    let origin = identity::govern_origin(&want.env)?;
     let enclave = adapter::read_enclave_values(&adapter::enclave_env_path(&l, &want.env))?;
     if let Some(e) = &enclave {
         if e.tenant_id != want.org {
@@ -177,9 +185,17 @@ pub fn run(args: &Args) -> Result<Outcome> {
                 want.org
             )));
         }
+        if e.govern_url.trim_end_matches('/') != origin {
+            return Err(refused(format!(
+                "the Enclave in {} is enrolled with another Govern than {}'s ({origin}); nothing was changed",
+                l.enclave_home().display(),
+                want.env
+            )));
+        }
     }
-    let ekka = resolve_ekka(args.ekka.as_deref())?;
+    let ekka = resolve_ekka(args.ekka.as_deref(), Path::new("/"), 0)?;
     say(format!("the Enclave runs {}", ekka.display()));
+    say(format!("the gateway trusts sign-in from {} only", identity::issuer(&want.env, &want.org)?));
 
     println!("== Docker Desktop");
     let docker = Docker::new(&l.docker_socket());
@@ -230,25 +246,25 @@ pub fn run(args: &Args) -> Result<Outcome> {
     docker.verify_image(&pins.supervisor)?;
     docker.verify_image(&pins.sandbox)?;
     say("the supervisor and sandbox runtime hold their pinned programs");
-    let source = recipe_source(&kit::DESK_IMAGE);
-    let have = docker.image(DESK_IMAGE_TAG)?;
-    let desk_image_id = match have {
-        Some(img) if img["Config"]["Labels"]["ekka.desk.source"].as_str() == Some(source.as_str()) => {
-            img["Id"].as_str().unwrap_or("").to_string()
+    match &pins.desk_image {
+        Some(pin) => {
+            docker.pull(&pin.image)?;
+            let img = docker.image(&pin.image)?.ok_or_else(|| failed(format!("Docker does not have {}", pin.image)))?;
+            if img["Id"].as_str() != Some(pin.image_id.as_str()) {
+                return Err(refused(format!("{} is not the pinned desk image {}", pin.image, pin.image_id)));
+            }
+            say(format!("the desk image {} is the pinned one", pin.image));
         }
-        _ => {
-            say("building the desk image on this Mac (several minutes the first time)");
-            let labels = BTreeMap::from([("ekka.desk.source".to_string(), source.clone())]);
-            let id = docker.build(&kit::DESK_IMAGE, DESK_IMAGE_TAG, &labels)?;
-            out.changes.push(format!("built the desk image {DESK_IMAGE_TAG} ({source})"));
-            id
-        }
-    };
-    say(format!("desk image {DESK_IMAGE_TAG} is {desk_image_id}"));
+        None => out.pending.push(
+            "desks: no published desk image is pinned for a Mac yet, so no desk-image record is written and desks \
+             wait (closed). An image built on this Mac is never recorded"
+                .into(),
+        ),
+    }
 
     let adapter_inputs = match (&adapter_staged, &enclave) {
         (Some(_), Some(e)) => {
-            Some(AdapterInputs { node_id: e.node_id.clone(), govern_keys: adapter::fetch_govern_keys(&e.govern_url)? })
+            Some(AdapterInputs { node_id: e.node_id.clone(), govern_keys: adapter::fetch_govern_keys(origin)? })
         }
         (Some(_), None) => {
             out.pending.push("the backend adapter's configuration: it needs the enrolled Enclave's node id".into());
@@ -256,6 +272,13 @@ pub fn run(args: &Args) -> Result<Outcome> {
         }
         _ => None,
     };
+    if profile.gateway_id.is_none() {
+        out.pending.push(
+            "the gateway: not registered yet. Register it (ekka desk setup --local), put its gateway_id in the \
+             identity profile, then run install again"
+                .into(),
+        );
+    }
 
     println!("== what root owns");
     let plan = RootPlan {
@@ -263,10 +286,10 @@ pub fn run(args: &Args) -> Result<Outcome> {
         want: want.clone(),
         gateway_staged,
         adapter_staged: adapter_staged.filter(|_| adapter_inputs.is_some()),
-        desk_image_id,
         resources,
-        oidc: profile.gateway.clone(),
+        gateway_id: profile.gateway_id.clone(),
         adapter: adapter_inputs,
+        rotate_ca: args.rotate_ca,
     };
     let roots = std::fs::read(crate::net::system_roots_path())
         .map_err(|e| failed(format!("reading the system's public roots: {e}")))?;
@@ -287,6 +310,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
             out.changes.push(c.to_string());
         }
     }
+    let binding = Binding::read(&l.binding())?.ok_or_else(|| failed("the root step left no binding"))?;
 
     println!("== the services, in your login session");
     let public = std::fs::read_to_string(l.jwt_dir().join(macos::JWT_PUBLIC))
@@ -294,8 +318,16 @@ pub fn run(args: &Args) -> Result<Outcome> {
     let key_b64 = tls::public_b64_of_pem(&public)?;
     std::fs::create_dir_all(l.logs()).map_err(|e| failed(format!("making {}: {e}", l.logs().display())))?;
     std::fs::set_permissions(l.logs(), std::fs::Permissions::from_mode(0o700)).ok();
-    let inputs = ServiceInputs { ekka: &ekka, env: &want.env, gateway_key_b64: &key_b64, profile: &profile };
-    let mut agents = vec![macos::enclave_agent(&l, &inputs), macos::gateway_agent(&l)];
+    let inputs = ServiceInputs {
+        ekka: &ekka,
+        env: &want.env,
+        gateway_key_b64: &key_b64,
+        installation_id: &binding.installation_id,
+    };
+    let mut agents = vec![macos::enclave_agent(&l, &inputs)];
+    if plan.gateway_id.is_some() {
+        agents.push(macos::gateway_agent(&l));
+    }
     if plan.adapter.is_some() {
         agents.push(macos::backend_agent(&l));
     }
@@ -307,6 +339,11 @@ pub fn run(args: &Args) -> Result<Outcome> {
         }
         changed.insert(a.label, c);
     }
+    out.pending.push(
+        "desk jobs: the Enclave's executor stays off until an ekka release can exchange its runner session for \
+         Govern's gateway pass"
+            .into(),
+    );
     if enclave.is_none() {
         out.pending.push(format!(
             "the Enclave: not enrolled in {} yet. Enroll it (ekka desk setup --local), then run install again",
@@ -318,7 +355,12 @@ pub fn run(args: &Args) -> Result<Outcome> {
         let answers = wait_for("the Enclave's interceptor", Duration::from_secs(60), || {
             std::os::unix::net::UnixStream::connect(&interceptor).is_ok()
         });
-        if answers {
+        if !answers {
+            out.pending.push(format!(
+                "the gateway waits for the Enclave's interceptor, which did not answer; see {}",
+                l.logs().join("enclave.log").display()
+            ));
+        } else if plan.gateway_id.is_some() {
             say("the Enclave's interceptor answers");
             macos::bootstrap(user.uid, LABEL_GATEWAY, &l.plist(LABEL_GATEWAY), changed[LABEL_GATEWAY])?;
             let ca = std::fs::read(l.tls_dir().join(macos::CA_CERT)).unwrap_or_default();
@@ -331,26 +373,25 @@ pub fn run(args: &Args) -> Result<Outcome> {
             } else {
                 out.pending.push(format!("the gateway did not answer; see {}", l.logs().join("gateway.log").display()));
             }
-        } else {
-            out.pending.push(format!(
-                "the gateway waits for the Enclave's interceptor, which did not answer; see {}",
-                l.logs().join("enclave.log").display()
-            ));
         }
     }
 
     println!("== the memory meter");
-    ensure_meter(&docker, &pins, &mut out)?;
-    say(format!("{} runs on your Docker Desktop", meter::NAME));
+    out.changes.extend(meter::replace(&docker, &pins.meter_image)?);
+    say(format!("a fresh {} runs on your Docker Desktop", meter::NAME));
 
     println!("== the gateway's one-time setup");
-    match (&profile.callers.enclave, &profile.callers.adapter) {
-        (Some(e), Some(a)) => {
-            let want = Desired::for_subjects(&e.subject, &a.subject).map_err(|s| failed(format!("{s:?}")))?;
+    match (&profile.gateway_id, &enclave) {
+        (Some(gateway_id), Some(e)) => {
+            let want = Desired::for_subjects(
+                &format!("enclave/{}", e.node_id),
+                &format!("adapter/{}", binding.installation_id),
+            )
+            .map_err(|s| failed(format!("{s:?}")))?;
             match bootstrap::reconcile(
                 &mut GovernExchangeNotYetAvailable,
                 &mut GatewayNotCalled,
-                &profile.gateway.audience,
+                gateway_id,
                 &want,
                 &std::time::SystemTime::now,
             ) {
@@ -361,9 +402,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
                 Err(Stop::Failed(why)) => return Err(failed(format!("the gateway's setup: {why}"))),
             }
         }
-        _ => {
-            out.pending.push("the gateway's setup: the identity profile names no Enclave or adapter subject yet".into())
-        }
+        _ => out.pending.push("the gateway's setup: it needs the registered gateway and the enrolled Enclave".into()),
     }
     Ok(out)
 }
@@ -372,21 +411,45 @@ pub fn run(args: &Args) -> Result<Outcome> {
 mod tests {
     use super::*;
 
+    fn me() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
     #[test]
-    fn the_ekka_program_must_be_absolute_and_owner_only() {
-        assert!(resolve_ekka(Some(Path::new("relative/ekka"))).is_err());
+    fn a_link_to_a_program_the_developer_can_change_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let mine = t.path().join("ekka-real");
+        std::fs::write(&mine, b"#!/bin/false\n").unwrap();
+        std::fs::set_permissions(&mine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = t.path().join("ekka");
+        std::os::unix::fs::symlink(&mine, &link).unwrap();
+        let e = resolve_ekka(Some(&link), Path::new("/"), 0).unwrap_err();
+        assert_eq!(e.kind, crate::error::Kind::Refused);
+        assert!(e.reason.contains("root-owned"), "{e}");
+    }
+
+    #[test]
+    fn a_program_owned_by_anyone_but_root_is_refused() {
+        if me() == 0 {
+            return;
+        }
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("ekka");
         std::fs::write(&p, b"#!/bin/false\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        // A temporary folder's own path may not be plain on every machine; only the rules below are checked.
-        if is_plain_absolute_path(&p.display().to_string()) {
-            assert_eq!(resolve_ekka(Some(&p)).unwrap(), p);
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o777)).unwrap();
-            assert!(resolve_ekka(Some(&p)).unwrap_err().reason.contains("other than its owner"));
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(resolve_ekka(Some(&p)).unwrap_err().reason.contains("not a program"));
-        }
+        // Even with every folder its owner's alone, a program the developer owns is one they can replace.
+        let e = resolve_ekka(Some(&p), Path::new("/"), 0).unwrap_err();
+        assert!(e.reason.contains("ekka only from a root-owned program"), "{e}");
+        assert!(resolve_ekka(Some(Path::new("relative/ekka")), Path::new("/"), 0).is_err());
+    }
+
+    #[test]
+    fn a_root_owned_program_is_used_by_its_real_path_never_the_link() {
+        // /bin/ls stands in for a root-owned ekka: root's file, in root's folders.
+        assert_eq!(resolve_ekka(Some(Path::new("/bin/ls")), Path::new("/"), 0).unwrap(), PathBuf::from("/bin/ls"));
+        let t = tempfile::tempdir().unwrap();
+        let link = t.path().join("ekka");
+        std::os::unix::fs::symlink("/bin/ls", &link).unwrap();
+        assert_eq!(resolve_ekka(Some(&link), Path::new("/"), 0).unwrap(), PathBuf::from("/bin/ls"));
     }
 }
