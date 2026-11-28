@@ -60,7 +60,7 @@ timeout = "500ms"
 
 [[openshell.gateway.interceptors.bindings]]
 rpc    = "openshell.v1.OpenShell/CreateSandbox"
-phases = ["validate"]  # refused for the Enclave's own identity; a person's create is OpenShell's decision
+phases = ["validate"]  # only a desk change run through EKKA (the backend adapter's sign-in); every other create is refused
 
 [[openshell.gateway.interceptors.bindings]]
 rpc    = "openshell.v1.OpenShell/UpdateConfig"
