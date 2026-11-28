@@ -152,6 +152,12 @@ jobs:
           compression-level: 0  # the layers are compressed already
 
       - uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c  # v0.20.5
+        env:
+          # Every package, without the list of files each package owns: a keyless attestation sends the whole SBOM
+          # to Sigstore's public transparency log. Measured with syft 1.31.0 on this image (linux/arm64): the same
+          # 287 packages, 595 file entries instead of 4878, 0.97 MB instead of 4.2 MB.
+          SYFT_FILE_METADATA_SELECTION: none
+          SYFT_RELATIONSHIPS_PACKAGE_FILE_OWNERSHIP: "false"
         with:
           image: ${{ env.ref }}
           format: spdx-json
@@ -165,7 +171,8 @@ jobs:
         run: |
           set -euo pipefail
           jq -e '.spdxVersion and (.packages | length > 0)' "sbom-$ARCH.spdx.json" > /dev/null
-          echo "SBOM: $(jq '.packages | length' "sbom-$ARCH.spdx.json") packages, $(wc -c < "sbom-$ARCH.spdx.json") bytes"
+          echo "SBOM: $(jq '.packages | length' "sbom-$ARCH.spdx.json") packages, $(jq '[.files[]?] | length' \
+            "sbom-$ARCH.spdx.json") file entries, $(wc -c < "sbom-$ARCH.spdx.json") bytes" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
