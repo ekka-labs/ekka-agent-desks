@@ -40,6 +40,35 @@ jobs:
           set -o pipefail   # a git log that fails must fail the step, not hand the check an empty text
           git log --format=%B "$BASE_SHA..$HEAD_SHA" | python3 tools/public_check.py --stdin
           printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | python3 tools/public_check.py --stdin
+  host:
+    # ekka-desk-host (host/), the native Mac desk host tool, on Apple Silicon: formatting, lints with warnings as
+    # errors, and its unit tests. Then its one root-only test under sudo, on this throwaway runner only: what the
+    # install writes as root, the developer who ran it can neither replace nor read where it must not. No test
+    # downloads anything (only cargo fetches the locked crates), and no test runs the real install.
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: The pinned Rust toolchain (host/rust-toolchain.toml)
+        run: rustup toolchain install 1.92.0 --profile minimal --component clippy,rustfmt
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Lints, warnings as errors
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --locked
+      - name: The root-only test, under sudo
+        run: |
+          set -euo pipefail
+          bin=$(cargo test --locked --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.name == "ekka-desk-host") | .executable' | head -1)
+          [[ -n $bin && -x $bin ]] || { echo "::error::the test program was not built"; exit 1; }
+          sudo "$bin" --ignored --exact apply::tests::root_a_developer_cannot_replace_a_record_nor_read_the_ca_key
   unittest-python39:
     # The same suite on Amazon Linux 2023's own python3, which is 3.9 (a supported server, README). The gateway
     # preflight once imported tomllib (3.11+) and so could not start a gateway there at all.
