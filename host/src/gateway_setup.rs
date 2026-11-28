@@ -218,7 +218,8 @@ struct TokenAnswer {
 
 /// Govern's answer as a pass, or why there is none. The pass ends `expires_in` (at most 120 s) after `sent_at`.
 pub fn pass_from(status: u16, body: &[u8], sent_at: SystemTime) -> std::result::Result<Pass, Stop> {
-    let code = code_of(body);
+    // Only a refusal's body is read for its code: an answer holding a pass is read once, into the pass.
+    let code = if status == 200 { String::new() } else { code_of(body) };
     let fresh = "open a new setup authorization (ekka desk setup --local)";
     match status {
         200 => {}

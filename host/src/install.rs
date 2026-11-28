@@ -273,7 +273,8 @@ pub fn run(args: &Args) -> Result<Outcome> {
 
     println!("== verified downloads");
     let pins = Pins::embedded()?.with_local(local.as_ref());
-    let staging = l.staging(&pins.release_id());
+    // Downloads are staged by the release's own pins: a local adapter rebuild never downloads the gateway again.
+    let staging = l.staging(&Pins::embedded()?.release_id());
     let gateway_staged = release::stage(&pins.gateway, &staging)?;
     say(format!("NVIDIA OpenShell gateway {}: archive and program match their pins", pins.openshell_version));
     let adapter_staged = match &pins.adapter {
