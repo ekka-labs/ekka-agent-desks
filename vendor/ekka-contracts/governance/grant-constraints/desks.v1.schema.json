@@ -9,7 +9,7 @@
   ],
   "$defs": {
     "full": {
-      "description": "The limits written out. They are stored on the grant, copied by Govern into the signed gate token's `constraints`, and enforced by the backend adapter before any backend call. CLOSED: an unknown key is refused, never ignored, because an ignored limit is a limit nobody enforces. Every list the adapter needs in order to allow anything is required and non-empty: no list, no create. Rules a schema cannot state are the adapter's, and refuse with the code naming the limit: every name in `providers` has an entry in `provider_config_digests`, and no other name does; a create's image digest (after `@`, or the whole value when it is a local content ID) is in `image_digests`; every host in `policy_baseline.network.allowed_hosts` is inside the `allowed_hosts` ceiling.",
+      "description": "The limits written out. They are stored on the grant, copied by Govern into the signed gate token's `constraints`, and enforced by the backend adapter before any backend call. CLOSED: an unknown key is refused, never ignored, because an ignored limit is a limit nobody enforces. Every list the adapter needs in order to allow anything is required and non-empty: no list, no create. Rules a schema cannot state are the adapter's, and refuse with the code naming the limit: every name in `providers` has an entry in `provider_config_digests`, and no other name does; a create's image digest (after `@`, or the whole value when it is a local content ID) is in `image_digests`; every host in `policy_baseline.network.allowed_hosts` is inside the `allowed_hosts` ceiling; a create's CPU and memory limit is at most `resources`, and a grant without `resources` allows no create.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -134,6 +134,26 @@
             }
           }
         },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_cpu_millicores", "max_memory_mib"],
+          "description": "The most CPU and memory one desk may be created with: a create's `resources` must be at most each value. Both are JSON integers, such as `4000`; the adapter refuses `4000.0` (CONSTRAINTS_INVALID), as it refuses it in a create. OPTIONAL in this schema only so that a grant written before it stays valid for every other change; a create needs it, and the adapter refuses every create under a grant without it. Either refusal is CONSTRAINT_RESOURCES.",
+          "properties": {
+            "max_cpu_millicores": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 256000,
+              "description": "Thousandths of one CPU, as a create's `cpu_millicores`."
+            },
+            "max_memory_mib": {
+              "type": "integer",
+              "minimum": 256,
+              "maximum": 4194304,
+              "description": "Mebibytes, as a create's `memory_mib`."
+            }
+          }
+        },
         "discovery": {
           "type": "object",
           "additionalProperties": false,
@@ -163,6 +183,26 @@
               "type": "string",
               "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
               "description": "When the window closes, UTC. A permit never outlives it."
+            }
+          }
+        },
+        "projects": {
+          "type": "array",
+          "maxItems": 8,
+          "description": "OPTIONAL: the server's own projects, each a team's desk image and its own reviewed policy. Absent or empty means none. A project widens nothing by itself: its `image_id` must also be in `image_digests` and its `policy_digest` in `policy_digests`, and every reader refuses a grant where either is missing. A schema cannot state that rule. Two entries never share a name.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "image_id", "policy_digest", "since"],
+            "properties": {
+              "name": { "$ref": "#/$defs/name", "description": "The project's name on this server." },
+              "image_id": { "$ref": "#/$defs/digest", "description": "The project's desk image: the local content ID of an image built on the server." },
+              "policy_digest": { "$ref": "#/$defs/digest", "description": "The digest the adapter computes for the project's own policy." },
+              "since": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+                "description": "When the project entered the grant, UTC, to the second. A reader also parses it as a real calendar time and refuses one that is not (for example 30 February)."
+              }
             }
           }
         },

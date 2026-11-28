@@ -21,6 +21,7 @@ use crate::error::{errno, failed, refused, Result};
 use crate::fsx::{self, ensure_dir, walk_trusted, Owner, Walk, Wrote, DIR_FLAGS};
 use crate::gateway_config;
 use crate::identity;
+use crate::local_build::{self, LocalBuild};
 use crate::platform::macos::{
     Layout, BUNDLE, CA_CERT, CA_KEY, JWT_KID, JWT_PUBLIC, JWT_SIGNING, LEAF_CERT, LEAF_KEY, LEAF_META,
 };
@@ -268,6 +269,13 @@ pub struct RootPlan {
     /// Allow the desk CPU or memory ceiling to go up (it may always go down); recorded when used.
     #[serde(default)]
     pub raise_ceiling: bool,
+    /// `install --rotate-adapter-key`: the adapter key is about to be replaced, so no sign-in is written for it.
+    #[serde(default)]
+    pub rotate_adapter_key: bool,
+    /// A developer's local build in place of the releases it names: dev only (`local_build`). Root hashes the
+    /// local adapter itself and records `"source": "local-build"`.
+    #[serde(default)]
+    pub local_build: Option<LocalBuild>,
 }
 
 pub const PLAN_SCHEMA: &str = "ekka-desk-host.root-plan/v2";
@@ -285,6 +293,13 @@ impl RootPlan {
                 ));
             }
             r.check()?;
+        }
+        if let Some(lb) = &self.local_build {
+            lb.check(&self.want.env)?;
+            let local = lb.ekka_backend.as_ref().map(|p| Path::new(&p.path));
+            if self.adapter_staged.is_some() && self.adapter_staged.as_deref() != local {
+                return Err(refused("the plan stages another adapter than its local build names"));
+            }
         }
         if let Some(a) = &self.adapter {
             adapter::check_keys(&a.govern_keys)?;
@@ -309,8 +324,10 @@ fn program(
     bin_path: &Path,
     pin: &Pinned,
     staged: &Path,
-    root: Owner,
+    owners: Owners,
+    checked: Option<&[u8]>,
 ) -> Result<()> {
+    let root = owners.root;
     if let Some(have) = read(bin, &pin.binary, MAX_PROGRAM)? {
         if verify_binary(pin, &have).is_ok()
             && fsx::holds(bin.expect("read found it"), &pin.binary, &have, 0o755, root)?
@@ -322,10 +339,13 @@ fn program(
         ctx.note(format!("install {}", bin_path.join(&pin.binary).display()));
         return Ok(());
     }
-    let fd =
-        rustix::fs::open(staged, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::empty())
-            .map_err(|e| errno(format!("opening the staged {}", pin.binary), e))?;
-    let bytes = fsx::read_regular(fd, &pin.binary, MAX_PROGRAM)?;
+    let bytes = match checked {
+        // A local build root already read and hashed, before any change (`local_adapter`): those same bytes.
+        Some(b) => b.to_vec(),
+        // What the developer staged: opened one folder at a time from `/`, never through a link anywhere on the way,
+        // each folder root's or theirs; read once from that one handle, and these bytes are hashed and installed.
+        None => fsx::read_regular(fsx::open_owned_path(staged, owners.dev.uid)?, &pin.binary, MAX_PROGRAM)?,
+    };
     verify_binary(pin, &bytes)?;
     ctx.file(bin, bin_path, &pin.binary, &bytes, 0o755, root)
 }
@@ -333,6 +353,9 @@ fn program(
 #[derive(Serialize)]
 struct ReleaseRecord<'a> {
     schema: &'static str,
+    /// `local-build` for a developer's local build (dev only); left out for a release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
     release: &'a str,
     openshell_version: &'a str,
     gateway: &'a Pinned,
@@ -391,6 +414,18 @@ fn legacy_bindings(l: &Layout, root: u32) -> Result<Vec<Binding>> {
     Ok(out)
 }
 
+/// A developer's local adapter build (dev only), read one folder at a time from `/` (no link, each folder root's or
+/// theirs, a regular file, at most 256 MiB) and hashed here against the manifest's sha256: any difference is
+/// refused, before anything changes. The bytes read are the ones installed.
+fn local_adapter(pin: &Pinned, staged: &Path, dev_uid: u32) -> Result<Vec<u8>> {
+    let fd = fsx::open_owned_path(staged, dev_uid)?;
+    let bytes = fsx::read_regular(fd, &pin.binary, MAX_PROGRAM)?;
+    verify_binary(pin, &bytes).map_err(|e| {
+        refused(format!("the local build's adapter {}: {}; nothing was changed", staged.display(), e.reason))
+    })?;
+    Ok(bytes)
+}
+
 /// Does (or, checking, lists) every root-owned part of the installation. Returns the binding in force.
 /// The CA key, when one exists, may be used again only while it is root's alone: owner root, mode 0600, and no
 /// ACL letting anyone else read or change it. Checking, as the developer, this reads the key's metadata only.
@@ -424,8 +459,17 @@ pub fn root_apply(
     system_roots: &[u8],
     ctx: &mut Ctx,
 ) -> Result<Binding> {
+    // A local build is dev only, refused here before anything; then its parts stand in for the pins they replace.
+    if let Some(lb) = &plan.local_build {
+        lb.check(&plan.want.env)?;
+    }
+    let pins = &pins.with_local(plan.local_build.as_ref());
     plan.check(pins)?;
     let (root, dev) = (owners.root, owners.dev);
+    let local_adapter = match (&pins.adapter, &plan.adapter_staged) {
+        (Some(pin), Some(staged)) if pins.adapter_local => Some(local_adapter(pin, staged, dev.uid)?),
+        _ => None,
+    };
     let top = &l.top;
 
     // One installation per Mac: the machine-wide binding names the organization, the developer's uid and the
@@ -699,7 +743,19 @@ pub fn root_apply(
     }
     if let Some(inputs) = &plan.adapter {
         let issuer = identity::issuer(&binding.env, &binding.org)?;
-        let cfg = adapter::config_bytes(l, &binding.org, inputs, &issuer)?;
+        // The desk-pass sign-in only when this installation's registration names this key and the pinned adapter
+        // reads it; otherwise left out (an older adapter refuses a file that has it).
+        // The key's thumbprint as root reads it now, under the install lock, through the folder handle it checked
+        // (no link, the developer's 0600 file, no ACL): never the plan's word for it. A key being replaced is none.
+        let key_kid = match (&be, plan.rotate_adapter_key) {
+            (Some(dir), false) => {
+                let path = l.backend_dir().join(crate::adapter_key::KEY_FILE);
+                crate::adapter_key::read_key(dir, &path, dev.uid).kid().map(str::to_string)
+            }
+            _ => None,
+        };
+        let signin = adapter::signin(l, &binding, plan.registration.as_ref(), key_kid.as_deref(), pins).ok();
+        let cfg = adapter::config_bytes(l, &binding.org, inputs, &issuer, signin.as_ref())?;
         ctx.file(dfd.as_ref(), &d, "backend-config.json", &cfg, 0o644, root)?;
     }
 
@@ -712,12 +768,13 @@ pub fn root_apply(
     let rel = ctx.sub_dir(rels.as_ref(), &opt.join("releases"), &release, 0o755, root)?;
     let bin = ctx.sub_dir(rel.as_ref(), &rel_path, "bin", 0o755, root)?;
     let bin_path = rel_path.join("bin");
-    program(ctx, bin.as_ref(), &bin_path, &pins.gateway, &plan.gateway_staged, root)?;
+    program(ctx, bin.as_ref(), &bin_path, &pins.gateway, &plan.gateway_staged, owners, None)?;
     if let (Some(pin), Some(staged)) = (&pins.adapter, &plan.adapter_staged) {
-        program(ctx, bin.as_ref(), &bin_path, pin, staged, root)?;
+        program(ctx, bin.as_ref(), &bin_path, pin, staged, owners, local_adapter.as_deref())?;
     }
     let record = ReleaseRecord {
         schema: "ekka-desk-host.release/v1",
+        source: pins.adapter_local.then_some(local_build::SOURCE),
         release: &release,
         openshell_version: &pins.openshell_version,
         gateway: &pins.gateway,
@@ -741,8 +798,17 @@ pub fn root_apply(
         log.extend_from_slice(&line);
         ctx.file(ekka_dev.as_ref(), &l.ekka_dev(), CEILING_RAISES, &log, 0o644, root)?;
     }
-    records::write(ctx, top, &records_dir, root, pins.desk_image.as_ref(), plan.resources)?;
-    if pins.desk_image.is_none() {
+    let image = records::expected_image(pins.desk_image.as_ref(), plan.local_build.as_ref())?;
+    records::write(ctx, top, &records_dir, root, image.as_deref(), plan.resources)?;
+    // A local build is said beside the records, root's, so nothing reads them as a release's; gone with it.
+    let rfd = ctx.trusted_dir(top, &records_dir, root.uid, 0o755)?;
+    match &plan.local_build {
+        Some(lb) => {
+            ctx.file(rfd.as_ref(), &records_dir, local_build::MARKER, &local_build::marker_bytes(lb), 0o644, root)?
+        }
+        None => ctx.remove(rfd.as_ref(), &records_dir, local_build::MARKER)?,
+    }
+    if image.is_none() {
         // No published image is pinned: an image record left from before is taken out of the runner's reach (kept
         // beside it, renamed, as evidence), so desks wait closed rather than run an image nobody pinned.
         let fd = ctx.trusted_dir(top, &records_dir, root.uid, 0o755)?;
@@ -795,10 +861,12 @@ pub(crate) mod tests {
 
     pub(crate) fn rig() -> Rig {
         let dir = tempfile::tempdir().unwrap();
-        let top = dir.path().join("root");
+        // Its real path: a Mac's temporary folder is under /var, a link, and root reads what is staged without one.
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let top = base.join("root");
         std::fs::create_dir(&top).unwrap();
         std::fs::set_permissions(&top, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let home = dir.path().join("home");
+        let home = base.join("home");
         std::fs::create_dir(&home).unwrap();
         let staged = home.join("openshell-gateway");
         std::fs::write(&staged, fake_program()).unwrap();
@@ -821,6 +889,8 @@ pub(crate) mod tests {
             adapter: None,
             rotate_ca: false,
             raise_ceiling: false,
+            rotate_adapter_key: false,
+            local_build: None,
         };
         let roots = std::fs::read(crate::net::system_roots_path()).unwrap();
         Rig { dir, layout, pins, plan, roots }
@@ -1000,6 +1070,245 @@ pub(crate) mod tests {
         std::fs::write(t.join(CA_CERT), other_ca).unwrap();
         let e = root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap_err();
         assert!(e.reason.contains("is not the certificate of the installation CA's key"), "{e}");
+    }
+
+    /// A rig with the backend adapter pinned (at `version`) and staged, and the enrolled Enclave's inputs.
+    pub(crate) fn with_adapter(r: &mut Rig, version: &str) {
+        let mut program = fake_program();
+        program.extend_from_slice(b" and the adapter");
+        let staged = r.layout.home.join("ekka-backend");
+        std::fs::write(&staged, &program).unwrap();
+        r.pins.adapter = Some(Pinned {
+            binary: "ekka-backend".into(),
+            archive_url: "https://example.com/a.tar.gz".into(),
+            checksums_url: "https://example.com/sums.txt".into(),
+            release_asset: "ekka-backend-aarch64-apple-darwin.tar.gz".into(),
+            archive_sha256: "a".repeat(64),
+            binary_sha256: crate::util::sha256_hex(&program),
+        });
+        r.pins.adapter_version = Some(version.into());
+        r.plan.adapter_staged = Some(staged);
+        r.plan.adapter = Some(AdapterInputs {
+            node_id: "2f8e7d6c-5b4a-4392-8170-6e5d4c3b2a19".into(),
+            govern_keys: vec![crate::adapter::GovernKey {
+                key_id: "govern-gate-token-v1".into(),
+                public_key_b64: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".into(),
+            }],
+        });
+    }
+
+    fn adapter_config(r: &Rig) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(r.layout.adapter_config()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_adapter_signs_in_with_a_desk_pass_only_for_its_registered_key_and_a_release_that_reads_it() {
+        let mut r = rig();
+        with_adapter(&mut r, "0.3.0");
+        registered(&mut r, owners());
+        let key = crate::adapter_key::ensure(&r.layout, owners(), false, None).unwrap();
+        let kid = key.state.kid().unwrap().to_string();
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../vendor/ekka-contracts/backend/adapter-config.v1.schema.json"))
+                .unwrap();
+        let apply = |r: &mut Rig, registered_kid: Option<&str>, rotating: bool, from: Option<&str>| {
+            r.plan.registration.as_mut().unwrap().adapter_kid = registered_kid.map(str::to_string);
+            r.plan.rotate_adapter_key = rotating;
+            r.pins.adapter_signin_from = from.map(str::to_string);
+            root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+            let v = adapter_config(r);
+            assert_eq!(crate::schema_check::errors(&v, &schema), Vec::<String>::new(), "the whole file, every time");
+            v["backend_gateway"]["signin"].clone()
+        };
+        // Today: no adapter release reads it, so it is never written, even for the registered key.
+        assert!(apply(&mut r, Some(&kid), false, None).is_null());
+        // A release that reads it, and the registered key: written, naming this installation, this gateway and the key.
+        let signin = apply(&mut r, Some(&kid), false, Some("0.3.0"));
+        let b = Binding::read(&r.layout.binding()).unwrap().unwrap();
+        assert_eq!(
+            signin,
+            serde_json::json!({"mode": "ekka_desk_pass.v1", "installation_id": b.installation_id, "gateway_id": GATEWAY,
+                "key_path": r.layout.backend_dir().join("adapter-key.pem").display().to_string()})
+        );
+        assert_eq!(adapter_config(&r)["backend_gateway"]["issuer"], identity::issuer("prod", ORG).unwrap());
+        // Any one of these missing, and it is taken out again: an older adapter, another key, a key being replaced, no registered kid.
+        assert!(apply(&mut r, Some(&kid), false, Some("0.4.0")).is_null(), "the pinned 0.3.0 predates 0.4.0");
+        assert!(apply(&mut r, Some("oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U"), false, Some("0.3.0")).is_null());
+        assert!(apply(&mut r, Some(&kid), true, Some("0.3.0")).is_null());
+        assert!(apply(&mut r, None, false, Some("0.3.0")).is_null());
+        assert!(apply(&mut r, Some(&kid), false, Some("0.3.0")).is_object());
+        r.plan.registration = None;
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(adapter_config(&r)["backend_gateway"]["signin"].is_null(), "not registered: never written");
+    }
+
+    /// A dev rig with a developer's local adapter build named by a local build manifest, at its real path.
+    fn local_rig() -> (Rig, PathBuf, Vec<u8>) {
+        let mut r = rig();
+        r.plan.want.env = "dev".into();
+        let mut program = fake_program();
+        program.extend_from_slice(b" built on this Mac");
+        let home = std::fs::canonicalize(&r.layout.home).unwrap();
+        let path = home.join("ekka-backend");
+        std::fs::write(&path, &program).unwrap();
+        r.plan.adapter_staged = Some(path.clone());
+        r.plan.local_build = Some(LocalBuild {
+            ekka: None,
+            ekka_backend: Some(local_build::Program {
+                path: path.display().to_string(),
+                sha256: crate::util::sha256_hex(&program),
+            }),
+            desk_image: Some(local_build::Image { image_id: format!("sha256:{}", "c".repeat(64)) }),
+        });
+        (r, path, program)
+    }
+
+    #[test]
+    fn a_local_build_is_refused_for_staging_and_prod_before_any_change() {
+        for env in ["staging", "prod"] {
+            let (mut r, _, _) = local_rig();
+            r.plan.want.env = env.into();
+            let before = snapshot(r.dir.path());
+            for mut ctx in [Ctx::check(), Ctx::apply()] {
+                let e = root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut ctx).unwrap_err();
+                assert!(e.reason.contains("--env dev only"), "{env}: {e}");
+                assert!(ctx.changes.is_empty());
+            }
+            assert_eq!(snapshot(r.dir.path()), before, "{env}: nothing changed");
+        }
+    }
+
+    #[test]
+    fn a_local_adapter_is_installed_only_after_roots_own_hash_matches_and_never_reads_as_a_release() {
+        let (r, path, program) = local_rig();
+        // Changed after the manifest was written: root's own hash refuses it before any change.
+        std::fs::write(&path, b"\xcf\xfa\xed\xfe something else").unwrap();
+        let before = snapshot(r.dir.path());
+        let e = root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap_err();
+        assert!(e.reason.contains("the local build's adapter") && e.reason.contains("nothing was changed"), "{e}");
+        assert_eq!(snapshot(r.dir.path()), before, "refused before any change");
+        // The manifest's bytes: installed like a release, and said to be a local build wherever root writes.
+        std::fs::write(&path, &program).unwrap();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let pins = r.pins.with_local(r.plan.local_build.as_ref());
+        let rel = r.layout.release_dir(&pins.release_id());
+        assert_eq!(std::fs::read(rel.join("bin/ekka-backend")).unwrap(), program);
+        let release: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(rel.join("release.json")).unwrap()).unwrap();
+        assert_eq!(release["source"], "local-build");
+        let marker = std::fs::read(r.layout.records().join(local_build::MARKER)).unwrap();
+        assert_eq!(local_build::read_marker(Some(marker)).unwrap(), r.plan.local_build);
+        let image: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(r.layout.records().join(records::IMAGE)).unwrap()).unwrap();
+        assert_eq!(image, serde_json::json!({"image": "ekka-desk:local", "id": format!("sha256:{}", "c".repeat(64))}));
+        let mut check = Ctx::check();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut check).unwrap();
+        assert!(check.changes.is_empty(), "a second install changes nothing: {:?}", check.changes);
+        // Back to releases: the marker goes, and the image nobody pinned is taken out of use.
+        let mut release_plan = r.plan.clone();
+        release_plan.local_build = None;
+        release_plan.adapter_staged = None;
+        root_apply(&release_plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(!r.layout.records().join(local_build::MARKER).exists());
+        assert!(!r.layout.records().join(records::IMAGE).exists());
+    }
+
+    #[test]
+    fn status_says_local_build_loudly_for_each_replaced_part() {
+        let (r, _, _) = local_rig();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let s = crate::status::status_with(&r.layout, &r.pins, None, owners());
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["local_build"]["notice"], "LOCAL BUILD, NOT A SIGNED RELEASE (dev only)");
+        assert_eq!(v["local_build"]["source"], "local-build");
+        assert!(v["local_build"]["ekka_backend"]["sha256"].is_string() && v["local_build"]["desk_image"].is_object());
+        let lines = s.local_build.as_ref().unwrap().lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.starts_with("LOCAL BUILD, NOT A SIGNED RELEASE (dev only)")), "{lines:?}");
+        let release = s.checks.iter().find(|c| c.id == "release").unwrap();
+        assert!(
+            !release.reason.as_deref().unwrap_or("").contains("current is"),
+            "the local release is the one expected: {release:?}"
+        );
+        // A release install shows none.
+        let plain = rig();
+        root_apply(&plain.plan, &plain.layout, owners(), &plain.pins, &plain.roots, &mut Ctx::apply()).unwrap();
+        let v = serde_json::to_value(crate::status::status_with(&plain.layout, &plain.pins, None, owners())).unwrap();
+        assert!(v.get("local_build").is_none());
+    }
+
+    /// Root reads what the developer staged one folder at a time, never through a link anywhere on the way: a folder
+    /// on the path swapped for a link is refused, even when the program behind it is the pinned one.
+    #[test]
+    fn a_staged_program_reached_through_a_linked_folder_is_refused() {
+        let mut r = rig();
+        let real = r.layout.home.join("real-cache");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::copy(&r.plan.gateway_staged, real.join("openshell-gateway")).unwrap();
+        std::os::unix::fs::symlink(&real, r.layout.home.join("cache-link")).unwrap();
+        r.plan.gateway_staged = r.layout.home.join("cache-link/openshell-gateway");
+        let e = root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap_err();
+        assert!(e.reason.contains("is a link"), "{e}");
+        let bin = r.layout.release_dir(&r.pins.release_id()).join("bin/openshell-gateway");
+        assert!(!bin.exists(), "nothing was installed from behind the link");
+    }
+
+    /// Root decides the sign-in from the key it reads itself, under the install lock, never from what the plan says.
+    #[test]
+    fn the_sign_in_follows_the_key_root_reads_not_the_plan() {
+        let mut r = rig();
+        with_adapter(&mut r, "0.3.0");
+        registered(&mut r, owners());
+        r.pins.adapter_signin_from = Some("0.3.0".into());
+        let kid =
+            crate::adapter_key::ensure(&r.layout, owners(), false, None).unwrap().state.kid().unwrap().to_string();
+        r.plan.registration.as_mut().unwrap().adapter_kid = Some(kid.clone());
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(adapter_config(&r)["backend_gateway"]["signin"].is_object(), "the registered key is on disk");
+        // Another key on disk than the one Govern registered: taken out, whatever the plan says.
+        crate::adapter_key::ensure(&r.layout, owners(), true, None).unwrap();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(adapter_config(&r)["backend_gateway"]["signin"].is_null());
+        // A key root cannot use as it is (readable by others): no sign-in.
+        crate::adapter_key::ensure(&r.layout, owners(), true, None).unwrap();
+        let key = r.layout.backend_dir().join(crate::adapter_key::KEY_FILE);
+        let kid = crate::adapter_key::inspect(&r.layout, owners()).kid().unwrap().to_string();
+        r.plan.registration.as_mut().unwrap().adapter_kid = Some(kid);
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(adapter_config(&r)["backend_gateway"]["signin"].is_null());
+    }
+
+    /// The adapter opens its key one folder at a time from `/`, refusing a link: `/var` is one on a Mac, so the
+    /// path written is the real one.
+    #[test]
+    fn the_adapter_key_path_is_the_real_private_var_path() {
+        let l = Layout::system(501, PathBuf::from("/Users/dev"));
+        let mut r = rig();
+        with_adapter(&mut r, "0.3.0");
+        let b = registered(&mut r, owners());
+        let mut reg = r.plan.registration.clone().unwrap();
+        reg.adapter_kid = Some("oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U".into());
+        r.pins.adapter_signin_from = Some("0.3.0".into());
+        let s = crate::adapter::signin(&l, &b, Some(&reg), reg.adapter_kid.as_deref(), &r.pins).unwrap();
+        assert_eq!(s.key_path, "/private/var/db/ekka-dev/501/backend/adapter-key.pem");
+        let cfg = crate::adapter::config_bytes(
+            &l,
+            ORG,
+            r.plan.adapter.as_ref().unwrap(),
+            &identity::issuer("prod", ORG).unwrap(),
+            Some(&s),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cfg).unwrap();
+        assert_eq!(v["backend_gateway"]["signin"]["key_path"], "/private/var/db/ekka-dev/501/backend/adapter-key.pem");
+        assert!(!String::from_utf8(cfg).unwrap().contains("\"/var/"), "never through the /var link");
+        let issuer = identity::issuer("prod", ORG).unwrap();
+        let mut wrong = s.clone();
+        wrong.key_path = "/var/db/ekka-dev/501/backend/adapter-key.pem".into();
+        assert!(crate::adapter::config_bytes(&l, ORG, r.plan.adapter.as_ref().unwrap(), &issuer, Some(&wrong)).is_err());
+        let keycloak = "https://desks.example.com/realms/ekka-desks";
+        assert!(crate::adapter::config_bytes(&l, ORG, r.plan.adapter.as_ref().unwrap(), keycloak, Some(&s)).is_err());
     }
 
     #[test]

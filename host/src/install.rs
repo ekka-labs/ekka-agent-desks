@@ -4,9 +4,10 @@
 //! In order: run only from the root-owned copy of this program; refuse another organization, developer or
 //! environment before any change (one installation per Mac); check every download and image as the developer;
 //! work out what root must change, and ask for the password once only when something does; then, as the
-//! developer, write the LaunchAgents and start them in the login session (the gateway only after the Enclave's
-//! interceptor answers), start a fresh memory meter, and run the gateway's one-time setup when it can. Every
-//! other step reads first and changes only what differs. What cannot be done yet is named, with what it waits for.
+//! developer, make the adapter's signing key if there is none, write the LaunchAgents and start them in the login
+//! session (the gateway only after the Enclave's interceptor answers), start a fresh memory meter, and say whether
+//! the gateway's one-time setup (`gateway-setup`) is done. Every other step reads first and changes only what
+//! differs. What cannot be done yet is named, with what it waits for.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -14,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::adapter::{self, AdapterInputs};
+use crate::adapter_key;
 use crate::apply::{self, Ctx, Owners, RootPlan, PLAN_SCHEMA};
 use crate::binding::{Binding, Want};
-use crate::bootstrap::{self, Desired, GatewayAdmin, GovernExchangeNotYetAvailable, Pass, Stop};
 use crate::error::{failed, refused, usage, Result};
 use crate::fsx::Owner;
 use crate::identity::{self, Profile};
+use crate::local_build::{self, LocalBuild};
 use crate::meter;
 use crate::platform::macos::{self, Layout, ServiceInputs, LABEL_BACKEND, LABEL_ENCLAVE, LABEL_GATEWAY};
 use crate::records::Resources;
@@ -40,6 +42,10 @@ pub struct Args {
     pub memory_mib: Option<u64>,
     pub rotate_ca: bool,
     pub raise_ceiling: bool,
+    /// Replace the adapter's signing key, which is otherwise never replaced; the new one must be registered.
+    pub rotate_adapter_key: bool,
+    /// A folder holding `local-build.json`: a developer's own builds in place of releases, `--env dev` only.
+    pub local_build: Option<PathBuf>,
 }
 
 /// What an install did and what it still waits for.
@@ -63,35 +69,6 @@ fn wait_for(what: &str, limit: Duration, mut ready: impl FnMut() -> bool) -> boo
     }
     say(format!("{what}: not yet, after {} s", limit.as_secs()));
     false
-}
-
-/// The gateway calls for setup are made with Govern's setup pass, which this release cannot obtain; until then
-/// no call is ever made (the pass source stops first).
-struct GatewayNotCalled;
-
-fn no_pass<T>() -> std::result::Result<T, Stop> {
-    Err(Stop::Pending("no gateway call without a setup pass".into()))
-}
-
-impl GatewayAdmin for GatewayNotCalled {
-    fn workspace_exists(&mut self, _: &Pass, _: &str) -> std::result::Result<bool, Stop> {
-        no_pass()
-    }
-    fn create_workspace(&mut self, _: &Pass, _: &str) -> std::result::Result<(), Stop> {
-        no_pass()
-    }
-    fn members(&mut self, _: &Pass, _: &str) -> std::result::Result<Vec<bootstrap::Member>, Stop> {
-        no_pass()
-    }
-    fn add_member(&mut self, _: &Pass, _: &str, _: &bootstrap::Member) -> std::result::Result<(), Stop> {
-        no_pass()
-    }
-    fn profiles(&mut self, _: &Pass) -> std::result::Result<Vec<bootstrap::ProviderProfile>, Stop> {
-        no_pass()
-    }
-    fn import_profiles(&mut self, _: &Pass, _: &[bootstrap::ProviderProfile]) -> std::result::Result<(), Stop> {
-        no_pass()
-    }
 }
 
 /// The gateway's LaunchAgent, as `registration::finish` drives it.
@@ -195,6 +172,11 @@ pub fn desk_limits(
 
 pub fn run(args: &Args) -> Result<Outcome> {
     let mut out = Outcome::default();
+    // A local build is for dev only: refused for any other environment before anything else is read or changed.
+    let local = match &args.local_build {
+        Some(dir) => Some(LocalBuild::load(dir, &args.env)?),
+        None => None,
+    };
     // Before anything else: the program that will ask for the password is the root-owned copy, and nothing the
     // developer's processes can change.
     let exe = std::env::current_exe().map_err(|e| failed(format!("finding this program: {e}")))?;
@@ -241,17 +223,33 @@ pub fn run(args: &Args) -> Result<Outcome> {
             )));
         }
     }
-    let ekka = crate::ekka::verify(
-        &crate::ekka::find(args.ekka.as_deref())?,
-        &crate::ekka::PublicRelease,
-        &crate::sigstore::Trust::embedded()?,
-        &crate::sigstore::PublicRekor,
-    )?;
-    say(format!(
-        "the Enclave runs {}: EKKA's signed ekka {} release, byte for byte",
-        ekka.path.display(),
-        ekka.version
-    ));
+    for line in local.iter().flat_map(LocalBuild::lines) {
+        println!("   {line}");
+    }
+    let ekka = match local.as_ref().and_then(|lb| lb.ekka.as_ref()) {
+        Some(p) => {
+            if args.ekka.as_deref().is_some_and(|e| e != Path::new(&p.path)) {
+                return Err(refused("--ekka and the local build name different ekka programs; nothing was changed"));
+            }
+            let v = crate::ekka::verify_local(Path::new(&p.path), &p.sha256)?;
+            say(format!("the Enclave runs {}: ekka {}, {}", v.path.display(), v.version, local_build::LOUD));
+            v
+        }
+        None => {
+            let v = crate::ekka::verify(
+                &crate::ekka::find(args.ekka.as_deref())?,
+                &crate::ekka::PublicRelease,
+                &crate::sigstore::Trust::embedded()?,
+                &crate::sigstore::PublicRekor,
+            )?;
+            say(format!(
+                "the Enclave runs {}: EKKA's signed ekka {} release, byte for byte",
+                v.path.display(),
+                v.version
+            ));
+            v
+        }
+    };
     let ekka = ekka.path;
     say(format!("the gateway trusts sign-in from {} only", identity::issuer(&want.env, &want.org)?));
 
@@ -274,11 +272,21 @@ pub fn run(args: &Args) -> Result<Outcome> {
     say(no_desk_limits(Some((info.cpus, info.memory_bytes >> 20))));
 
     println!("== verified downloads");
-    let pins = Pins::embedded()?;
-    let staging = l.staging(&pins.release_id());
+    let pins = Pins::embedded()?.with_local(local.as_ref());
+    // Downloads are staged by the release's own pins: a local adapter rebuild never downloads the gateway again.
+    let staging = l.staging(&Pins::embedded()?.release_id());
     let gateway_staged = release::stage(&pins.gateway, &staging)?;
     say(format!("NVIDIA OpenShell gateway {}: archive and program match their pins", pins.openshell_version));
     let adapter_staged = match &pins.adapter {
+        // A local adapter is checked here, read as root will read it, before anything changes; root hashes it again.
+        Some(pin) if pins.adapter_local => {
+            let path = PathBuf::from(&local.as_ref().and_then(|lb| lb.ekka_backend.as_ref()).expect("local").path);
+            let fd = crate::fsx::open_owned_path(&path, user.uid)?;
+            release::verify_binary(pin, &crate::fsx::read_regular(fd, &pin.binary, 256 * 1024 * 1024)?)
+                .map_err(|e| refused(format!("the local adapter {}: {}", path.display(), e.reason)))?;
+            say(format!("the backend adapter {}: {}", path.display(), local_build::LOUD));
+            Some(path)
+        }
         Some(pin) => {
             let p = release::stage(pin, &staging)?;
             say("EKKA backend adapter: archive and program match their pins");
@@ -294,8 +302,21 @@ pub fn run(args: &Args) -> Result<Outcome> {
     docker.verify_image(&pins.supervisor)?;
     docker.verify_image(&pins.sandbox)?;
     say("the supervisor and sandbox runtime hold their pinned programs");
-    match &pins.desk_image {
-        Some(pin) => {
+    match (local.as_ref().and_then(|lb| lb.desk_image.as_ref()), &pins.desk_image) {
+        (Some(want), _) => {
+            let img = docker
+                .image(local_build::LOCAL_IMAGE)?
+                .ok_or_else(|| refused(format!("Docker has no {}; build it first", local_build::LOCAL_IMAGE)))?;
+            if img["Id"].as_str() != Some(want.image_id.as_str()) {
+                return Err(refused(format!(
+                    "{} is not the local build's desk image {}; nothing was changed",
+                    local_build::LOCAL_IMAGE,
+                    want.image_id
+                )));
+            }
+            say(format!("the desk image {} ({}): {}", local_build::LOCAL_IMAGE, want.image_id, local_build::LOUD));
+        }
+        (None, Some(pin)) => {
             docker.pull(&pin.image)?;
             let img = docker.image(&pin.image)?.ok_or_else(|| failed(format!("Docker does not have {}", pin.image)))?;
             if img["Id"].as_str() != Some(pin.image_id.as_str()) {
@@ -303,7 +324,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
             }
             say(format!("the desk image {} is the pinned one", pin.image));
         }
-        None => out.pending.push(
+        (None, None) => out.pending.push(
             "desks: no published desk image is pinned for a Mac yet, so no desk-image record is written and desks \
              wait (closed). An image built on this Mac is never recorded"
                 .into(),
@@ -331,6 +352,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
     };
 
     println!("== what root owns");
+    let owners = Owners { root: Owner { uid: 0, gid: 0 }, dev: Owner { uid: user.uid, gid: user.gid } };
     let plan = RootPlan {
         schema: PLAN_SCHEMA.into(),
         want: want.clone(),
@@ -341,10 +363,11 @@ pub fn run(args: &Args) -> Result<Outcome> {
         adapter: adapter_inputs,
         rotate_ca: args.rotate_ca,
         raise_ceiling: args.raise_ceiling,
+        rotate_adapter_key: args.rotate_adapter_key,
+        local_build: local.clone(),
     };
     let roots = std::fs::read(crate::net::system_roots_path())
         .map_err(|e| failed(format!("reading the system's public roots: {e}")))?;
-    let owners = Owners { root: Owner { uid: 0, gid: 0 }, dev: Owner { uid: user.uid, gid: user.gid } };
     let mut check = Ctx::check();
     apply::root_apply(&plan, &l, owners, &pins, &roots, &mut check)?;
     if check.changes.is_empty() {
@@ -378,6 +401,24 @@ pub fn run(args: &Args) -> Result<Outcome> {
             false
         }
     };
+
+    println!("== the adapter's signing key");
+    let registered_kid = registration.as_ref().filter(|_| registered).and_then(|r| r.adapter_kid.as_deref());
+    let key = adapter_key::ensure(&l, owners, args.rotate_adapter_key, registered_kid)?;
+    out.changes.extend(key.changed.clone());
+    out.pending.extend(key.problem.clone());
+    if let Some(kid) = key.state.kid() {
+        say(format!(
+            "kid {kid}: its public half is in status --json (adapter_public_jwk), for registering the gateway"
+        ));
+    }
+    if plan.adapter.is_some() && key.problem.is_none() {
+        if let Err(why) = adapter::signin(&l, &binding, registration.as_ref(), key.state.kid(), &pins) {
+            out.pending.push(format!("the adapter's desk-pass sign-in is not written: {why}"));
+        }
+    }
+    // The adapter reads its configuration once, when it starts.
+    let adapter_config_changed = out.changes.iter().any(|c| c.contains(&l.adapter_config().display().to_string()));
 
     println!("== the services, in your login session");
     let public = std::fs::read_to_string(l.jwt_dir().join(macos::JWT_PUBLIC))
@@ -492,7 +533,8 @@ pub fn run(args: &Args) -> Result<Outcome> {
             if wait_for("the gateway", Duration::from_secs(60), || tls::probe(addr, tls::GATEWAY_DNS, &ca).is_ok()) {
                 say("the gateway answers with verified TLS on 127.0.0.1");
                 if plan.adapter.is_some() {
-                    macos::bootstrap(user.uid, LABEL_BACKEND, &l.plist(LABEL_BACKEND), changed[LABEL_BACKEND])?;
+                    let again = changed[LABEL_BACKEND] || adapter_config_changed;
+                    macos::bootstrap(user.uid, LABEL_BACKEND, &l.plist(LABEL_BACKEND), again)?;
                 }
             } else {
                 out.pending.push(format!("the gateway did not answer; see {}", l.logs().join("gateway.log").display()));
@@ -505,28 +547,12 @@ pub fn run(args: &Args) -> Result<Outcome> {
     say(format!("a fresh {} runs on your Docker Desktop", meter::NAME));
 
     println!("== the gateway's one-time setup");
-    match (registration.as_ref().filter(|_| registered).map(|r| &r.gateway_id), &enclave) {
-        (Some(gateway_id), Some(e)) => {
-            let want = Desired::for_subjects(
-                &format!("enclave/{}", e.node_id),
-                &format!("adapter/{}", binding.installation_id),
-            )
-            .map_err(|s| failed(format!("{s:?}")))?;
-            match bootstrap::reconcile(
-                &mut GovernExchangeNotYetAvailable,
-                &mut GatewayNotCalled,
-                gateway_id,
-                &want,
-                &std::time::SystemTime::now,
-            ) {
-                Ok(r) if r.ready => out.changes.extend(r.changed),
-                Ok(r) => out.pending.extend(r.problems),
-                Err(Stop::Pending(why)) => out.pending.push(why),
-                Err(Stop::Expired) => out.pending.push("the setup pass expired; run install again to resume".into()),
-                Err(Stop::Failed(why)) => return Err(failed(format!("the gateway's setup: {why}"))),
-            }
-        }
-        _ => out.pending.push("the gateway's setup: it needs the registered gateway and the enrolled Enclave".into()),
+    match crate::gateway_setup::check(&l, owners) {
+        Ok(()) => say("done: the gateway read back the desks workspace, its two members and every profile"),
+        Err(why) => out.pending.push(format!(
+            "the gateway's one-time setup: {why}. ekka desk setup --local opens a one-time authorization at Govern \
+             and passes it to ekka-desk-host gateway-setup on stdin"
+        )),
     }
     Ok(out)
 }

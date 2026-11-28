@@ -28,9 +28,29 @@ tar = { version = "0.4.46", default-features = false }
 time = "0.3.47"
 toml = "0.8.23"
 zeroize = "1.8.1"
+# The gateway's admin API (OpenShell v0.1.9 is gRPC only), for the one-time setup: the same crates, at the same
+# versions, as EKKA's backend adapter's gateway client. One TLS stack (rustls with ring), the installation's CA only.
+prost = "=0.14.4"
+prost-reflect = { version = "=0.16.5", features = ["serde"] }
+prost-types = "=0.14.4"
+tokio = { version = "=1.53.3", default-features = false, features = ["rt", "net", "time"] }
+tonic = { version = "=0.14.6", default-features = false, features = ["codegen", "channel", "tls-ring"] }
+tonic-prost = "=0.14.6"
+
+[build-dependencies]
+# OpenShell's types from its vendored .proto files (vendor/openshell), compiled by protox: no protoc, and none of
+# OpenShell's Rust code.
+prost = "=0.14.4"
+protox = "=0.9.1"
+tonic-prost-build = "=0.14.6"
 
 [dev-dependencies]
+# Tests only: the vendored contract schemas' `pattern` rules (src/schema_check.rs). Never in the program.
+regex-lite = "0.1.9"
 tempfile = "3.25.0"
+# Tests only: a fake OpenShell gateway over TLS for the gateway client (src/gateway_grpc.rs). Never in the program.
+tonic = { version = "=0.14.6", default-features = false, features = ["codegen", "channel", "tls-ring", "server", "router"] }
+tokio = { version = "=1.53.3", default-features = false, features = ["rt", "net", "time", "sync"] }
 
 [profile.release]
 codegen-units = 1

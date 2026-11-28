@@ -47,8 +47,8 @@ def facts_accept(contract, answer):
 class TheVendoredContract(unittest.TestCase):
     def test_is_the_published_files_byte_for_byte(self):
         manifest = vendored("MANIFEST.json")
-        self.assertEqual(manifest["version"], "0.83.0")
-        self.assertEqual(manifest["tag"], "v0.83.0")
+        self.assertEqual(manifest["version"], "0.89.0")
+        self.assertEqual(manifest["tag"], "v0.89.0")
         for path, digest in manifest["files"].items():
             with open(os.path.join(VENDOR, path), "rb") as f:
                 self.assertEqual(hashlib.sha256(f.read()).hexdigest(), digest, path)

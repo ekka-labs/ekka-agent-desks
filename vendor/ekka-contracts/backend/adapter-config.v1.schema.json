@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://schemas.ekka.ai/backend/adapter-config.v1.schema.json",
   "title": "BackendAdapterConfig",
-  "description": "The backend adapter's one configuration file, read once at start from `--config` (the kit installs it at `/etc/ekka-backend/config.json`, read-only to the adapter). It names who the adapter serves and which keys and gateway it trusts. It holds NO credential of any kind: the gateway credential stays in the Enclave's vault and arrives with each call through the API gate. Unknown fields are refused, at every level.",
+  "description": "The backend adapter's one configuration file, read once at start from `--config` (the kit installs it at `/etc/ekka-backend/config.json`, read-only to the adapter). It names who the adapter serves and which keys and gateway it trusts. It holds NO credential of any kind: under `client_credentials.v1` the gateway credential stays in the Enclave's vault and arrives with each call through the API gate; under `ekka_desk_pass.v1` there is no gateway credential at all, and the file names only where the installation's signing key is (`backend_gateway.signin.key_path`), never the key. Unknown fields are refused, at every level.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -72,7 +72,7 @@
         },
         "client_id": {
           "const": "ekka-desk-admin",
-          "description": "The adapter's sign-in client at the gateway's issuer. Its secret is never here."
+          "description": "The adapter's sign-in client at the gateway's issuer under `client_credentials.v1`. Its secret is never here. Under `ekka_desk_pass.v1` it is sent nowhere: the adapter is `adapter/<installation_id>` at Govern."
         },
         "issuer": {
           "type": "string",
@@ -81,7 +81,7 @@
           "not": {
             "pattern": "/\\.\\.?(/|$)"
           },
-          "description": "The sign-in service that issues the gateway's tokens, exactly as the gateway checks a token's `iss` (a kit install: `https://<public name>/realms/ekka-desks`). https, no user, query, fragment or trailing slash. The adapter reads its discovery document and refuses to start unless the document names this issuer exactly and its token endpoint is on the same origin, so the client credential is never sent anywhere else. Pinned by the kit at install, never learned from the gateway."
+          "description": "The sign-in service that issues the gateway's tokens, exactly as the gateway checks a token's `iss`. https, no user, query, fragment or trailing slash. Pinned by the kit at install, never learned from the gateway. Under `client_credentials.v1` (a kit install: `https://<public name>/realms/ekka-desks`) the adapter reads its discovery document and refuses to start unless the document names this issuer exactly and its token endpoint is on the same origin, so the client credential is never sent anywhere else. Under `ekka_desk_pass.v1` it is Govern's issuer for this organization, `https://<Govern host>/oidc/orgs/<organization_id>` (the adapter refuses another organization's), and each exchange goes to `issuer` + `/token`; no discovery document is read."
         },
         "workspace": {
           "type": "string",
@@ -91,6 +91,77 @@
         "ca_pem_path": {
           "$ref": "#/$defs/absolute_path",
           "description": "A CA bundle to trust for the gateway, when it is not publicly trusted (a kit install's own CA)."
+        },
+        "signin": {
+          "description": "How the adapter signs in to the gateway: ONE mode, named here, never guessed. Absent, it is `client_credentials.v1`, so every file written before this field keeps its meaning. `client_credentials.v1`: the API gate adds the gateway's client credential to each call, and the adapter exchanges it at `issuer` for the gateway's token. `ekka_desk_pass.v1`: for each operation the adapter has admitted, it exchanges that operation's own Gate Token at Govern's token endpoint (RFC 8693 token exchange) for a short-lived pass, proving it is this installation's adapter with an RFC 7523 ES256 assertion signed by the key at `key_path`. The call's `Authorization` is then neither required nor read. A refused or failed exchange is the call's answer: the adapter never falls back to another mode.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "client_credentials.v1",
+                  "description": "The client credential the API gate adds to each call, at the sign-in service `issuer` names."
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "installation_id",
+                "gateway_id",
+                "key_path"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "ekka_desk_pass.v1",
+                  "description": "A pass from Govern for each admitted operation's own Gate Token. `issuer` must then be Govern's issuer for this organization."
+                },
+                "installation_id": {
+                  "$ref": "#/$defs/uuid",
+                  "description": "The id the host generated for this installation and registered with the gateway: the adapter signs in to Govern as `adapter/<installation_id>`."
+                },
+                "gateway_id": {
+                  "type": "string",
+                  "pattern": "^urn:ekka:desk-gateway:(production|development):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                  "description": "The gateway's id as Govern answered its registration (`gateway.gateway_id`): each exchange's `audience`, and the one gateway each assertion is good at."
+                },
+                "key_path": {
+                  "$ref": "#/$defs/absolute_path",
+                  "description": "Where this installation's signing key is: an ES256 (P-256) private key in unencrypted PKCS#8 PEM (`BEGIN PRIVATE KEY`, carrying its public key), whose public half was registered as `adapter_public_jwk`. A regular file, not a symlink, owned by the adapter's user and closed to group and others (mode 0600 or 0400); the adapter refuses to start otherwise. Only the path is here, never the key."
+                }
+              }
+            }
+          ]
+        }
+      },
+      "if": {
+        "required": [
+          "signin"
+        ],
+        "properties": {
+          "signin": {
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "const": "ekka_desk_pass.v1"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "issuer": {
+            "pattern": "^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/oidc/orgs/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
         }
       }
     },
