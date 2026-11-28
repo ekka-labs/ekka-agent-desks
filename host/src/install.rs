@@ -23,7 +23,7 @@ use crate::identity::{self, Profile};
 use crate::meter;
 use crate::platform::macos::{self, Layout, ServiceInputs, LABEL_BACKEND, LABEL_ENCLAVE, LABEL_GATEWAY};
 use crate::records::Resources;
-use crate::registration::{gateway_action, GatewayAction, Registration};
+use crate::registration::{finish, gateway_action, GatewayAction, Launchd, Registration, RestartPending};
 use crate::release::{self, Pins};
 use crate::runtime::docker::Docker;
 use crate::tls;
@@ -94,24 +94,78 @@ impl GatewayAdmin for GatewayNotCalled {
     }
 }
 
-/// A digest of everything the gateway trusts, as anyone may read it: its configuration, its registration record,
-/// its certificate, the CA and its token key. A change means a running gateway must restart to use it.
-fn trust_digest(l: &Layout) -> String {
-    let files = [
-        l.gateway_toml(),
-        l.d().join(crate::registration::RECORD),
-        l.tls_dir().join(macos::LEAF_CERT),
-        l.tls_dir().join(macos::CA_CERT),
-        l.jwt_dir().join(macos::JWT_PUBLIC),
-    ];
-    let mut all = Vec::new();
-    for f in files {
-        all.extend_from_slice(f.display().to_string().as_bytes());
-        all.push(0);
-        all.extend(std::fs::read(&f).unwrap_or_default());
-        all.push(0);
+/// The gateway's LaunchAgent, as `registration::finish` drives it.
+struct GatewayLaunchd {
+    uid: u32,
+    plist: PathBuf,
+}
+
+impl Launchd for GatewayLaunchd {
+    fn state(&self) -> macos::ServiceState {
+        macos::service_state(self.uid, LABEL_GATEWAY)
     }
-    crate::util::sha256_hex(&all)
+    fn restart(&self) -> Result<()> {
+        macos::kickstart(self.uid, LABEL_GATEWAY)
+    }
+    fn start(&self) -> Result<()> {
+        macos::bootstrap(self.uid, LABEL_GATEWAY, &self.plist, false)
+    }
+    fn stop(&self) -> Result<()> {
+        macos::bootout(self.uid, LABEL_GATEWAY)
+    }
+}
+
+/// Removes the restart marker once launchd confirmed what it asked for.
+fn clear_pending(marker: &Path, pending: &mut Option<RestartPending>) -> Result<()> {
+    match std::fs::remove_file(marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(failed(format!("removing {}: {e}", marker.display()))),
+    }
+    *pending = None;
+    Ok(())
+}
+
+/// What status, doctor and install say about desk limits on a developer's Mac.
+pub fn no_desk_limits(vm: Option<(u64, u64)>) -> String {
+    let size = match vm {
+        Some((cpus, mib)) => format!("{cpus} CPUs, {mib} MiB"),
+        None => "unknown while Docker Desktop is not answering".to_string(),
+    };
+    format!(
+        "desks on this Mac have no CPU or memory limit of their own; Docker Desktop's VM size ({size}) bounds them; the \
+         room check still holds jobs when the VM is short of memory"
+    )
+}
+
+/// The per-desk CPU and memory ceiling for `profile`. The developer-native profile has none in this release: the
+/// adapter and the runner cannot apply one on a Mac yet (no cgroup files to read limits back from), so a limit would
+/// only make every desk refuse. Asking for one there is refused, saying so; a later release adds it.
+pub fn desk_limits(
+    profile: &str,
+    cpu_millicores: Option<u64>,
+    memory_mib: Option<u64>,
+    info: &crate::runtime::docker::Info,
+) -> Result<Option<Resources>> {
+    if profile == crate::binding::PROFILE {
+        if cpu_millicores.is_some() || memory_mib.is_some() {
+            return Err(usage(format!(
+                "{}. --desk-cpu-millicores and --desk-memory-mib are not taken on a developer's Mac; a later release \
+                 gives a desk on a Mac its own CPU and memory limit",
+                no_desk_limits(Some((info.cpus, info.memory_bytes >> 20)))
+            )));
+        }
+        return Ok(None);
+    }
+    match (cpu_millicores, memory_mib) {
+        (None, None) => Resources::half_of(info.cpus, info.memory_bytes).map(Some),
+        (Some(c), Some(m)) => {
+            let r = Resources { max_cpu_millicores: c, max_memory_mib: m };
+            r.fits(info.cpus, info.memory_bytes)?;
+            Ok(Some(r))
+        }
+        _ => Err(usage("give both --desk-cpu-millicores and --desk-memory-mib, or neither")),
+    }
 }
 
 pub fn run(args: &Args) -> Result<Outcome> {
@@ -190,31 +244,9 @@ pub fn run(args: &Args) -> Result<Outcome> {
         info.cpus,
         info.memory_bytes >> 20
     ));
-    // The ceiling already recorded, if any: a default never raises it (only --raise-ceiling with values does).
-    let recorded: Option<crate::records::Ceiling> =
-        std::fs::read(l.records().join(crate::records::CEILING)).ok().and_then(|b| serde_json::from_slice(&b).ok());
-    let resources = match (args.cpu_millicores, args.memory_mib) {
-        (None, None) => {
-            let half = Resources::half_of(info.cpus, info.memory_bytes)?;
-            match &recorded {
-                Some(c) => Resources {
-                    max_cpu_millicores: half.max_cpu_millicores.min(c.resources.max_cpu_millicores),
-                    max_memory_mib: half.max_memory_mib.min(c.resources.max_memory_mib),
-                },
-                None => half,
-            }
-        }
-        (Some(c), Some(m)) => {
-            let r = Resources { max_cpu_millicores: c, max_memory_mib: m };
-            r.fits(info.cpus, info.memory_bytes)?;
-            r
-        }
-        _ => return Err(usage("give both --desk-cpu-millicores and --desk-memory-mib, or neither")),
-    };
-    say(format!(
-        "one desk may have at most {} millicores and {} MiB",
-        resources.max_cpu_millicores, resources.max_memory_mib
-    ));
+    // A developer's Mac sets no CPU or memory limit for a desk in this release (`desk_limits`).
+    let resources = desk_limits(&want.profile, args.cpu_millicores, args.memory_mib, &info)?;
+    say(no_desk_limits(Some((info.cpus, info.memory_bytes >> 20))));
 
     println!("== verified downloads");
     let pins = Pins::embedded()?;
@@ -263,7 +295,15 @@ pub fn run(args: &Args) -> Result<Outcome> {
         }
         _ => None,
     };
-    let registration = profile.registration.as_ref().map(Registration::from_answer).transpose()?;
+    // A registration that is not well-formed is no registration: the gateway is stopped and its trust removed.
+    let registration = match profile.registration.as_ref().map(Registration::from_answer) {
+        Some(Ok(r)) => Some(r),
+        Some(Err(e)) => {
+            out.pending.push(format!("the gateway: {}; it is stopped and its configuration removed", e.reason));
+            None
+        }
+        None => None,
+    };
 
     println!("== what root owns");
     let plan = RootPlan {
@@ -280,7 +320,6 @@ pub fn run(args: &Args) -> Result<Outcome> {
     let roots = std::fs::read(crate::net::system_roots_path())
         .map_err(|e| failed(format!("reading the system's public roots: {e}")))?;
     let owners = Owners { root: Owner { uid: 0, gid: 0 }, dev: Owner { uid: user.uid, gid: user.gid } };
-    let trust_before = trust_digest(&l);
     let mut check = Ctx::check();
     apply::root_apply(&plan, &l, owners, &pins, &roots, &mut check)?;
     if check.changes.is_empty() {
@@ -298,7 +337,6 @@ pub fn run(args: &Args) -> Result<Outcome> {
         }
     }
     let binding = Binding::read(&l.binding())?.ok_or_else(|| failed("the root step left no binding"))?;
-    let trust_changed = trust_digest(&l) != trust_before;
     // The same check root made: only this installation's registration makes a gateway.
     let registered = match registration.as_ref().map(|r| r.verify(&binding)) {
         Some(Ok(_)) => true,
@@ -328,14 +366,24 @@ pub fn run(args: &Args) -> Result<Outcome> {
         gateway_key_b64: &key_b64,
         installation_id: &binding.installation_id,
     };
+    // A restart (or stop) the root step asked for, now or in an earlier install that did not finish it.
+    let marker = l.run_dir().join(crate::registration::RESTART_PENDING);
+    let mut pending: Option<RestartPending> = std::fs::read(&marker).ok().and_then(|b| serde_json::from_slice(&b).ok());
     let mut agents = vec![macos::enclave_agent(&l, &inputs)];
     if registered {
         agents.push(macos::gateway_agent(&l));
     } else {
         // Not registered, or not this installation's: never leave a gateway running on an old configuration.
-        if macos::service_state(user.uid, LABEL_GATEWAY).loaded {
-            macos::bootout(user.uid, LABEL_GATEWAY)?;
-            out.changes.push("stopped the gateway: it has no registration for this installation".into());
+        let launchd = GatewayLaunchd { uid: user.uid, plist: l.plist(LABEL_GATEWAY) };
+        let stop = RestartPending::new(true, String::new());
+        if macos::service_state(user.uid, LABEL_GATEWAY).loaded || pending.is_some() {
+            if finish(&launchd, &stop, Duration::from_secs(30))? {
+                out.changes.push("stopped the gateway: it has no registration for this installation".into());
+                clear_pending(&marker, &mut pending)?;
+            } else {
+                out.pending
+                    .push("the gateway: launchd did not confirm it stopped; install finishes it next time".into());
+            }
         }
         if std::fs::symlink_metadata(l.plist(LABEL_GATEWAY)).is_ok() {
             std::fs::remove_file(l.plist(LABEL_GATEWAY))
@@ -378,15 +426,30 @@ pub fn run(args: &Args) -> Result<Outcome> {
         } else if registered {
             say("the Enclave's interceptor answers");
             let loaded = macos::service_state(user.uid, LABEL_GATEWAY).loaded;
-            match gateway_action(true, loaded, changed[LABEL_GATEWAY], trust_changed) {
+            match gateway_action(true, loaded, changed[LABEL_GATEWAY], pending.is_some()) {
                 GatewayAction::Start => {
-                    macos::bootstrap(user.uid, LABEL_GATEWAY, &l.plist(LABEL_GATEWAY), changed[LABEL_GATEWAY])?
+                    macos::bootstrap(user.uid, LABEL_GATEWAY, &l.plist(LABEL_GATEWAY), changed[LABEL_GATEWAY])?;
+                    if pending.is_some()
+                        && wait_for("the gateway", Duration::from_secs(30), || {
+                            macos::service_state(user.uid, LABEL_GATEWAY).running
+                        })
+                    {
+                        clear_pending(&marker, &mut pending)?;
+                    }
                 }
                 GatewayAction::Reload => {
-                    macos::kickstart(user.uid, LABEL_GATEWAY)?;
-                    out.changes.push("restarted the gateway on its new trust configuration".into());
+                    let launchd = GatewayLaunchd { uid: user.uid, plist: l.plist(LABEL_GATEWAY) };
+                    let restart = pending.clone().expect("a reload is for a pending restart");
+                    if finish(&launchd, &restart, Duration::from_secs(30))? {
+                        out.changes.push("restarted the gateway on its new trust configuration".into());
+                        clear_pending(&marker, &mut pending)?;
+                    }
                 }
                 GatewayAction::Unload | GatewayAction::Keep => {}
+            }
+            if pending.is_some() {
+                out.pending
+                    .push("the gateway: launchd did not confirm its restart; install finishes it next time".into());
             }
             let ca = std::fs::read(l.tls_dir().join(macos::CA_CERT)).unwrap_or_default();
             let addr = std::net::SocketAddr::from((tls::GATEWAY_IP, macos::GATEWAY_PORT));
@@ -430,4 +493,30 @@ pub fn run(args: &Args) -> Result<Outcome> {
         _ => out.pending.push("the gateway's setup: it needs the registered gateway and the enrolled Enclave".into()),
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vm() -> crate::runtime::docker::Info {
+        crate::runtime::docker::Info {
+            os_type: "linux".into(),
+            arch: "aarch64".into(),
+            cpus: 8,
+            memory_bytes: 16 << 30,
+            server_version: "29".into(),
+            operating_system: "Docker Desktop".into(),
+        }
+    }
+
+    #[test]
+    fn a_developer_mac_gets_no_desk_limit_and_asking_for_one_is_refused_plainly() {
+        assert_eq!(desk_limits(crate::binding::PROFILE, None, None, &vm()).unwrap(), None);
+        let e = desk_limits(crate::binding::PROFILE, Some(2000), Some(4096), &vm()).unwrap_err();
+        assert!(e.reason.contains("desks on this Mac have no CPU or memory limit of their own"), "{e}");
+        assert!(e.reason.contains("(8 CPUs, 16384 MiB)") && e.reason.contains("a later release"), "{e}");
+        // The same shape stays for a profile that sets one.
+        assert!(desk_limits("server", None, None, &vm()).unwrap().is_some());
+    }
 }

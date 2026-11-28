@@ -416,13 +416,22 @@ pub const HOST_BINARY: &str = "/usr/local/libexec/ekka-desk-host/ekka-desk-host"
 /// bytes, atomically. Nothing the developer can write is hashed, run or installed by root.
 pub fn bootstrap_command(version: &str) -> String {
     format!(
-        "sudo /bin/sh -euc '\n\
+        "/usr/bin/sudo /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/root /bin/sh -euc '\n\
          v={version}\n\
+         L=/usr/local/libexec/ekka-desk-host\n\
+         for p in /usr /usr/local /usr/local/libexec \"$L\"; do\n\
+         \x20 [ -e \"$p\" ] || /bin/mkdir -m 0755 \"$p\"\n\
+         \x20 if [ -L \"$p\" ] || [ ! -d \"$p\" ]; then echo \"$p is a link or not a folder; make it a real folder\" >&2; exit 1; fi\n\
+         \x20 m=$(/usr/bin/stat -f %Lp \"$p\")\n\
+         \x20 if [ \"$(/usr/bin/stat -f %u \"$p\")\" != 0 ] || [ $((0$m & 022)) != 0 ]; then\n\
+         \x20   echo \"$p must be root-owned and writable only by root: /usr/sbin/chown root:wheel $p; /bin/chmod go-w $p\" >&2; exit 1; fi\n\
+         \x20 if [ \"$(/bin/ls -led \"$p\" | /usr/bin/wc -l)\" -ne 1 ]; then echo \"$p has an access control list; remove it: /bin/chmod -N $p\" >&2; exit 1; fi\n\
+         done\n\
          d=$(/usr/bin/mktemp -d /private/tmp/ekka-desk-host.XXXXXXXX); cd \"$d\"\n\
          r=https://github.com/ekka-labs/ekka-agent-desks/releases/download/host-v$v\n\
          f=ekka-desk-host-$v-aarch64-apple-darwin.tar.gz\n\
-         for x in \"$f\" \"$f.sha256\" \"$f.sig\" \"$f.crt\"; do /usr/bin/curl -fsSLo \"$x\" \"$r/$x\"; done\n\
-         /usr/bin/curl -fsSLo cosign https://github.com/sigstore/cosign/releases/download/{COSIGN_VERSION}/cosign-darwin-arm64\n\
+         for x in \"$f\" \"$f.sha256\" \"$f.sig\" \"$f.crt\"; do /usr/bin/curl -q --proto =https -fsSLo \"$x\" \"$r/$x\"; done\n\
+         /usr/bin/curl -q --proto =https -fsSLo cosign https://github.com/sigstore/cosign/releases/download/{COSIGN_VERSION}/cosign-darwin-arm64\n\
          echo \"{COSIGN_SHA256}  cosign\" | /usr/bin/shasum -a 256 -c -\n\
          /bin/chmod 0700 cosign\n\
          /usr/bin/shasum -a 256 -c \"$f.sha256\"\n\
@@ -430,9 +439,8 @@ pub fn bootstrap_command(version: &str) -> String {
          \x20 --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\n\
          \x20 --certificate-identity \"{HOST_SIGNER}$v\" \"$f\"\n\
          /usr/bin/tar -xzf \"$f\" ekka-desk-host\n\
-         /usr/bin/install -d -o root -g wheel -m 0755 /usr/local/libexec/ekka-desk-host\n\
-         /usr/bin/install -o root -g wheel -m 0755 ekka-desk-host /usr/local/libexec/ekka-desk-host/.ekka-desk-host.new\n\
-         /bin/mv -f /usr/local/libexec/ekka-desk-host/.ekka-desk-host.new {HOST_BINARY}\n\
+         /usr/bin/install -o root -g wheel -m 0755 ekka-desk-host \"$L/.ekka-desk-host.new\"\n\
+         /bin/mv -f \"$L/.ekka-desk-host.new\" {HOST_BINARY}\n\
          cd /; /bin/rm -rf \"$d\"'"
     )
 }
@@ -542,32 +550,66 @@ mod tests {
     #[test]
     fn the_placement_command_verifies_and_installs_only_bytes_root_fetched_into_its_own_folder() {
         let c = bootstrap_command("1.2.3");
-        // Root makes the folder (mktemp -d: root's, 0700) and everything is fetched into it as root.
-        assert!(c.starts_with("sudo /bin/sh -euc '") && c.contains("/usr/bin/mktemp -d /private/tmp/"), "{c}");
+        // sudo by its full path, and root starts from a clean environment: nothing of the developer's (HOME,
+        // .curlrc, PATH) reaches it.
+        assert!(c.starts_with("/usr/bin/sudo /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/root /bin/sh -euc '"), "{c}");
+        assert!(c.contains("/usr/bin/mktemp -d /private/tmp/"), "{c}");
         assert!(!c.contains("<downloaded"), "never a developer's file by name: {c}");
-        // cosign is pinned by sha256 before it runs; the archive by its sha256 file and its signature, by exactly
-        // this kit's release workflow for exactly this tag; the program comes out of those very bytes.
+        // Every download ignores any curl configuration and speaks https only.
+        let curls = c.matches("/usr/bin/curl").count();
+        assert_eq!(c.matches("/usr/bin/curl -q --proto =https ").count(), curls, "{c}");
         let pos = |needle: &str| c.find(needle).unwrap_or_else(|| panic!("{needle} missing in {c}"));
+        // Every folder above the program is checked as root before anything is written there: real, root's,
+        // writable only by root, no ACL.
+        for check in ["[ -L \"$p\" ]", "/usr/bin/stat -f %u \"$p\"", "$((0$m & 022))", "/bin/ls -led \"$p\""] {
+            assert!(pos(check) < pos("/usr/bin/install"), "{check}");
+        }
+        assert!(c.contains("for p in /usr /usr/local /usr/local/libexec \"$L\"; do"));
+        // cosign pinned by sha256 before it runs; the archive by its sha256 file and its signature by exactly this
+        // kit's release workflow for exactly this tag; the program out of those very bytes, installed atomically.
         assert!(pos(COSIGN_SHA256) < pos("./cosign verify-blob"));
         assert!(pos("shasum -a 256 -c \"$f.sha256\"") < pos("/usr/bin/tar -xzf"));
         assert!(pos("./cosign verify-blob") < pos("/usr/bin/tar -xzf"));
         assert!(c.contains(&format!("--certificate-identity \"{HOST_SIGNER}$v\"")) && c.contains("v=1.2.3"));
-        // Atomic: installed beside, then renamed over the program.
         assert!(
-            pos(".ekka-desk-host.new")
-                < pos(&format!("/bin/mv -f /usr/local/libexec/ekka-desk-host/.ekka-desk-host.new {HOST_BINARY}"))
+            pos("$L/.ekka-desk-host.new\"\n") < pos(&format!("/bin/mv -f \"$L/.ekka-desk-host.new\" {HOST_BINARY}"))
         );
-        // Only the system's own programs run as root, and the cosign root fetched and checked itself.
-        for line in c.lines().skip(1) {
-            let first = line.split_whitespace().next().unwrap_or("");
-            assert!(
-                first.starts_with("/usr/bin/")
-                    || first.starts_with("/bin/")
-                    || first.starts_with("./cosign")
-                    || ["v=", "d=", "r=", "f=", "for", "echo", "cd", "--cert"].iter().any(|ok| first.starts_with(ok)),
-                "{line}"
-            );
+        // No program is found through PATH: each is named by its full path (or is the shell's own, or root's cosign).
+        for word in
+            ["sudo", "curl", "install", "mv", "tar", "shasum", "mkdir", "stat", "chmod", "rm", "mktemp", "ls", "wc"]
+        {
+            for (i, _) in c.match_indices(word) {
+                let before = &c[..i];
+                let ok = before.ends_with('/')
+                    || before.ends_with("-")
+                    || before.ends_with('.')
+                    || !before.ends_with(|ch: char| ch.is_whitespace() || ch == '(' || ch == ';' || ch == '|');
+                assert!(ok, "{word} is run through PATH near: {}", &c[i.saturating_sub(20)..(i + 20).min(c.len())]);
+            }
         }
+    }
+
+    #[test]
+    fn the_root_commands_folder_checks_refuse_a_developer_folder_or_a_link() {
+        // The command's own check loop, run by the system shell over other folders (all existing, so nothing is
+        // made): root's real folders pass; a folder the developer owns, or a link, stops it.
+        let c = bootstrap_command("1.2.3");
+        let start = c.find("for p in").unwrap();
+        let end = c[start..].find("done\n").unwrap() + start + 5;
+        let check = |folders: &str| {
+            let script = c[start..end].replacen("/usr /usr/local /usr/local/libexec \"$L\"", folders, 1);
+            std::process::Command::new("/bin/sh").arg("-euc").arg(script).output().unwrap()
+        };
+        assert!(check("/usr /bin").status.success());
+        let t = tempfile::tempdir().unwrap();
+        let mine = t.path().join("mine");
+        std::fs::create_dir(&mine).unwrap();
+        let out = check(&format!("/usr '{}'", mine.display()));
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("must be root-owned"));
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink("/usr", &link).unwrap();
+        let out = check(&format!("'{}'", link.display()));
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("is a link"));
     }
 
     #[test]

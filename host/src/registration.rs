@@ -126,6 +126,100 @@ impl Record {
     }
 }
 
+/// A digest of everything the gateway trusts: its configuration, its registration record, its certificate, the CA
+/// and its token key. When the root step changes it, a running gateway must restart (or stop) to stop using the old.
+pub fn trust_digest(l: &crate::platform::macos::Layout) -> String {
+    use crate::platform::macos::{CA_CERT, JWT_PUBLIC, LEAF_CERT};
+    let files = [
+        l.gateway_toml(),
+        l.d().join(RECORD),
+        l.tls_dir().join(LEAF_CERT),
+        l.tls_dir().join(CA_CERT),
+        l.jwt_dir().join(JWT_PUBLIC),
+    ];
+    let mut all = Vec::new();
+    for f in files {
+        all.extend_from_slice(f.display().to_string().as_bytes());
+        all.push(0);
+        all.extend(std::fs::read(&f).unwrap_or_default());
+        all.push(0);
+    }
+    crate::util::sha256_hex(&all)
+}
+
+/// Root writes this, root-owned, into the developer's `D/run` in the same step that changes what the gateway
+/// trusts. The developer's side removes it only once launchd confirms the gateway restarted (or stopped); every
+/// later install finishes a pending one first.
+pub const RESTART_PENDING: &str = "gateway-restart.pending";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartPending {
+    pub schema: String,
+    /// `restart` when the gateway has a configuration to run, `stop` when it has none.
+    pub action: String,
+    pub trust_digest: String,
+}
+
+impl RestartPending {
+    pub fn new(stop: bool, trust_digest: String) -> Self {
+        RestartPending {
+            schema: "ekka-desk-host.gateway-restart/v1".into(),
+            action: if stop { "stop" } else { "restart" }.into(),
+            trust_digest,
+        }
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut v = serde_json::to_vec_pretty(self).unwrap_or_default();
+        v.push(b'\n');
+        v
+    }
+
+    pub fn stops(&self) -> bool {
+        self.action == "stop"
+    }
+}
+
+/// What finishing a restart needs from launchd, so it can be checked without one.
+pub trait Launchd {
+    fn state(&self) -> crate::platform::macos::ServiceState;
+    fn restart(&self) -> Result<()>;
+    fn start(&self) -> Result<()>;
+    fn stop(&self) -> Result<()>;
+}
+
+/// Restarts (or stops) the gateway as the pending marker asks, and says whether launchd confirmed it: a restart is
+/// confirmed only by the service running under a new process id, a stop only by the service being gone.
+pub fn finish(launchd: &dyn Launchd, pending: &RestartPending, wait: std::time::Duration) -> Result<bool> {
+    let before = launchd.state();
+    if pending.stops() {
+        if before.loaded {
+            launchd.stop()?;
+        }
+    } else if before.loaded {
+        launchd.restart()?;
+    } else {
+        launchd.start()?;
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let now = launchd.state();
+        let done = if pending.stops() {
+            !now.loaded
+        } else {
+            now.running && now.pid.is_some() && (now.pid != before.pid || !before.running)
+        };
+        if done {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 /// What the developer's side does with the gateway's LaunchAgent after the root step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayAction {
@@ -198,6 +292,66 @@ pub(crate) mod tests {
             let r = Registration::from_answer(&a).unwrap();
             assert!(r.verify(&b).is_err(), "{path} must not be used");
         }
+    }
+
+    use crate::platform::macos::ServiceState;
+    use std::cell::RefCell;
+
+    /// A launchd in memory: what `state` answers after each call.
+    struct FakeLaunchd {
+        states: RefCell<Vec<ServiceState>>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+    impl FakeLaunchd {
+        fn new(states: Vec<ServiceState>) -> Self {
+            FakeLaunchd { states: RefCell::new(states), calls: RefCell::new(Vec::new()) }
+        }
+    }
+    impl Launchd for FakeLaunchd {
+        fn state(&self) -> ServiceState {
+            let mut s = self.states.borrow_mut();
+            if s.len() > 1 {
+                s.remove(0)
+            } else {
+                s[0].clone()
+            }
+        }
+        fn restart(&self) -> Result<()> {
+            self.calls.borrow_mut().push("restart");
+            Ok(())
+        }
+        fn start(&self) -> Result<()> {
+            self.calls.borrow_mut().push("start");
+            Ok(())
+        }
+        fn stop(&self) -> Result<()> {
+            self.calls.borrow_mut().push("stop");
+            Ok(())
+        }
+    }
+
+    fn st(loaded: bool, running: bool, pid: Option<u32>) -> ServiceState {
+        ServiceState { loaded, running, pid }
+    }
+
+    #[test]
+    fn a_pending_restart_is_done_only_when_launchd_shows_a_new_process() {
+        let wait = std::time::Duration::from_millis(600);
+        let restart = RestartPending::new(false, "d".into());
+        let l = FakeLaunchd::new(vec![st(true, true, Some(10)), st(true, true, Some(11))]);
+        assert!(finish(&l, &restart, wait).unwrap());
+        assert_eq!(*l.calls.borrow(), ["restart"]);
+        let same = FakeLaunchd::new(vec![st(true, true, Some(10))]);
+        assert!(!finish(&same, &restart, wait).unwrap(), "the same process is not a restart: the marker stays");
+        let stopped = FakeLaunchd::new(vec![st(false, false, None), st(true, true, Some(12))]);
+        assert!(finish(&stopped, &restart, wait).unwrap());
+        assert_eq!(*stopped.calls.borrow(), ["start"]);
+        let stop = RestartPending::new(true, "d".into());
+        let l = FakeLaunchd::new(vec![st(true, true, Some(10)), st(false, false, None)]);
+        assert!(finish(&l, &stop, wait).unwrap());
+        assert_eq!(*l.calls.borrow(), ["stop"]);
+        let stuck = FakeLaunchd::new(vec![st(true, true, Some(10))]);
+        assert!(!finish(&stuck, &stop, wait).unwrap(), "still loaded: the marker stays");
     }
 
     #[test]

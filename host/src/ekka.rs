@@ -8,7 +8,7 @@
 //! not report an ekka version, or is not that release's `ekka`, is refused.
 
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -102,19 +102,28 @@ pub fn verify(program: &Path, release: &dyn RunnerRelease, trust: &Trust, rekor:
     if !is_plain_absolute_path(&real.display().to_string()) {
         return Err(refused(format!("ekka's real path {} is not a plain absolute path", real.display())));
     }
-    let meta = std::fs::metadata(&real).map_err(|e| refused(format!("{}: {e}", real.display())))?;
-    let parent = real.parent().ok_or_else(|| refused("ekka has no folder"))?;
-    let parent_meta = std::fs::metadata(parent).map_err(|e| refused(format!("{}: {e}", parent.display())))?;
+    // Before it is run, even to ask its version: the program and every folder above it, up to /, are owned by root
+    // or this developer, writable by nobody else, with no ACL letting anyone else change them.
+    let me = rustix::process::getuid().as_raw();
+    let meta = std::fs::symlink_metadata(&real).map_err(|e| refused(format!("{}: {e}", real.display())))?;
     if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
         return Err(refused(format!("{} is not a program", real.display())));
     }
-    if meta.permissions().mode() & 0o022 != 0 || parent_meta.permissions().mode() & 0o022 != 0 {
-        return Err(refused(format!("{} or its folder can be changed by other users", real.display())));
-    }
-    for p in [real.as_path(), parent] {
+    for p in real.ancestors() {
+        let m = std::fs::symlink_metadata(p).map_err(|e| refused(format!("{}: {e}", p.display())))?;
+        let owner_ok = m.uid() == 0 || m.uid() == me;
+        if !owner_ok || m.permissions().mode() & 0o022 != 0 || m.file_type().is_symlink() {
+            return Err(refused(format!(
+                "{} is uid {} mode {:o}: ekka and every folder above it must be root's or yours and writable by \
+                 nobody else; it was not run",
+                p.display(),
+                m.uid(),
+                m.permissions().mode() & 0o7777
+            )));
+        }
         let f = std::fs::File::open(p).map_err(|e| refused(format!("{}: {e}", p.display())))?;
         if let Some(why) = crate::acl::unsafe_grant(&f, crate::acl::Guard::Writes)? {
-            return Err(refused(format!("{}: {why}", p.display())));
+            return Err(refused(format!("{}: {why}; it was not run", p.display())));
         }
     }
     let installed = std::fs::read(&real).map_err(|e| refused(format!("reading {}: {e}", real.display())))?;
@@ -244,6 +253,21 @@ mod tests {
         // The same version string, other bytes: not the release's ekka.
         let other = program(d.path(), "other", &format!("echo 'ekka {V}' # other"));
         assert!(verify(&other, &r, &t, &k).unwrap_err().reason.contains("is not that release's ekka"));
+    }
+
+    #[test]
+    fn a_program_below_a_folder_others_can_write_is_never_run() {
+        let d = tempfile::tempdir().unwrap();
+        let open = d.path().join("open");
+        let inner = open.join("bin");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let marker = d.path().join("ran");
+        let p = program(&inner, "ekka", &format!("touch '{}'; echo 'ekka {V}'", marker.display()));
+        let (r, t, k) = release(b"x", &format!("{SIGNER}{V}"));
+        let e = verify(&p, &r, &t, &k).unwrap_err();
+        assert!(e.reason.contains("it was not run"), "{e}");
+        assert!(!marker.exists(), "the program was run before it was checked");
     }
 
     #[test]

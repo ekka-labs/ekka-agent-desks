@@ -117,8 +117,13 @@ unsafe fn entries_of(acl: sys::Acl) -> Result<(usize, Vec<Allow>)> {
                 return Err(refused("an access control list entry's permissions could not be read; refused"));
             }
             for p in sys::ALL {
-                if sys::acl_get_perm_np(set, p as i32) == 1 {
-                    perms |= p;
+                match sys::acl_get_perm_np(set, p as i32) {
+                    1 => perms |= p,
+                    0 => {}
+                    _ => {
+                        sys::acl_free(acl);
+                        return Err(refused("an access control list permission could not be read; refused"));
+                    }
                 }
             }
             let q = sys::acl_get_qualifier(entry);

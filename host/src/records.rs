@@ -162,7 +162,10 @@ pub struct CeilingProfile {
 pub struct Ceiling {
     pub profiles: Vec<CeilingProfile>,
     pub hosts: Vec<String>,
-    pub resources: Resources,
+    /// The largest CPU and memory one desk may have, when the profile sets one. Left out (never `null`) when it
+    /// does not: the runner reads an absent ceiling as none, and a developer's Mac has none in this release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
 }
 
 impl Ceiling {
@@ -184,14 +187,17 @@ impl Ceiling {
         {
             return Err(refused("the provider ceiling's hosts must be the sorted union of its profiles' (1 to 64)"));
         }
-        self.resources.check()
+        match &self.resources {
+            Some(r) => r.check(),
+            None => Ok(()),
+        }
     }
 }
 
 /// The provider ceiling: every profile this install puts in the gateway, the hosts each names, all of them, and
 /// the largest CPU and memory one desk may be given. Without a resource ceiling a desks grant carries none, and
 /// desks run with no CPU or memory limit at all.
-pub fn ceiling(resources: Resources) -> Result<Ceiling> {
+pub fn ceiling(resources: Option<Resources>) -> Result<Ceiling> {
     let mut profiles = Vec::new();
     for p in &kit::PROVIDERS {
         profiles.push(CeilingProfile { name: p.name.to_string(), hosts: profile_hosts(p.name, p.yaml)? });
@@ -203,7 +209,7 @@ pub fn ceiling(resources: Resources) -> Result<Ceiling> {
     Ok(c)
 }
 
-pub fn ceiling_bytes(resources: Resources) -> Result<Vec<u8>> {
+pub fn ceiling_bytes(resources: Option<Resources>) -> Result<Vec<u8>> {
     pretty(&ceiling(resources)?)
 }
 
@@ -222,7 +228,7 @@ pub fn write(
     dir: &Path,
     root: Owner,
     desk_image: Option<&DeskImagePin>,
-    resources: Resources,
+    resources: Option<Resources>,
 ) -> Result<()> {
     let mut files = vec![(BASELINE, baseline_bytes()?), (CEILING, ceiling_bytes(resources)?)];
     if let Some(pin) = desk_image {
@@ -254,11 +260,12 @@ mod tests {
 
     #[test]
     fn the_ceiling_names_every_imported_profile_with_positive_cpu_and_memory() {
-        let c = ceiling(RES).unwrap();
+        let c = ceiling(Some(RES)).unwrap();
         let names: Vec<_> = c.profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["bitbucket", "claude-code", "codex", "github"]);
         assert!(c.hosts.contains(&"github.com".to_string()));
-        assert!(c.resources.max_cpu_millicores > 0 && c.resources.max_memory_mib > 0);
+        let r = c.resources.unwrap();
+        assert!(r.max_cpu_millicores > 0 && r.max_memory_mib > 0);
         // The same hosts the gateway's JSON forms name: the ceiling and the gateway can never disagree.
         for p in &kit::PROVIDERS {
             let json: serde_json::Value = serde_json::from_str(p.json).unwrap();
@@ -268,14 +275,14 @@ mod tests {
             from_json.dedup();
             assert_eq!(from_json, profile_hosts(p.name, p.yaml).unwrap(), "{}", p.name);
         }
-        let text = String::from_utf8(ceiling_bytes(RES).unwrap()).unwrap();
+        let text = String::from_utf8(ceiling_bytes(Some(RES)).unwrap()).unwrap();
         assert!(text.contains("\"max_cpu_millicores\": 4000") && text.ends_with("}\n"), "{text}");
     }
 
     #[test]
     fn a_ceiling_outside_the_runners_ranges_is_refused() {
-        assert!(ceiling(Resources { max_cpu_millicores: 0, max_memory_mib: 8192 }).is_err());
-        assert!(ceiling(Resources { max_cpu_millicores: 4000, max_memory_mib: 0 }).is_err());
+        assert!(ceiling(Some(Resources { max_cpu_millicores: 0, max_memory_mib: 8192 })).is_err());
+        assert!(ceiling(Some(Resources { max_cpu_millicores: 4000, max_memory_mib: 0 })).is_err());
         assert!(Resources::half_of(1, 256 * 1024 * 1024).is_err(), "a VM too small for one desk is refused");
         let half = Resources::half_of(8, 16 * 1024 * 1024 * 1024).unwrap();
         assert_eq!(half, Resources { max_cpu_millicores: 4000, max_memory_mib: 8192 });
@@ -285,6 +292,29 @@ mod tests {
         assert_eq!((big.max_cpu_millicores, big.max_memory_mib), (MAX_DESK_CPU_MILLICORES, MAX_DESK_MEMORY_MIB));
         assert!(Resources { max_cpu_millicores: MAX_DESK_CPU_MILLICORES + 1, max_memory_mib: 1024 }.check().is_err());
         assert!(Resources { max_cpu_millicores: 1000, max_memory_mib: MAX_DESK_MEMORY_MIB + 1 }.check().is_err());
+    }
+
+    /// The runner's ceiling reader, field for field: `resources` may be absent, and nothing else may be added.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct RunnerCeiling {
+        profiles: Vec<CeilingProfile>,
+        #[serde(default)]
+        resources: Option<Resources>,
+        hosts: Vec<String>,
+    }
+
+    #[test]
+    fn a_developer_mac_ceiling_has_no_resources_and_the_runner_reads_it() {
+        let bytes = ceiling_bytes(None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("resources").is_none(), "left out, never null: {v}");
+        let runner: RunnerCeiling = serde_json::from_slice(&bytes).unwrap();
+        assert!(runner.resources.is_none() && !runner.hosts.is_empty());
+        // A profile that sets one still writes it, in the shape the runner reads.
+        let with: RunnerCeiling = serde_json::from_slice(&ceiling_bytes(Some(RES)).unwrap()).unwrap();
+        assert_eq!(with.resources, Some(RES));
     }
 
     #[test]
@@ -307,7 +337,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("private/var/lib/ekka-agent-desks/backend");
         let mut ctx = Ctx::apply();
-        write(&mut ctx, t.path(), &dir, me(), Some(&pin()), RES).unwrap();
+        write(&mut ctx, t.path(), &dir, me(), Some(&pin()), Some(RES)).unwrap();
         assert_eq!(ctx.changes.len(), 8, "{:?}", ctx.changes); // five folders made, three records
         for name in [BASELINE, IMAGE, CEILING] {
             let m = std::fs::metadata(dir.join(name)).unwrap();
@@ -319,12 +349,17 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(BASELINE)).unwrap(), kit::BASELINE_POLICY);
 
         let mut again = Ctx::apply();
-        write(&mut again, t.path(), &dir, me(), Some(&pin()), RES).unwrap();
+        write(&mut again, t.path(), &dir, me(), Some(&pin()), Some(RES)).unwrap();
         assert!(again.changes.is_empty(), "{:?}", again.changes);
         let mut check = Ctx::check();
-        write(&mut check, t.path(), &dir, me(), Some(&pin()), Resources { max_cpu_millicores: 2000, ..RES }).unwrap();
+        write(&mut check, t.path(), &dir, me(), Some(&pin()), Some(Resources { max_cpu_millicores: 2000, ..RES }))
+            .unwrap();
         assert_eq!(check.changes.len(), 1, "a changed ceiling is one change: {:?}", check.changes);
-        assert_eq!(std::fs::read(dir.join(CEILING)).unwrap(), ceiling_bytes(RES).unwrap(), "checking wrote nothing");
+        assert_eq!(
+            std::fs::read(dir.join(CEILING)).unwrap(),
+            ceiling_bytes(Some(RES)).unwrap(),
+            "checking wrote nothing"
+        );
     }
 
     #[test]
@@ -336,7 +371,7 @@ mod tests {
         std::fs::write(t.path().join("wide-open.json"), b"{}").unwrap();
         std::os::unix::fs::symlink(t.path().join("wide-open.json"), dir.join(CEILING)).unwrap();
         let mut ctx = Ctx::apply();
-        let e = write(&mut ctx, t.path(), &dir, me(), Some(&pin()), RES).unwrap_err();
+        let e = write(&mut ctx, t.path(), &dir, me(), Some(&pin()), Some(RES)).unwrap_err();
         assert!(e.reason.contains("provider-ceiling.json is a link"), "{e}");
         assert_eq!(std::fs::read(t.path().join("wide-open.json")).unwrap(), b"{}");
     }
@@ -348,8 +383,15 @@ mod tests {
         std::fs::create_dir_all(t.path().join("private/var")).unwrap();
         std::os::unix::fs::symlink(t.path().join("private/var"), t.path().join("var")).unwrap();
         let mut ctx = Ctx::apply();
-        let e = write(&mut ctx, t.path(), &t.path().join("var/lib/ekka-agent-desks/backend"), me(), Some(&pin()), RES)
-            .unwrap_err();
+        let e = write(
+            &mut ctx,
+            t.path(),
+            &t.path().join("var/lib/ekka-agent-desks/backend"),
+            me(),
+            Some(&pin()),
+            Some(RES),
+        )
+        .unwrap_err();
         assert!(e.reason.contains("is a link or not a folder"), "{e}");
         assert!(!t.path().join("private/var/lib").exists());
     }

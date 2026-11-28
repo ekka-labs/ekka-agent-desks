@@ -31,10 +31,23 @@ fn b64(s: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(s.trim()).map_err(|_| refused("a signature part is not base64"))
 }
 
+/// One Fulcio certificate authority: its root, its intermediates, and the interval Sigstore says it was valid for.
+pub struct Authority {
+    root: CertificateDer<'static>,
+    intermediates: Vec<CertificateDer<'static>>,
+    start: i64,
+    end: Option<i64>,
+}
+
+impl Authority {
+    fn valid_at(&self, t: i64) -> bool {
+        self.start <= t && self.end.is_none_or(|e| t <= e)
+    }
+}
+
 /// Fulcio's certificate authorities and Rekor's keys.
 pub struct Trust {
-    anchors: Vec<CertificateDer<'static>>,
-    intermediates: Vec<CertificateDer<'static>>,
+    authorities: Vec<Authority>,
     /// Rekor logs: (log id in hex, the P-256 public key point).
     rekor: Vec<(String, Vec<u8>)>,
 }
@@ -48,15 +61,19 @@ impl Trust {
     /// with a P-256 key.
     pub fn parse(json: &str) -> Result<Self> {
         let v: Value = serde_json::from_str(json).map_err(|_| failed("the Sigstore trusted root is not JSON"))?;
-        let mut t = Trust { anchors: Vec::new(), intermediates: Vec::new(), rekor: Vec::new() };
+        let mut t = Trust { authorities: Vec::new(), rekor: Vec::new() };
         for ca in v["certificateAuthorities"].as_array().into_iter().flatten() {
             let mut chain: Vec<CertificateDer<'static>> = Vec::new();
             for c in ca["certChain"]["certificates"].as_array().into_iter().flatten() {
                 chain.push(CertificateDer::from(b64(c["rawBytes"].as_str().unwrap_or(""))?));
             }
+            let start = rfc3339(ca["validFor"]["start"].as_str().unwrap_or(""))?;
+            let end = match ca["validFor"]["end"].as_str() {
+                Some(e) => Some(rfc3339(e)?),
+                None => None,
+            };
             if let Some(root) = chain.pop() {
-                t.anchors.push(root);
-                t.intermediates.extend(chain);
+                t.authorities.push(Authority { root, intermediates: chain, start, end });
             }
         }
         for log in v["tlogs"].as_array().into_iter().flatten() {
@@ -66,7 +83,7 @@ impl Trust {
             let spki = b64(log["publicKey"]["rawBytes"].as_str().unwrap_or(""))?;
             t.rekor.push((sha256_hex(&spki), spki_point(&spki)?));
         }
-        if t.anchors.is_empty() || t.rekor.is_empty() {
+        if t.authorities.is_empty() || t.rekor.is_empty() {
             return Err(failed("the Sigstore trusted root names no Fulcio CA or no Rekor key"));
         }
         Ok(t)
@@ -74,8 +91,34 @@ impl Trust {
 
     #[cfg(test)]
     pub fn new(anchors: Vec<CertificateDer<'static>>, rekor: Vec<(String, Vec<u8>)>) -> Self {
-        Trust { anchors, intermediates: Vec::new(), rekor }
+        let authorities = anchors
+            .into_iter()
+            .map(|root| Authority { root, intermediates: Vec::new(), start: 0, end: None })
+            .collect();
+        Trust { authorities, rekor }
     }
+
+    /// The authorities Sigstore says were valid at `t`: only these may anchor a signature made then.
+    pub fn valid_at(&self, t: i64) -> Vec<&Authority> {
+        self.authorities.iter().filter(|a| a.valid_at(t)).collect()
+    }
+}
+
+/// An RFC 3339 UTC time as Sigstore's trusted root writes it (`2022-04-13T20:06:15Z`, fractions ignored).
+fn rfc3339(s: &str) -> Result<i64> {
+    let bad = || failed("the Sigstore trusted root has a time that is not RFC 3339 UTC");
+    if s.len() < 20 || !s.ends_with('Z') || s.as_bytes()[10] != b'T' {
+        return Err(bad());
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r).and_then(|x| x.parse::<u32>().ok()).ok_or_else(bad);
+    let date = time::Date::from_calendar_date(
+        n(0..4)? as i32,
+        time::Month::try_from(n(5..7)? as u8).map_err(|_| bad())?,
+        n(8..10)? as u8,
+    )
+    .map_err(|_| bad())?;
+    let t = time::Time::from_hms(n(11..13)? as u8, n(14..16)? as u8, n(17..19)? as u8).map_err(|_| bad())?;
+    Ok(time::PrimitiveDateTime::new(date, t).assume_utc().unix_timestamp())
 }
 
 /// One DER element: (tag, contents, the rest after it).
@@ -315,17 +358,22 @@ pub fn verify(signed: &Signed, identity: &str, issuer: &str, trust: &Trust, reko
     if time < leaf.not_before || time > leaf.not_after {
         return Err(refused("the release was logged outside its signing certificate's lifetime"));
     }
-    let anchors: Vec<TrustAnchor> = trust
-        .anchors
+    // Only an authority valid when the release was logged may anchor it: a root past its end anchors nothing.
+    let valid = trust.valid_at(time);
+    if valid.is_empty() {
+        return Err(refused("no Sigstore certificate authority was valid when this release was logged"));
+    }
+    let anchors: Vec<TrustAnchor> = valid
         .iter()
-        .map(|a| webpki::anchor_from_trusted_cert(a).map(|t| t.to_owned()))
+        .map(|a| webpki::anchor_from_trusted_cert(&a.root).map(|t| t.to_owned()))
         .collect::<std::result::Result<_, _>>()
         .map_err(|_| failed("a pinned Fulcio CA certificate does not parse"))?;
+    let intermediates: Vec<CertificateDer> = valid.iter().flat_map(|a| a.intermediates.iter().cloned()).collect();
     let ee = webpki::EndEntityCert::try_from(&cert).map_err(|e| refused(format!("the signing certificate: {e}")))?;
     ee.verify_for_usage(
         webpki::ALL_VERIFICATION_ALGS,
         &anchors,
-        &trust.intermediates,
+        &intermediates,
         UnixTime::since_unix_epoch(Duration::from_secs(time as u64)),
         webpki::KeyUsage::required(CODE_SIGNING),
         None,
@@ -438,9 +486,10 @@ pub(crate) mod tests {
         assert!(verify(&swapped, ID, GITHUB_ISSUER, &w.trust, &rekor).unwrap_err().reason.contains("does not verify"));
         let s = Signed { blob, sig_b64: &w.sig_b64, crt_b64: &w.crt_b64 };
         let stranger = sign(blob, ID, GITHUB_ISSUER, now());
-        let untrusted = Trust::new(stranger.trust.anchors.clone(), w.trust.rekor.clone());
+        let anchors = |t: &Trust| t.authorities.iter().map(|a| a.root.clone()).collect::<Vec<_>>();
+        let untrusted = Trust::new(anchors(&stranger.trust), w.trust.rekor.clone());
         assert!(verify(&s, ID, GITHUB_ISSUER, &untrusted, &rekor).unwrap_err().reason.contains("chain"));
-        let other_log = Trust::new(w.trust.anchors.clone(), stranger.trust.rekor.clone());
+        let other_log = Trust::new(anchors(&w.trust), stranger.trust.rekor.clone());
         assert!(verify(&s, ID, GITHUB_ISSUER, &other_log, &rekor).unwrap_err().reason.contains("transparency log"));
         assert!(verify(&s, ID, GITHUB_ISSUER, &w.trust, &Fixed(vec![])).is_err(), "no log entry");
         let late = sign(blob, ID, GITHUB_ISSUER, now() + 3600);
@@ -452,9 +501,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_certificate_authority_anchors_only_inside_its_validity() {
+        // The pinned trusted root: the first Fulcio CA ended on 2022-12-31; the second began on 2022-04-13.
+        let t = Trust::embedded().unwrap();
+        let at = |s: &str| t.valid_at(rfc3339(s).unwrap()).len();
+        assert_eq!(at("2021-06-01T00:00:00Z"), 1);
+        assert_eq!(at("2022-06-01T00:00:00Z"), 2);
+        assert_eq!(at("2026-11-28T00:00:00Z"), 1, "the first CA is past its end");
+        assert_eq!(at("2020-01-01T00:00:00Z"), 0, "before any CA");
+        // A release logged while its only CA was not valid is refused, though everything else verifies.
+        let blob = b"a release";
+        let w = sign(blob, ID, GITHUB_ISSUER, now());
+        let mut expired =
+            Trust::new(w.trust.authorities.iter().map(|a| a.root.clone()).collect(), w.trust.rekor.clone());
+        expired.authorities[0].end = Some(now() - 60);
+        let s = Signed { blob, sig_b64: &w.sig_b64, crt_b64: &w.crt_b64 };
+        let e = verify(&s, ID, GITHUB_ISSUER, &expired, &Fixed(vec![w.entry.clone()])).unwrap_err();
+        assert!(e.reason.contains("no Sigstore certificate authority was valid"), "{e}");
+    }
+
+    #[test]
     fn the_pinned_trusted_root_names_fulcio_and_rekor() {
         let t = Trust::embedded().unwrap();
-        assert!(!t.anchors.is_empty() && !t.intermediates.is_empty());
+        assert!(!t.authorities.is_empty() && t.authorities.iter().any(|a| !a.intermediates.is_empty()));
         assert!(t.rekor.iter().any(|(id, _)| id == "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d"));
     }
 }

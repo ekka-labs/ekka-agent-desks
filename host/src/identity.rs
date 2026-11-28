@@ -131,9 +131,8 @@ impl Profile {
         if !is_uuid(&p.org) {
             return Err(refused("the identity profile's org is not a lowercase tenant id"));
         }
-        if let Some(r) = &p.registration {
-            gateway_class(&crate::registration::Registration::from_answer(r)?.gateway_id)?;
-        }
+        // A registration is read and checked by root against this installation; one that is not well-formed or not
+        // usable makes the gateway stop (fail closed), so it is never a reason to stop the install here.
         Ok(p)
     }
 }

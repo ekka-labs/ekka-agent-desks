@@ -74,6 +74,8 @@ pub struct Status {
     pub enclave_enrolled: bool,
     pub services: Vec<Service>,
     pub bootstrap: Check,
+    /// Said plainly: a developer's Mac gives a desk no CPU or memory limit of its own in this release.
+    pub desk_limits: String,
     pub checks: Vec<Check>,
 }
 
@@ -82,6 +84,7 @@ pub struct Doctor {
     pub schema: &'static str,
     pub host_version: &'static str,
     pub ok: bool,
+    pub desk_limits: String,
     pub checks: Vec<Check>,
 }
 
@@ -359,6 +362,7 @@ pub fn status(l: &Layout, pins: &Pins, env: Option<&str>) -> Status {
         ]);
     }
     let docker = Docker::new(&l.docker_socket());
+    let vm = docker.info().ok().map(|i| (i.cpus, i.memory_bytes >> 20));
     checks.push(check_docker(&docker));
     checks.push(check_meter(&docker, pins));
     let env = env.or(binding.as_ref().map(|b| b.env.as_str())).unwrap_or("prod");
@@ -390,6 +394,7 @@ pub fn status(l: &Layout, pins: &Pins, env: Option<&str>) -> Status {
         enclave_enrolled: enrolled.is_some(),
         services,
         bootstrap,
+        desk_limits: crate::install::no_desk_limits(vm),
         checks,
     }
 }
@@ -404,7 +409,9 @@ fn lan_ipv4() -> Option<std::net::IpAddr> {
 
 /// Everything `status` checks, and the live probes.
 pub fn doctor(l: &Layout, pins: &Pins) -> Doctor {
-    let mut checks = status(l, pins, None).checks;
+    let s = status(l, pins, None);
+    let desk_limits = s.desk_limits.clone();
+    let mut checks = s.checks;
     checks.push(check_socket("interceptor_socket", &l.interceptor_socket(), l.uid));
     checks.push(from(
         "interceptor_answers",
@@ -454,7 +461,7 @@ pub fn doctor(l: &Layout, pins: &Pins) -> Doctor {
         }
     }));
     let ok = checks.iter().all(|c| c.ok);
-    Doctor { schema: DOCTOR_SCHEMA, host_version: env!("CARGO_PKG_VERSION"), ok, checks }
+    Doctor { schema: DOCTOR_SCHEMA, host_version: env!("CARGO_PKG_VERSION"), ok, desk_limits, checks }
 }
 
 #[cfg(test)]
@@ -474,6 +481,8 @@ mod tests {
         assert_eq!(by_id("binding").reason.as_deref(), Some("not installed: run ekka-desk-host install"));
         assert!(by_id("host_binary").reason.as_deref().unwrap().contains(macos::HOST_BINARY));
         assert!(!s.bootstrap.ok && s.bootstrap.reason.as_deref().unwrap().starts_with("pending"));
+        assert!(s.desk_limits.starts_with("desks on this Mac have no CPU or memory limit of their own"));
+        assert!(s.desk_limits.contains("the room check still holds jobs when the VM is short of memory"));
     }
 
     #[test]

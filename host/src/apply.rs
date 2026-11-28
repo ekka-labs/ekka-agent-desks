@@ -256,7 +256,8 @@ pub struct RootPlan {
     pub want: Want,
     pub gateway_staged: PathBuf,
     pub adapter_staged: Option<PathBuf>,
-    pub resources: Resources,
+    /// The largest CPU and memory one desk may have, when the profile sets one (a developer's Mac does not).
+    pub resources: Option<Resources>,
     /// Govern's answer to the gateway's registration, once it is registered. Root uses it only when it is this
     /// installation's (`registration`); every sign-in value is computed, and checked against it.
     pub registration: Option<Registration>,
@@ -277,10 +278,9 @@ impl RootPlan {
             return Err(refused(format!("the root plan is not {PLAN_SCHEMA}")));
         }
         self.want.check()?;
-        if let Some(r) = &self.registration {
-            identity::gateway_class(&r.gateway_id)?;
+        if let Some(r) = &self.resources {
+            r.check()?;
         }
-        self.resources.check()?;
         if let Some(a) = &self.adapter {
             adapter::check_keys(&a.govern_keys)?;
             if pins.adapter.is_none() || self.adapter_staged.is_none() {
@@ -334,8 +334,26 @@ struct ReleaseRecord<'a> {
     adapter: Option<&'a Pinned>,
 }
 
+/// A legacy binding's folder or file is trusted only when owned by root or that developer, writable by nobody
+/// else, with no ACL letting anyone else change it.
+fn legacy_trusted(fd: &OwnedFd, what: &Path, uid: u32, root: u32) -> Result<()> {
+    let st = rustix::fs::fstat(fd).map_err(|e| errno(format!("reading {}", what.display()), e))?;
+    if (st.st_uid != uid && st.st_uid != root) || fsx::mode_bits(st.st_mode) & 0o022 != 0 {
+        return Err(refused(format!(
+            "{} is uid {} mode {:o}: an old binding anyone else could have written is not trusted; nothing was changed",
+            what.display(),
+            st.st_uid,
+            fsx::mode_bits(st.st_mode)
+        )));
+    }
+    if let Some(why) = crate::acl::unsafe_grant(fd, crate::acl::Guard::Writes)? {
+        return Err(refused(format!("{}: {why}; nothing was changed", what.display())));
+    }
+    Ok(())
+}
+
 /// Bindings the first release wrote, one per developer at `ekka-dev/<uid>/binding.json`, each checked to be what
-/// it says (its uid is its folder's) and read without following a link.
+/// it says (its uid is its folder's), trusted (`legacy_trusted`), and read without following a link.
 fn legacy_bindings(l: &Layout, root: u32) -> Result<Vec<Binding>> {
     let dir = match walk_trusted(&l.ekka_dev(), &l.top, root, None)? {
         Walk::Found(fd, _) => fd,
@@ -352,7 +370,12 @@ fn legacy_bindings(l: &Layout, root: u32) -> Result<Vec<Binding>> {
             Err(Errno::NOTDIR) => continue,
             Err(e) => return Err(errno(format!("opening {}", l.ekka_dev().join(&name).display()), e)),
         };
-        if let Some(bytes) = fsx::read_at(&sub, LEGACY_BINDING, 64 * 1024)? {
+        let path = l.ekka_dev().join(&name);
+        legacy_trusted(&sub, &path, uid, root)?;
+        let Some(file) = fsx::open_file_at(&sub, LEGACY_BINDING)? else { continue };
+        legacy_trusted(&file, &path.join(LEGACY_BINDING), uid, root)?;
+        {
+            let bytes = fsx::read_regular(file, LEGACY_BINDING, 64 * 1024)?;
             let b = Binding::parse(&bytes)?;
             if b.uid != uid {
                 return Err(refused(format!("{}/{LEGACY_BINDING} names uid {}; nothing was changed", name, b.uid)));
@@ -464,19 +487,26 @@ pub fn root_apply(
         },
         Walk::Missing(_) => None,
     };
-    let raised = old_ceiling.as_ref().is_some_and(|c| {
-        plan.resources.max_cpu_millicores > c.resources.max_cpu_millicores
-            || plan.resources.max_memory_mib > c.resources.max_memory_mib
+    // Going from a limit to none, or to a larger one, is a raise; from none to a limit, or a smaller one, is not.
+    let raised = old_ceiling.as_ref().is_some_and(|c| match (&c.resources, &plan.resources) {
+        (Some(_), None) => true,
+        (Some(o), Some(n)) => n.max_cpu_millicores > o.max_cpu_millicores || n.max_memory_mib > o.max_memory_mib,
+        (None, _) => false,
     });
     if raised && !plan.raise_ceiling {
-        let c = &old_ceiling.as_ref().expect("raised implies a ceiling").resources;
+        let show = |r: &Option<Resources>| match r {
+            Some(r) => format!("{} millicores and {} MiB", r.max_cpu_millicores, r.max_memory_mib),
+            None => "no limit".to_string(),
+        };
+        let old = &old_ceiling.as_ref().expect("raised implies a ceiling").resources;
         return Err(refused(format!(
-            "the desk ceiling is {} millicores and {} MiB; raising it to {} and {} needs --raise-ceiling. Nothing \
-             was changed",
-            c.max_cpu_millicores, c.max_memory_mib, plan.resources.max_cpu_millicores, plan.resources.max_memory_mib
+            "the desk ceiling is {}; raising it to {} needs --raise-ceiling. Nothing was changed",
+            show(old),
+            show(&plan.resources)
         )));
     }
 
+    let trust_before = registration::trust_digest(l);
     let d = l.d();
     let dfd = ctx.trusted_dir(top, &d, root.uid, 0o755)?;
     if migrated || dfd.as_ref().map(|fd| exists(Some(fd), LEGACY_BINDING)).transpose()?.unwrap_or(false) {
@@ -513,7 +543,8 @@ pub fn root_apply(
     }
     let mut ca: Option<Ca> = None;
     let mut ca_pem: Option<Vec<u8>> = read(tls.as_ref(), CA_CERT, 64 * 1024)?;
-    let rotate = rotating || (plan.rotate_ca && exposed.is_some());
+    // --rotate-ca always rotates: also a CA whose certificate and key do not belong together.
+    let rotate = rotating || plan.rotate_ca;
     let make_ca = !exists(tls.as_ref(), CA_KEY)? || rotate;
     if make_ca {
         if ctx.checking() {
@@ -631,6 +662,15 @@ pub fn root_apply(
             ctx.remove(dfd.as_ref(), &d, registration::RECORD)?;
         }
     }
+    // What the gateway trusts changed in this step: a running gateway must restart on it (or stop, with nothing to
+    // trust). The marker is root's, in the developer's run folder, so their side can remove it once launchd
+    // confirms; until then every install finishes it first.
+    let trust_after = registration::trust_digest(l);
+    if !ctx.checking() && trust_after != trust_before {
+        let stop = !l.gateway_toml().exists();
+        let marker = registration::RestartPending::new(stop, trust_after);
+        ctx.file(run.as_ref(), &l.run_dir(), registration::RESTART_PENDING, &marker.bytes(), 0o644, root)?;
+    }
     if let Some(inputs) = &plan.adapter {
         let issuer = identity::issuer(&binding.env, &binding.org)?;
         let cfg = adapter::config_bytes(l, &binding.org, inputs, &issuer)?;
@@ -663,14 +703,7 @@ pub fn root_apply(
     ctx.link(ofd.as_ref(), &opt, "current", &format!("releases/{release}"))?;
 
     // The records EKKA's desk commands build a grant from. The desk image only by a published, pinned digest.
-    records::write(ctx, top, &records_dir, root, pins.desk_image.as_ref(), plan.resources)?;
-    if pins.desk_image.is_none() {
-        // No published image is pinned: an image record left from before is taken out of the runner's reach (kept
-        // beside it, renamed, as evidence), so desks wait closed rather than run an image nobody pinned.
-        let fd = ctx.trusted_dir(top, &records_dir, root.uid, 0o755)?;
-        let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
-        ctx.quarantine(fd.as_ref(), &records_dir, records::IMAGE, &format!("{}.unpinned-{stamp}", records::IMAGE))?;
-    }
+    // A raise is logged (and saved to disk) before the raised ceiling is written: never a raise without its record.
     if raised {
         let old = old_ceiling.expect("raised implies a ceiling").resources;
         let note = serde_json::json!({"schema": "ekka-desk-host.ceiling-raise/v1",
@@ -681,6 +714,14 @@ pub fn root_apply(
         let mut log = read(ekka_dev.as_ref(), CEILING_RAISES, 1024 * 1024)?.unwrap_or_default();
         log.extend_from_slice(&line);
         ctx.file(ekka_dev.as_ref(), &l.ekka_dev(), CEILING_RAISES, &log, 0o644, root)?;
+    }
+    records::write(ctx, top, &records_dir, root, pins.desk_image.as_ref(), plan.resources)?;
+    if pins.desk_image.is_none() {
+        // No published image is pinned: an image record left from before is taken out of the runner's reach (kept
+        // beside it, renamed, as evidence), so desks wait closed rather than run an image nobody pinned.
+        let fd = ctx.trusted_dir(top, &records_dir, root.uid, 0o755)?;
+        let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
+        ctx.quarantine(fd.as_ref(), &records_dir, records::IMAGE, &format!("{}.unpinned-{stamp}", records::IMAGE))?;
     }
     Ok(binding)
 }
@@ -744,7 +785,7 @@ pub(crate) mod tests {
             },
             gateway_staged: staged,
             adapter_staged: None,
-            resources: Resources { max_cpu_millicores: 4000, max_memory_mib: 8192 },
+            resources: Some(Resources { max_cpu_millicores: 4000, max_memory_mib: 8192 }),
             registration: None,
             adapter: None,
             rotate_ca: false,
@@ -801,7 +842,7 @@ pub(crate) mod tests {
         let before = snapshot(r.dir.path());
         let mut foreign = r.plan.clone();
         foreign.want.org = FOREIGN.into();
-        foreign.resources.max_memory_mib = 1024;
+        foreign.resources.as_mut().unwrap().max_memory_mib = 1024;
         for mut ctx in [Ctx::check(), Ctx::apply()] {
             let e = root_apply(&foreign, &r.layout, owners(), &r.pins, &r.roots, &mut ctx).unwrap_err();
             assert_eq!(e.kind, crate::error::Kind::Refused);
@@ -963,6 +1004,76 @@ pub(crate) mod tests {
         assert!(!r.layout.gateway_toml().exists() && !record.exists());
     }
 
+    #[test]
+    fn a_trust_change_leaves_a_root_owned_restart_marker_until_the_developers_side_confirms() {
+        let mut r = rig();
+        registered(&mut r, owners());
+        let marker = r.layout.run_dir().join(registration::RESTART_PENDING);
+        let read =
+            || -> registration::RestartPending { serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap() };
+        assert_eq!(read().action, "restart", "the registration changed what the gateway trusts");
+        assert_eq!(read().trust_digest, registration::trust_digest(&r.layout));
+        // Confirmed by launchd on the developer's side: removed there. A same-org retry then changes nothing.
+        std::fs::remove_file(&marker).unwrap();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(!marker.exists());
+        // The registration taken away: the configuration goes, and the gateway must stop.
+        let mut none = r.plan.clone();
+        none.registration = None;
+        root_apply(&none, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert_eq!(read().action, "stop");
+        // A malformed or production registration stops it the same way, with no error before the cleanup.
+        registered(&mut r, owners());
+        let mut prod = crate::registration::tests::answer(&Binding::read(&r.layout.binding()).unwrap().unwrap());
+        prod["gateway"]["gateway_id"] = "urn:ekka:desk-gateway:production:0b6f4a52-1c3d-4e5f-8a9b-0c1d2e3f4a5b".into();
+        let mut bad = r.plan.clone();
+        bad.registration = Some(Registration::from_answer(&prod).unwrap());
+        root_apply(&bad, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(!r.layout.gateway_toml().exists());
+        assert_eq!(read().action, "stop");
+    }
+
+    #[test]
+    fn a_raise_is_logged_before_the_ceiling_is_written() {
+        let r = rig();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        // Make the records write fail at its first file: the raise must already be on record.
+        let base = r.layout.records().join(records::BASELINE);
+        std::fs::remove_file(&base).unwrap();
+        std::fs::create_dir(&base).unwrap();
+        let mut up = r.plan.clone();
+        up.resources.as_mut().unwrap().max_memory_mib += 1024;
+        up.raise_ceiling = true;
+        assert!(root_apply(&up, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).is_err());
+        assert!(r.layout.ekka_dev().join(CEILING_RAISES).exists(), "logged before it was committed");
+    }
+
+    #[test]
+    fn a_legacy_binding_anyone_else_could_have_written_is_refused() {
+        let r = rig();
+        plant_legacy(&r.layout, me().uid, ORG);
+        std::fs::set_permissions(r.layout.d().join(LEGACY_BINDING), std::fs::Permissions::from_mode(0o666)).unwrap();
+        let e = root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::check()).unwrap_err();
+        assert!(e.reason.contains("is not trusted"), "{e}");
+        std::fs::set_permissions(r.layout.d().join(LEGACY_BINDING), std::fs::Permissions::from_mode(0o644)).unwrap();
+        crate::acl::tests::plant(&r.layout.d(), "everyone allow add_file,delete_child");
+        assert!(root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::check()).is_err());
+    }
+
+    #[test]
+    fn rotate_ca_always_rotates_even_a_protected_key_with_the_wrong_certificate() {
+        let r = rig();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let (_, _, other_ca) = Ca::generate("99999999-2222-4333-8444-555555555555").unwrap();
+        std::fs::write(r.layout.tls_dir().join(CA_CERT), other_ca).unwrap();
+        let mut rotate = r.plan.clone();
+        rotate.rotate_ca = true;
+        root_apply(&rotate, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let ca = std::fs::read(r.layout.tls_dir().join(CA_CERT)).unwrap();
+        let key = String::from_utf8(std::fs::read(r.layout.tls_dir().join(CA_KEY)).unwrap()).unwrap();
+        assert!(tls::cert_matches_key(&ca, &key).unwrap());
+    }
+
     /// A binding as the first release wrote it, in `ekka-dev/<uid>/`.
     fn plant_legacy(l: &Layout, uid: u32, org: &str) -> Binding {
         let dir = l.ekka_dev().join(uid.to_string());
@@ -1014,14 +1125,14 @@ pub(crate) mod tests {
         let ceiling = r.layout.records().join(records::CEILING);
         let before = std::fs::read(&ceiling).unwrap();
         let mut up = r.plan.clone();
-        up.resources.max_memory_mib += 1024;
+        up.resources.as_mut().unwrap().max_memory_mib += 1024;
         for mut ctx in [Ctx::check(), Ctx::apply()] {
             let e = root_apply(&up, &r.layout, owners(), &r.pins, &r.roots, &mut ctx).unwrap_err();
             assert!(e.reason.contains("--raise-ceiling"), "{e}");
         }
         assert_eq!(std::fs::read(&ceiling).unwrap(), before, "not raised without asking");
         let mut down = r.plan.clone();
-        down.resources.max_cpu_millicores -= 1000;
+        down.resources.as_mut().unwrap().max_cpu_millicores -= 1000;
         root_apply(&down, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
         assert!(!r.layout.ekka_dev().join(CEILING_RAISES).exists(), "going down is not a raise");
         up.raise_ceiling = true;
@@ -1030,7 +1141,7 @@ pub(crate) mod tests {
         assert_eq!(log.lines().count(), 1, "{log}");
         assert!(log.contains("\"to\":{\"max_cpu_millicores\":4000,\"max_memory_mib\":9216}"), "{log}");
         let mut over = up.clone();
-        over.resources.max_memory_mib = records::MAX_DESK_MEMORY_MIB + 1;
+        over.resources.as_mut().unwrap().max_memory_mib = records::MAX_DESK_MEMORY_MIB + 1;
         assert!(
             root_apply(&over, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).is_err(),
             "never above the maxima"
@@ -1062,7 +1173,7 @@ pub(crate) mod tests {
         root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
         let ca = std::fs::read(r.layout.tls_dir().join(CA_CERT)).unwrap();
         let mut plan = r.plan.clone();
-        plan.resources.max_memory_mib = 4096;
+        plan.resources.as_mut().unwrap().max_memory_mib = 4096;
         let mut ctx = Ctx::apply();
         root_apply(&plan, &r.layout, owners(), &r.pins, &r.roots, &mut ctx).unwrap();
         assert_eq!(ctx.changes.len(), 1, "{:?}", ctx.changes);
@@ -1087,13 +1198,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_plan_that_is_not_well_formed_is_refused() {
+        // (A production or malformed registration is not refused here: it fails closed, its trust removed; see
+        // a_trust_change_leaves_a_root_owned_restart_marker_until_the_developers_side_confirms.)
         let r = rig();
-        let mut p = r.plan.clone();
-        let mut b =
-            crate::registration::tests::answer(&Want { uid: 501, ..r.plan.want.clone() }.new_binding().unwrap());
-        b["gateway"]["gateway_id"] = "urn:ekka:desk-gateway:production:0b6f4a52-1c3d-4e5f-8a9b-0c1d2e3f4a5b".into();
-        p.registration = Some(Registration::from_answer(&b).unwrap());
-        assert!(root_apply(&p, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::check()).is_err());
         let mut p = r.plan.clone();
         p.gateway_staged = PathBuf::from("relative/path");
         assert!(root_apply(&p, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::check()).is_err());
@@ -1131,7 +1238,7 @@ pub(crate) mod tests {
         root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
         let ceiling = std::fs::read(r.layout.records().join(records::CEILING)).unwrap();
         let mut wide = r.plan.clone();
-        wide.resources = Resources { max_cpu_millicores: 64_000, max_memory_mib: 262_144 };
+        wide.resources = Some(Resources { max_cpu_millicores: 64_000, max_memory_mib: 262_144 });
         for mut ctx in [Ctx::check(), Ctx::apply()] {
             assert!(root_apply(&wide, &r.layout, owners(), &r.pins, &r.roots, &mut ctx).is_err());
         }
@@ -1164,7 +1271,7 @@ pub(crate) mod tests {
             let mut second = r.plan.clone();
             second.want.uid = other_uid;
             second.want.org = org.into();
-            second.resources.max_memory_mib = 1024;
+            second.resources.as_mut().unwrap().max_memory_mib = 1024;
             let layout = Layout { uid: other_uid, ..r.layout.clone() };
             for mut ctx in [Ctx::check(), Ctx::apply()] {
                 let e = root_apply(&second, &layout, owners(), &r.pins, &r.roots, &mut ctx).unwrap_err();

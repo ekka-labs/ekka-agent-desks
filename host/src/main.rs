@@ -38,12 +38,12 @@ const HELP: &str = "ekka-desk-host: installs and checks one EKKA desk host (this
 
   ekka-desk-host install --profile developer-native --runtime docker-desktop \\
       --env <env> --org <tenant id> --identity-profile <file> \\
-      [--ekka <absolute path>] [--desk-cpu-millicores <n> --desk-memory-mib <n> [--raise-ceiling]] [--rotate-ca]
+      [--ekka <absolute path>] [--rotate-ca]
       Installs for the developer running it, run from /usr/local/libexec/ekka-desk-host/ekka-desk-host (root's).
       Asks for the password once, and only when something root owns must change. One installation per Mac:
       another organization, developer or environment is refused before any change. --rotate-ca replaces an
-      installation CA whose key is no longer root's alone, and the gateway certificate with it. A desk ceiling
-      only goes down unless --raise-ceiling is given; every raise is recorded.
+      installation CA whose key is no longer root's alone, and the gateway certificate with it. Desks on a
+      developer's Mac have no CPU or memory limit of their own in this release; Docker Desktop's VM bounds them.
 
   ekka-desk-host status [--json]     what this host observes, with a reason for each failure
   ekka-desk-host doctor [--json]     status, and live probes that change nothing
@@ -183,6 +183,7 @@ fn run(args: Vec<String>) -> Result<ExitCode> {
                 let mut all = s.checks.clone();
                 all.push(s.bootstrap.clone());
                 print_checks(s.ok, &all);
+                println!("note: {}", s.desk_limits);
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -193,6 +194,7 @@ fn run(args: Vec<String>) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&d).map_err(|e| refused(e.to_string()))?);
             } else {
                 print_checks(d.ok, &d.checks);
+                println!("note: {}", d.desk_limits);
             }
             Ok(if d.ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
         }
