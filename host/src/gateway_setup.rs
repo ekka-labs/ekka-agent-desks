@@ -5,7 +5,7 @@
 //! setup --local` does it) and gets an authorization `ekds_...`, said once. It reaches this command on stdin only:
 //! never as an argument or an environment variable, where other processes on the Mac could read it, and never typed
 //! at a terminal. This command checks it can use a pass before it spends the authorization: the gateway's admin
-//! client is there and the gateway answers with verified TLS. It then redeems the authorization once at
+//! client (`gateway_grpc`, OpenShell's gRPC) is made and the gateway answers with verified TLS. It then redeems the authorization once at
 //! `{issuer}/token` (RFC 8693, Govern's desk-pass contract section 3d) for a setup pass of at most 120 s, held in
 //! memory, and brings the gateway to the desired state (`bootstrap::reconcile`): the `desks` workspace, the Enclave
 //! and the adapter as ordinary members, the provider profiles, each read back. A second run changes nothing; a run
@@ -294,34 +294,31 @@ impl SetupPass for GovernExchange<'_> {
     }
 }
 
-/// The gateway's admin API is gRPC (OpenShell v0.1.9) and this build has no gRPC client yet: no call is ever made,
-/// and `available` says so before any authorization is redeemed.
-pub struct NoAdminClient;
+/// A gateway admin client that could not be made (its CA unreadable, say): no call is ever made, and `available`
+/// says why before any authorization is redeemed.
+pub struct Unavailable(pub String);
 
-pub const NO_ADMIN_CLIENT: &str = "this build of ekka-desk-host has no client for the gateway's admin API (gRPC), \
-                                   so the gateway's setup cannot run yet";
-
-impl GatewayAdmin for NoAdminClient {
+impl GatewayAdmin for Unavailable {
     fn available(&self) -> std::result::Result<(), String> {
-        Err(NO_ADMIN_CLIENT.into())
+        Err(self.0.clone())
     }
     fn workspace_exists(&mut self, _: &Pass, _: &str) -> std::result::Result<bool, Stop> {
-        Err(Stop::Pending(NO_ADMIN_CLIENT.into()))
+        Err(Stop::Pending(self.0.clone()))
     }
     fn create_workspace(&mut self, _: &Pass, _: &str) -> std::result::Result<(), Stop> {
-        Err(Stop::Pending(NO_ADMIN_CLIENT.into()))
+        Err(Stop::Pending(self.0.clone()))
     }
     fn members(&mut self, _: &Pass, _: &str) -> std::result::Result<Vec<Member>, Stop> {
-        Err(Stop::Pending(NO_ADMIN_CLIENT.into()))
+        Err(Stop::Pending(self.0.clone()))
     }
     fn add_member(&mut self, _: &Pass, _: &str, _: &Member) -> std::result::Result<(), Stop> {
-        Err(Stop::Pending(NO_ADMIN_CLIENT.into()))
+        Err(Stop::Pending(self.0.clone()))
     }
     fn profiles(&mut self, _: &Pass) -> std::result::Result<Vec<ProviderProfile>, Stop> {
-        Err(Stop::Pending(NO_ADMIN_CLIENT.into()))
+        Err(Stop::Pending(self.0.clone()))
     }
     fn import_profiles(&mut self, _: &Pass, _: &[ProviderProfile]) -> std::result::Result<(), Stop> {
-        Err(Stop::Pending(NO_ADMIN_CLIENT.into()))
+        Err(Stop::Pending(self.0.clone()))
     }
 }
 
@@ -520,11 +517,17 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
     let authorization = read_authorization(std::env::vars_os(), &mut std::io::stdin().lock(), terminal)?;
     let ca = std::fs::read(l.tls_dir().join(macos::CA_CERT)).unwrap_or_default();
     let addr = std::net::SocketAddr::from((crate::tls::GATEWAY_IP, macos::GATEWAY_PORT));
+    // The gateway's admin API over TLS that trusts this installation's CA only, by the gateway's own name.
+    let mut gateway: Box<dyn GatewayAdmin> =
+        match crate::gateway_grpc::GatewayGrpc::new(&format!("https://{addr}"), &ca, crate::tls::GATEWAY_DNS) {
+            Ok(g) => Box::new(g),
+            Err(e) => Box::new(Unavailable(format!("the gateway's admin client: {}", e.reason))),
+        };
     let result = setup(
         &ctx,
         authorization,
         &mut crate::net::Https,
-        &mut NoAdminClient,
+        gateway.as_mut(),
         &mut || crate::tls::probe(addr, crate::tls::GATEWAY_DNS, &ca).map_err(|e| e.reason),
         &mut |r| keep_record(&l, owners, r),
         &SystemTime::now,
@@ -774,9 +777,12 @@ mod tests {
     fn without_an_admin_client_or_a_gateway_the_authorization_is_never_spent() {
         let (r, ctx) = installed();
         let mut govern = FakeGovern::passes(1);
-        let res = run(&r, &ctx, &mut govern, &mut NoAdminClient);
+        let res = run(&r, &ctx, &mut govern, &mut Unavailable("no CA to trust".into()));
         assert_eq!((res.state, res.authorization_used, res.exit_code()), (State::Waiting, false, 4));
-        assert!(res.reason.as_deref().unwrap().contains("gRPC") && res.reason.as_deref().unwrap().contains("not used"));
+        assert!(
+            res.reason.as_deref().unwrap().contains("no CA to trust")
+                && res.reason.as_deref().unwrap().contains("not used")
+        );
         let down = setup(
             &ctx,
             auth(),
@@ -805,6 +811,44 @@ mod tests {
             &std::fs::metadata(r.layout.gateway_dir().join(RECORD)).unwrap().permissions(),
         );
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// The whole command's path with its real parts: Govern's exchange (faked at its token endpoint), the gRPC client,
+    /// and a fake OpenShell gateway over TLS from an installation CA.
+    #[test]
+    fn gateway_setup_completes_over_grpc_and_a_second_run_changes_nothing() {
+        let (r, ctx) = installed();
+        let served = crate::gateway_grpc::tests::serve();
+        let mut govern = FakeGovern {
+            answers: vec![
+                (
+                    200,
+                    r#"{"access_token":"setup-pass-for-the-fake-gateway","token_type":"Bearer","expires_in":120}"#
+                        .into()
+                );
+                2
+            ],
+            forms: Vec::new(),
+            urls: Vec::new(),
+        };
+        for round in 0..2 {
+            let mut gw =
+                crate::gateway_grpc::GatewayGrpc::new(&served.uri, &served.ca_pem, crate::tls::GATEWAY_DNS).unwrap();
+            let res = setup(
+                &ctx,
+                auth(),
+                &mut govern,
+                &mut gw,
+                &mut || Ok(()),
+                &mut |rec| keep_record(&r.layout, owners(), rec),
+                &SystemTime::now,
+            );
+            assert_eq!((res.state, res.exit_code(), res.authorization_used), (State::Done, 0, true), "{res:?}");
+            assert_eq!(res.changed.is_empty(), round == 1, "{round}: {:?}", res.changed);
+            assert_eq!(check(&r.layout, owners()), Ok(()));
+        }
+        let st = served.fake.0.lock().unwrap();
+        assert_eq!((st.workspaces.len(), st.members.len(), st.profiles.len()), (1, 2, 4));
     }
 
     #[test]

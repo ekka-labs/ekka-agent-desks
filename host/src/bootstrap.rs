@@ -27,9 +27,7 @@ impl Pass {
     pub fn new(token: String, expires_at: SystemTime) -> Self {
         Pass { token, expires_at }
     }
-    /// The bearer, for the gateway call that needs it and nothing else. Only the gateway's admin client reads it,
-    /// and this build has none yet (`gateway_setup::NoAdminClient`); the tests' fake gateway does.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The bearer, for the gateway call that needs it and nothing else (`gateway_grpc`).
     pub fn bearer(&self) -> &str {
         &self.token
     }
@@ -99,6 +97,10 @@ pub trait GatewayAdmin {
     fn add_member(&mut self, pass: &Pass, workspace: &str, member: &Member) -> Result<(), Stop>;
     fn profiles(&mut self, pass: &Pass) -> Result<Vec<ProviderProfile>, Stop>;
     fn import_profiles(&mut self, pass: &Pass, profiles: &[ProviderProfile]) -> Result<(), Stop>;
+    /// Whether a profile the gateway holds (`have`, as `profiles` gave it) is this release's (`want`).
+    fn same_definition(&self, have: &Value, want: &Value) -> bool {
+        have == want
+    }
 }
 
 /// The state setup brings the gateway to.
@@ -194,7 +196,7 @@ pub fn reconcile(
         want.profiles.iter().filter(|p| !have.iter().any(|h| h.name == p.name)).cloned().collect();
     for p in &want.profiles {
         if let Some(h) = have.iter().find(|h| h.name == p.name) {
-            if h.definition != p.definition {
+            if !gateway.same_definition(&h.definition, &p.definition) {
                 r.problems.push(format!(
                     "the {} profile at the gateway differs from this release's; it was left as it is",
                     p.name
@@ -219,7 +221,7 @@ pub fn reconcile(
     }
     let profiles = gateway.profiles(live(&pass, now)?)?;
     for p in &want.profiles {
-        if !profiles.contains(p) {
+        if !profiles.iter().any(|h| h.name == p.name && gateway.same_definition(&h.definition, &p.definition)) {
             r.problems.push(format!("the {} profile does not read back exactly", p.name));
         }
     }

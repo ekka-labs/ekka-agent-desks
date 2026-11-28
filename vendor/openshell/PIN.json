@@ -1,0 +1,13 @@
+{
+  "source": "https://github.com/NVIDIA/OpenShell/tree/v0.1.9/proto",
+  "tag": "v0.1.9",
+  "commit": "ce58cf8e9b953281352d98a637e41616295b1318",
+  "about": "NVIDIA OpenShell's gRPC definitions, byte for byte at the gateway release the Mac host pins (deploy/pins.json openshell.version). ekka-desk-host generates its gateway client from them at build time; nothing is edited. A new OpenShell version is a new pin: copy the files from that commit and update these hashes in the same change.",
+  "files": {
+    "proto/datamodel.proto": "e50bd875a760f54b80269c65ee47984cae424fb623b7f59551ba62550c23e70b",
+    "proto/openshell.proto": "679653bdfb94c891cef8b65a713944c12d9ed82b1e52a0110192336d608e6e58",
+    "proto/options.proto": "b0e03562c92777978f6f3e0f46260cdb82f1d88d1c1837eab0e53cdd0f195eb7",
+    "proto/sandbox.proto": "20466672241d2d16e199c58bf7e88b824b22768c69a77efda0360d02f94c721b",
+    "LICENSE": "d07c0367e2861e7fe70fa1b679f879f4fa2f9138ade4457d44ecf8b2e135bb45"
+  }
+}

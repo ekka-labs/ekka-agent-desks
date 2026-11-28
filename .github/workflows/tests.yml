@@ -69,6 +69,19 @@ jobs:
             | jq -r 'select(.profile.test == true and .target.name == "ekka-desk-host") | .executable' | head -1)
           [[ -n $bin && -x $bin ]] || { echo "::error::the test program was not built"; exit 1; }
           sudo "$bin" --ignored --exact apply::tests::root_a_developer_cannot_replace_a_record_nor_read_the_ca_key
+  host-deny:
+    # ekka-desk-host's crates (host/Cargo.lock): allowed licenses, crates.io only, no banned crate, and no RustSec
+    # advisory, by host/deny.toml, the shape EKKA's backend adapter checks its own crates with.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1 (cargo-deny 0.20.2)
+        with:
+          manifest-path: host/Cargo.toml
+          command: check bans licenses sources advisories
   unittest-python39:
     # The same suite on Amazon Linux 2023's own python3, which is 3.9 (a supported server, README). The gateway
     # preflight once imported tomllib (3.11+) and so could not start a gateway there at all.

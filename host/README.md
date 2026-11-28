@@ -82,8 +82,8 @@ read: an argument, an environment variable or a terminal is refused. The command
 it redeems the authorization once for a two-minute setup pass, then makes the `desks` workspace, adds the Enclave and
 the adapter as members and imports the provider profiles, reading each back. A second run changes nothing; a run the
 pass outlives stops, and a fresh authorization finishes it. Exit 0 means set up, 4 waiting, 3 refused, 1 failed.
-The gateway's admin API is gRPC, and this release has no client for it yet: the command stops before it spends the
-authorization, and says so.
+It speaks the gateway's admin API (OpenShell v0.1.9's gRPC, from its `.proto` files vendored in
+`vendor/openshell`) over TLS that trusts only this installation's CA, with the setup pass as the bearer.
 
 ## A local build (dev only)
 
