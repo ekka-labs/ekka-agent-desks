@@ -65,5 +65,33 @@
     "digest": "sha256:6b602a6ff6a4ef33d7d90e6ea6da15fddd606e4ed6bae3d6d9862c13298eb840",
     "release_workflow": ".github/workflows/release.yml",
     "cosign_image": "gcr.io/projectsigstore/cosign:v2.6.5@sha256:ad281047f85c5e1fc6ffbc30c2b55be3b07b4032bef715a12122ce5829619aca"
+  },
+  "macos": {
+    "about": "The native Mac desk host (ekka-desk-host, host/). Apple Silicon only. Each archive is checked against its sha256 here AND its publisher's checksum entry, and the program inside it against its own sha256, before anything is installed.",
+    "gateway": {
+      "release_asset": "openshell-gateway-aarch64-apple-darwin.tar.gz",
+      "release_checksums": "openshell-gateway-checksums-sha256.txt",
+      "archive_sha256": "b348a57b97dc755d6a668631d328dd03fa88dc1b3565f16a094c9c59a420c51a",
+      "binary": "openshell-gateway",
+      "binary_sha256": "b0deae91da3b3a58d33410da8ff26f3a7423d8db45bf677796fa6b220f7637fd"
+    },
+    "ekka_backend": {
+      "todo": "Not published yet. Pin version, archive_sha256 and binary_sha256 from the tagged ekka-backend release once its Darwin artifact is out; until then the host installs no adapter and says so.",
+      "release": "https://github.com/ekka-labs/ekka-backend/releases/download",
+      "version": null,
+      "release_asset": "ekka-backend-aarch64-apple-darwin.tar.gz",
+      "release_checksums": "ekka-backend-checksums-sha256.txt",
+      "archive_sha256": null,
+      "binary": "ekka-backend",
+      "binary_sha256": null
+    },
+    "meter": {
+      "image": "docker.io/library/busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"
+    },
+    "desk_image": {
+      "todo": "No published desk image for linux/arm64 yet. Pin its repository@digest and its content id (sha256 of its image config) once one is published; until then the host writes no desk-image record and desks wait, closed. An image built on the Mac is never recorded.",
+      "image": null,
+      "image_id": null
+    }
   }
 }

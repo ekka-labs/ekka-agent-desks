@@ -1,0 +1,29 @@
+{
+  "schema": "ekka-desk-host.identity-profile/v3",
+  "org": "7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
+  "registration": {
+    "gateway": {
+      "gateway_id": "urn:ekka:desk-gateway:development:0b6f4a52-1c3d-4e5f-8a9b-0c1d2e3f4a5b",
+      "tenant_id": "7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
+      "node_id": "2f8e7d6c-5b4a-4392-8170-6e5d4c3b2a19",
+      "installation_id": "5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d",
+      "class": "development",
+      "endpoint": "https://host.docker.internal:8080",
+      "workspace": "desks",
+      "adapter_kid": "example-thumbprint",
+      "registered_at": "2026-11-28T00:00:00.000Z",
+      "oidc": {
+        "issuer": "https://govern.ekka.ai/oidc/orgs/7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
+        "audience": "urn:ekka:desk-gateway:development:0b6f4a52-1c3d-4e5f-8a9b-0c1d2e3f4a5b",
+        "jwks_uri": "https://govern.ekka.ai/oidc/orgs/7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7/jwks.json",
+        "token_endpoint": "https://govern.ekka.ai/oidc/orgs/7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7/token",
+        "roles_claim": "ekka_roles.development",
+        "scopes_claim": "scope",
+        "admin_role": "openshell-admin",
+        "user_role": "openshell-user",
+        "jwks_ttl_secs": 300
+      }
+    },
+    "created": true
+  }
+}

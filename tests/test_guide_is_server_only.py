@@ -2,8 +2,10 @@
 guide; we will work on local mac version at some later date").
 
 No guide page shows a local install, the Mac helper or a mounted checkout, and no page links one of the removed
-pages. "Mac" appears only where a person on a Mac connects to the server (docs/SERVER.md, step 6) and where the guide
-says a Mac cannot be the server. The local-install code itself was removed.
+pages. "Mac" appears only where a person on a Mac connects to the server (docs/SERVER.md, step 6), where the guide
+says a Mac cannot be the server, and in the one security section that states the trust boundary of a developer's Mac
+host (docs/SECURITY.md, MAC_SECTION), which the native host tool in host/ installs. The local-install code itself was
+removed.
 """
 import os
 import re
@@ -28,13 +30,20 @@ MAC_ALLOWED = {
 }
 
 
+# The one section allowed to name a developer's Mac: its security boundary, from its heading to the next heading.
+MAC_SECTION = ("docs/SECURITY.md", "## A developer's Mac")
+
+
 def problems(pages):
     found = []
     for name, text in pages:
+        in_mac_section = False
         for number, line in enumerate(text.splitlines(), 1):
+            if line.startswith("## "):
+                in_mac_section = (name, line) == MAC_SECTION
             if FORBIDDEN.search(line):
                 found.append(f"{name}:{number}: {FORBIDDEN.search(line).group(0)}")
-            elif MAC.search(line) and not any(a in line for a in MAC_ALLOWED.get(name, ())):
+            elif MAC.search(line) and not in_mac_section and not any(a in line for a in MAC_ALLOWED.get(name, ())):
                 found.append(f"{name}:{number}: {MAC.search(line).group(0)}")
     return found
 

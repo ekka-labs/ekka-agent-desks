@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Written by ekka-desk-host for one service of an EKKA desk host. Do not edit: install writes it again.
+  A per-user LaunchAgent: it runs as the developer who logs in, never as root, and only in that user's
+  login session (LimitLoadToSessionType Aqua), where the login Keychain and Docker Desktop are.
+  Every path is absolute; every value is filled in by ekka-desk-host from checked settings.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@@LABEL@@</string>
+  <key>ProgramArguments</key>
+  <array>
+@@ARGUMENTS@@
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+@@ENVIRONMENT@@
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>@@WORKING_DIRECTORY@@</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>@@LOG@@</string>
+  <key>StandardErrorPath</key>
+  <string>@@LOG@@</string>
+</dict>
+</plist>

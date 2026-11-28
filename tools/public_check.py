@@ -2,8 +2,9 @@
 
 This repository is public. A file, a commit message or a pull request's text here must carry none of:
 - an email address, quoted or not, except the reserved example domains (example.com, example.net, example.org);
-- a reference to a private EKKA repository. The one name allowed is the vendored contracts' package,
-  written exactly as its package name with the leading at sign;
+- a reference to a private EKKA repository. The names allowed are the vendored contracts' package, written exactly
+  as its package name with the leading at sign, and the published identity that signs EKKA's runner releases
+  (SIGNER), written exactly;
 - a link to a coding-assistant session, or a co-author trailer.
 Exit 0 when clean, 1 with one line per hit. A hit names its kind and where it is (file and line), never the value
 it found: CI logs are public too, so printing the value would publish it. CI runs this on every pull request's
@@ -19,8 +20,19 @@ MAIL = re.compile(r"(?:\"(?![\s:,+{}\[\]]*\")[^\"\n]+\"|[a-z0-9._%+-]+)@" + DOMA
 EXAMPLE = re.compile(r"(?:^|\.)example\.(?:com|net|org)$", re.I)
 PRIVATE_REPO = re.compile(r"(?<![\w.-])@?ekka-ai/[a-z0-9._-]+", re.I)
 PACKAGE = "@ekka-" + "ai/contracts"   # split, so this file passes its own check
+# The one repository path allowed, exactly where it is the identity that signs EKKA's runner releases: the keyless
+# Sigstore certificate's subject. EKKA already publishes this identity in get.ekka.ai/install.sh and in the public
+# Sigstore transparency log, and the Mac host tool must name it to check an `ekka` program came from that release.
+# Exactly this prefix; the same repository path anywhere else is still refused.
+SIGNER = "https://github.com/ekka-" + "ai/ekka-runner/.github/workflows/release-binaries.yml@refs/tags/v"
 SESSION = re.compile(r"claude\.ai/code/" + "session", re.I)
 TRAILER = re.compile(r"^\s*co-authored-" + r"by:", re.I | re.M)
+
+
+def signer_at(text, pos):
+    """Whether the repository path found at `pos` is part of the exact release-signer identity (SIGNER)."""
+    start = pos - len("https://github.com/")
+    return start >= 0 and text.startswith(SIGNER, start)
 
 
 def hits(text):
@@ -31,7 +43,7 @@ def hits(text):
         return text.count("\n", 0, pos) + 1
     found += [("email address", line_of(m.start())) for m in MAIL.finditer(text) if not EXAMPLE.search(m.group(1))]
     found += [("private repository reference", line_of(m.start())) for m in PRIVATE_REPO.finditer(text)
-              if m.group(0).lower() != PACKAGE]
+              if m.group(0).lower() != PACKAGE and not signer_at(text, m.start())]
     found += [("coding-assistant session link", line_of(m.start())) for m in SESSION.finditer(text)]
     found += [("co-author trailer", line_of(m.start())) for m in TRAILER.finditer(text)]
     return found
