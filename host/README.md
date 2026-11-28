@@ -59,6 +59,44 @@ bounds them, and EKKA's room check still holds jobs while the VM is short of mem
 and `--desk-cpu-millicores` and `--desk-memory-mib` are refused. A later release gives a desk on a Mac its own CPU
 and memory limit.
 
+## The adapter's signing key
+
+`install` makes one ES256 (P-256) key for the backend adapter at `/private/var/db/ekka-dev/<uid>/backend/adapter-key.pem`,
+yours alone (mode 0600), once. It is never replaced silently: a key that is not safe to use, or not the one Govern
+registered, is reported and left as it is, and only `install --rotate-adapter-key` replaces it (then register the new
+key). `status --json` shows its public half and thumbprint as `adapter_public_jwk` and `adapter_kid`, for registering
+the gateway; it never shows the key.
+
+The adapter's configuration gets the desk-pass sign-in (`backend_gateway.signin`) only when the gateway's
+registration is this installation's, Govern registered this key, and the pinned adapter release reads it. No adapter
+release reads it yet, so this release never writes it, and `status` says why (`adapter_signin`).
+
+## The gateway's one-time setup
+
+```sh
+<one-time setup authorization> | /usr/local/libexec/ekka-desk-host/ekka-desk-host gateway-setup --json
+```
+
+`ekka desk setup --local` opens the authorization (`ekds_...`) at Govern and passes it on stdin, the only place it is
+read: an argument, an environment variable or a terminal is refused. The command checks the gateway answers before
+it redeems the authorization once for a two-minute setup pass, then makes the `desks` workspace, adds the Enclave and
+the adapter as members and imports the provider profiles, reading each back. A second run changes nothing; a run the
+pass outlives stops, and a fresh authorization finishes it. Exit 0 means set up, 4 waiting, 3 refused, 1 failed.
+The gateway's admin API is gRPC, and this release has no client for it yet: the command stops before it spends the
+authorization, and says so.
+
+## A local build (dev only)
+
+```sh
+ekka-desk-host install ... --env dev --local-build <dir>
+```
+
+`<dir>/local-build.json` names your own builds of `ekka`, the backend adapter and the desk image by sha256 (or image
+id), in place of the signed releases; any part it leaves out is the release. It is refused for staging and prod.
+Every check made before a program runs stays; only the release's signature is replaced by the hash. Root hashes the
+adapter itself before it changes anything. `status` and `doctor` print `LOCAL BUILD, NOT A SIGNED RELEASE (dev only)`
+for each replaced part, and root keeps a `local-build.json` marker beside the records.
+
 The identity profile is `deploy/macos/identity-profile.sample.json` in shape. It holds the organization, and,
 once the gateway is registered, Govern's answer to that registration. The security boundary of a developer's Mac is in
 [Security and data](../docs/SECURITY.md#a-developers-mac).

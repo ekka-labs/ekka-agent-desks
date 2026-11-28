@@ -183,6 +183,59 @@ pub fn private_dir(parent: &OwnedFd, name: &str, what: &Path, uid: u32) -> Resul
     Ok(Some(fd))
 }
 
+/// The regular file at the absolute `path`, opened one name at a time from `/` without following a link: every
+/// folder on the way and the file itself owned by root or `uid`, writable by nobody else, with no access control
+/// list letting anyone else change it. For reading a developer's own file as root, so nothing on the way can be
+/// swapped for something else.
+pub fn open_owned_path(path: &Path, uid: u32) -> Result<OwnedFd> {
+    let rel = path.strip_prefix("/").map_err(|_| refused(format!("{} is not an absolute path", path.display())))?;
+    let names: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) => Ok(n),
+            _ => Err(refused(format!("{} has a part that is not a plain name", path.display()))),
+        })
+        .collect::<Result<_>>()?;
+    let (file, dirs) = names.split_last().ok_or_else(|| refused(format!("{} names no file", path.display())))?;
+    let owned = |fd: &OwnedFd, at: &Path| -> Result<rustix::fs::Stat> {
+        let st = fstat(fd).map_err(|e| errno(format!("reading {}", at.display()), e))?;
+        if (st.st_uid != 0 && st.st_uid != uid) || mode_bits(st.st_mode) & 0o022 != 0 {
+            return Err(refused(format!(
+                "{} is uid {} mode {:o}: it and every folder above it must be root's or uid {uid}'s and writable by \
+                 nobody else",
+                at.display(),
+                st.st_uid,
+                mode_bits(st.st_mode)
+            )));
+        }
+        if let Some(why) = acl::unsafe_grant(fd, Guard::Writes)? {
+            return Err(refused(format!("{}: {why}", at.display())));
+        }
+        Ok(st)
+    };
+    let mut here = PathBuf::from("/");
+    let mut fd = rustix::fs::open("/", DIR_FLAGS, Mode::empty()).map_err(|e| errno("opening /", e))?;
+    owned(&fd, &here)?;
+    for name in dirs {
+        here.push(name);
+        fd = openat(&fd, *name, DIR_FLAGS, Mode::empty()).map_err(|e| match e {
+            Errno::LOOP | Errno::NOTDIR => refused(format!("{} is a link or not a folder", here.display())),
+            e => errno(format!("opening {}", here.display()), e),
+        })?;
+        owned(&fd, &here)?;
+    }
+    here.push(file);
+    let f = openat(&fd, *file, FILE_FLAGS, Mode::empty()).map_err(|e| match e {
+        Errno::LOOP => refused(format!("{} is a link; it must be a regular file", here.display())),
+        e => errno(format!("opening {}", here.display()), e),
+    })?;
+    let st = owned(&f, &here)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(refused(format!("{} is not a regular file", here.display())));
+    }
+    Ok(f)
+}
+
 /// The folder `name` inside the trusted folder `parent`, made if missing, with exactly `mode` and `owner`. A
 /// folder that exists with another owner is refused, never taken over.
 pub fn ensure_dir(parent: &OwnedFd, name: &str, mode: u32, owner: Owner, what: &str) -> Result<(OwnedFd, Wrote)> {

@@ -42,6 +42,8 @@ pub struct Pins {
     pub adapter_version: Option<String>,
     /// The first adapter release that reads the desk-pass sign-in (`ADAPTER_SIGNIN_MIN_VERSION`).
     pub adapter_signin_from: Option<String>,
+    /// The adapter is a developer's local build (`local_build`, dev only), not a release.
+    pub adapter_local: bool,
     pub supervisor: ImagePin,
     pub sandbox: ImagePin,
     pub meter_image: String,
@@ -141,6 +143,7 @@ impl Pins {
             gateway,
             adapter_version: adapter.as_ref().and(a["version"].as_str()).map(str::to_string),
             adapter_signin_from: ADAPTER_SIGNIN_MIN_VERSION.map(str::to_string),
+            adapter_local: false,
             adapter,
             supervisor: img("supervisor")?,
             sandbox: img("sandbox")?,
@@ -208,9 +211,27 @@ pub fn signin_support(pinned: Option<&str>, min: Option<&str>) -> std::result::R
     }
 }
 
-/// Whether this release's pinned adapter reads the desk-pass sign-in (`signin_support` for these pins).
+/// Whether this release's pinned adapter reads the desk-pass sign-in (`signin_support` for these pins). A
+/// developer's local adapter build (dev only) is taken to read it: it is built from the source that does, and one
+/// that does not refuses its configuration and does not start, which `status` shows.
 pub fn adapter_signin(pins: &Pins) -> std::result::Result<(), String> {
+    if pins.adapter_local {
+        return Ok(());
+    }
     signin_support(pins.adapter_version.as_deref(), pins.adapter_signin_from.as_deref())
+}
+
+impl Pins {
+    /// These pins with a developer's local build in place of the parts it names (dev only, `local_build`).
+    pub fn with_local(&self, local: Option<&crate::local_build::LocalBuild>) -> Pins {
+        let mut p = self.clone();
+        if let Some(pin) = local.and_then(|l| l.adapter_pin()) {
+            p.adapter = Some(pin);
+            p.adapter_version = None;
+            p.adapter_local = true;
+        }
+        p
+    }
 }
 
 /// The one entry for `asset` in a `sha256sum`-style checksum file. Every line must be `<64 hex>  <name>` (or

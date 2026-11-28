@@ -22,6 +22,7 @@ use crate::apply::Owners;
 use crate::binding::Binding;
 use crate::fsx;
 use crate::gateway_config;
+use crate::local_build::{self, LocalBuild};
 use crate::meter;
 use crate::platform::macos::{
     self, Layout, BUNDLE, CA_CERT, CA_KEY, GATEWAY_PORT, LABEL_BACKEND, LABEL_ENCLAVE, LABEL_GATEWAY, LEAF_KEY,
@@ -67,11 +68,34 @@ pub struct Service {
     pub pid: Option<u32>,
 }
 
+/// A developer's local build in place of releases (dev only), as root recorded it: said loudly, never mistaken for
+/// a release.
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalBuildShown {
+    pub notice: &'static str,
+    pub source: &'static str,
+    #[serde(flatten)]
+    pub parts: LocalBuild,
+}
+
+impl LocalBuildShown {
+    fn of(parts: LocalBuild) -> Self {
+        LocalBuildShown { notice: local_build::LOUD, source: local_build::SOURCE, parts }
+    }
+    /// One loud line per replaced part, for people.
+    pub fn lines(&self) -> Vec<String> {
+        self.parts.lines()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Status {
     pub schema: &'static str,
     pub host_version: &'static str,
     pub ok: bool,
+    /// Present only while a local build is installed (`install --local-build`, dev only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_build: Option<LocalBuildShown>,
     pub binding: Option<Binding>,
     pub release: String,
     pub adapter_pinned: bool,
@@ -94,6 +118,8 @@ pub struct Doctor {
     pub schema: &'static str,
     pub host_version: &'static str,
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_build: Option<LocalBuildShown>,
     pub desk_limits: String,
     pub checks: Vec<Check>,
 }
@@ -158,8 +184,17 @@ fn check_release(l: &Layout, pins: &Pins) -> Check {
     pass("release")
 }
 
+/// The local build root recorded beside the records, if any.
+fn local_marker(l: &Layout, root_uid: u32) -> std::result::Result<Option<LocalBuild>, String> {
+    let dir = match fsx::walk_trusted(&l.records(), &l.top, root_uid, None).map_err(|e| e.reason)? {
+        fsx::Walk::Found(fd, _) => fd,
+        fsx::Walk::Missing(_) => return Ok(None),
+    };
+    local_build::read_marker(fsx::read_at(&dir, local_build::MARKER, 64 * 1024).map_err(|e| e.reason)?)
+}
+
 /// The records as the runner reads them: a walk from `/` that refuses links, root-owned, nobody else may write.
-fn check_records(l: &Layout, pins: &Pins) -> Check {
+fn check_records(l: &Layout, pins: &Pins, local: Option<&LocalBuild>) -> Check {
     from(
         "records",
         (|| {
@@ -177,17 +212,20 @@ fn check_records(l: &Layout, pins: &Pins) -> Check {
             if c != records::ceiling(c.resources).map_err(|e| e.reason)? {
                 return Err("provider-ceiling.json does not name exactly this release's profiles".into());
             }
-            // The desk image only by a published, pinned digest; without one, desks wait (closed).
-            match (fsx::read_at(&dir, records::IMAGE, 4096).map_err(|e| e.reason)?, &pins.desk_image) {
+            // The desk image only by a published, pinned digest (or a dev local build's id); without one, desks wait.
+            let want = records::expected_image(pins.desk_image.as_ref(), local).map_err(|e| e.reason)?;
+            match (fsx::read_at(&dir, records::IMAGE, 4096).map_err(|e| e.reason)?, want) {
                 (None, None) => {
                     return Err("waiting: no published desk image is pinned for a Mac yet; desks wait, closed".into())
                 }
                 (Some(_), None) => return Err("desk-image.json names an image this release did not pin".into()),
                 (None, Some(_)) => return Err("desk-image.json is missing: run install again".into()),
-                (Some(have), Some(pin)) => {
+                (Some(have), Some(want)) => {
                     expect(&l.records().join(records::IMAGE), 0, 0o644)?;
-                    if have != records::image_bytes(pin).map_err(|e| e.reason)? {
-                        return Err("desk-image.json is not the pinned published desk image".into());
+                    if have != want {
+                        return Err(
+                            "desk-image.json is not the pinned published desk image, nor the local build's".into()
+                        );
                     }
                 }
             }
@@ -432,10 +470,18 @@ pub fn status(l: &Layout, pins: &Pins, env: Option<&str>) -> Status {
 pub fn status_with(l: &Layout, pins: &Pins, env: Option<&str>, owners: Owners) -> Status {
     let (b, binding) = check_binding(l);
     let mut checks = vec![check_host_binary(), b];
+    let local = match local_marker(l, owners.root.uid) {
+        Ok(local) => local,
+        Err(why) => {
+            checks.push(fail("local_build", why));
+            None
+        }
+    };
+    let pins = &pins.with_local(local.as_ref());
     if binding.is_some() {
         checks.extend([
             check_release(l, pins),
-            check_records(l, pins),
+            check_records(l, pins, local.as_ref()),
             check_folders(l),
             check_tls(l),
             check_gateway_config(l, binding.as_ref()),
@@ -470,6 +516,7 @@ pub fn status_with(l: &Layout, pins: &Pins, env: Option<&str>, owners: Owners) -
         schema: STATUS_SCHEMA,
         host_version: env!("CARGO_PKG_VERSION"),
         ok,
+        local_build: local.map(LocalBuildShown::of),
         binding,
         release: pins.release_id(),
         adapter_pinned: pins.adapter.is_some(),
@@ -495,6 +542,8 @@ fn lan_ipv4() -> Option<std::net::IpAddr> {
 pub fn doctor(l: &Layout, pins: &Pins) -> Doctor {
     let s = status(l, pins, None);
     let desk_limits = s.desk_limits.clone();
+    let local_build = s.local_build.clone();
+    let pins = &pins.with_local(local_build.as_ref().map(|lb| &lb.parts));
     let mut checks = s.checks;
     checks.push(check_socket("interceptor_socket", &l.interceptor_socket(), l.uid));
     checks.push(from(
@@ -545,7 +594,7 @@ pub fn doctor(l: &Layout, pins: &Pins) -> Doctor {
         }
     }));
     let ok = checks.iter().all(|c| c.ok);
-    Doctor { schema: DOCTOR_SCHEMA, host_version: env!("CARGO_PKG_VERSION"), ok, desk_limits, checks }
+    Doctor { schema: DOCTOR_SCHEMA, host_version: env!("CARGO_PKG_VERSION"), ok, local_build, desk_limits, checks }
 }
 
 #[cfg(test)]

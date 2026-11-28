@@ -21,6 +21,7 @@ use crate::binding::{Binding, Want};
 use crate::error::{failed, refused, usage, Result};
 use crate::fsx::Owner;
 use crate::identity::{self, Profile};
+use crate::local_build::{self, LocalBuild};
 use crate::meter;
 use crate::platform::macos::{self, Layout, ServiceInputs, LABEL_BACKEND, LABEL_ENCLAVE, LABEL_GATEWAY};
 use crate::records::Resources;
@@ -43,6 +44,8 @@ pub struct Args {
     pub raise_ceiling: bool,
     /// Replace the adapter's signing key, which is otherwise never replaced; the new one must be registered.
     pub rotate_adapter_key: bool,
+    /// A folder holding `local-build.json`: a developer's own builds in place of releases, `--env dev` only.
+    pub local_build: Option<PathBuf>,
 }
 
 /// What an install did and what it still waits for.
@@ -169,6 +172,11 @@ pub fn desk_limits(
 
 pub fn run(args: &Args) -> Result<Outcome> {
     let mut out = Outcome::default();
+    // A local build is for dev only: refused for any other environment before anything else is read or changed.
+    let local = match &args.local_build {
+        Some(dir) => Some(LocalBuild::load(dir, &args.env)?),
+        None => None,
+    };
     // Before anything else: the program that will ask for the password is the root-owned copy, and nothing the
     // developer's processes can change.
     let exe = std::env::current_exe().map_err(|e| failed(format!("finding this program: {e}")))?;
@@ -215,17 +223,33 @@ pub fn run(args: &Args) -> Result<Outcome> {
             )));
         }
     }
-    let ekka = crate::ekka::verify(
-        &crate::ekka::find(args.ekka.as_deref())?,
-        &crate::ekka::PublicRelease,
-        &crate::sigstore::Trust::embedded()?,
-        &crate::sigstore::PublicRekor,
-    )?;
-    say(format!(
-        "the Enclave runs {}: EKKA's signed ekka {} release, byte for byte",
-        ekka.path.display(),
-        ekka.version
-    ));
+    for line in local.iter().flat_map(LocalBuild::lines) {
+        println!("   {line}");
+    }
+    let ekka = match local.as_ref().and_then(|lb| lb.ekka.as_ref()) {
+        Some(p) => {
+            if args.ekka.as_deref().is_some_and(|e| e != Path::new(&p.path)) {
+                return Err(refused("--ekka and the local build name different ekka programs; nothing was changed"));
+            }
+            let v = crate::ekka::verify_local(Path::new(&p.path), &p.sha256)?;
+            say(format!("the Enclave runs {}: ekka {}, {}", v.path.display(), v.version, local_build::LOUD));
+            v
+        }
+        None => {
+            let v = crate::ekka::verify(
+                &crate::ekka::find(args.ekka.as_deref())?,
+                &crate::ekka::PublicRelease,
+                &crate::sigstore::Trust::embedded()?,
+                &crate::sigstore::PublicRekor,
+            )?;
+            say(format!(
+                "the Enclave runs {}: EKKA's signed ekka {} release, byte for byte",
+                v.path.display(),
+                v.version
+            ));
+            v
+        }
+    };
     let ekka = ekka.path;
     say(format!("the gateway trusts sign-in from {} only", identity::issuer(&want.env, &want.org)?));
 
@@ -248,11 +272,20 @@ pub fn run(args: &Args) -> Result<Outcome> {
     say(no_desk_limits(Some((info.cpus, info.memory_bytes >> 20))));
 
     println!("== verified downloads");
-    let pins = Pins::embedded()?;
+    let pins = Pins::embedded()?.with_local(local.as_ref());
     let staging = l.staging(&pins.release_id());
     let gateway_staged = release::stage(&pins.gateway, &staging)?;
     say(format!("NVIDIA OpenShell gateway {}: archive and program match their pins", pins.openshell_version));
     let adapter_staged = match &pins.adapter {
+        // A local adapter is checked here, read as root will read it, before anything changes; root hashes it again.
+        Some(pin) if pins.adapter_local => {
+            let path = PathBuf::from(&local.as_ref().and_then(|lb| lb.ekka_backend.as_ref()).expect("local").path);
+            let fd = crate::fsx::open_owned_path(&path, user.uid)?;
+            release::verify_binary(pin, &crate::fsx::read_regular(fd, &pin.binary, 256 * 1024 * 1024)?)
+                .map_err(|e| refused(format!("the local adapter {}: {}", path.display(), e.reason)))?;
+            say(format!("the backend adapter {}: {}", path.display(), local_build::LOUD));
+            Some(path)
+        }
         Some(pin) => {
             let p = release::stage(pin, &staging)?;
             say("EKKA backend adapter: archive and program match their pins");
@@ -268,8 +301,21 @@ pub fn run(args: &Args) -> Result<Outcome> {
     docker.verify_image(&pins.supervisor)?;
     docker.verify_image(&pins.sandbox)?;
     say("the supervisor and sandbox runtime hold their pinned programs");
-    match &pins.desk_image {
-        Some(pin) => {
+    match (local.as_ref().and_then(|lb| lb.desk_image.as_ref()), &pins.desk_image) {
+        (Some(want), _) => {
+            let img = docker
+                .image(local_build::LOCAL_IMAGE)?
+                .ok_or_else(|| refused(format!("Docker has no {}; build it first", local_build::LOCAL_IMAGE)))?;
+            if img["Id"].as_str() != Some(want.image_id.as_str()) {
+                return Err(refused(format!(
+                    "{} is not the local build's desk image {}; nothing was changed",
+                    local_build::LOCAL_IMAGE,
+                    want.image_id
+                )));
+            }
+            say(format!("the desk image {} ({}): {}", local_build::LOCAL_IMAGE, want.image_id, local_build::LOUD));
+        }
+        (None, Some(pin)) => {
             docker.pull(&pin.image)?;
             let img = docker.image(&pin.image)?.ok_or_else(|| failed(format!("Docker does not have {}", pin.image)))?;
             if img["Id"].as_str() != Some(pin.image_id.as_str()) {
@@ -277,7 +323,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
             }
             say(format!("the desk image {} is the pinned one", pin.image));
         }
-        None => out.pending.push(
+        (None, None) => out.pending.push(
             "desks: no published desk image is pinned for a Mac yet, so no desk-image record is written and desks \
              wait (closed). An image built on this Mac is never recorded"
                 .into(),
@@ -321,6 +367,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
         rotate_ca: args.rotate_ca,
         raise_ceiling: args.raise_ceiling,
         adapter_kid: key_kid,
+        local_build: local.clone(),
     };
     let roots = std::fs::read(crate::net::system_roots_path())
         .map_err(|e| failed(format!("reading the system's public roots: {e}")))?;

@@ -96,8 +96,10 @@ pub fn find(given: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// `program` is EKKA's runner release for the version it reports, byte for byte (module doc). Returns its real path.
-pub fn verify(program: &Path, release: &dyn RunnerRelease, trust: &Trust, rekor: &dyn RekorSource) -> Result<Verified> {
+/// Before it is run, even to ask its version: the program's real path, and the program and every folder above it, up
+/// to /, owned by root or this developer, writable by nobody else, with no ACL letting anyone else change them.
+/// Returns its real path and its bytes.
+fn checked(program: &Path) -> Result<(PathBuf, Vec<u8>)> {
     let real = program.canonicalize().map_err(|e| refused(format!("{}: {e}", program.display())))?;
     if !is_plain_absolute_path(&real.display().to_string()) {
         return Err(refused(format!("ekka's real path {} is not a plain absolute path", real.display())));
@@ -127,6 +129,27 @@ pub fn verify(program: &Path, release: &dyn RunnerRelease, trust: &Trust, rekor:
         }
     }
     let installed = std::fs::read(&real).map_err(|e| refused(format!("reading {}: {e}", real.display())))?;
+    Ok((real, installed))
+}
+
+/// A developer's local build of `ekka` (`--local-build`, dev only): every check `verify` makes before it runs the
+/// program, and then, in place of EKKA's signed release, its sha256 must be the manifest's. Only then is it run.
+pub fn verify_local(program: &Path, sha256: &str) -> Result<Verified> {
+    let (real, installed) = checked(program)?;
+    let have = sha256_hex(&installed);
+    if have != sha256 {
+        return Err(refused(format!(
+            "{} hashes to {have}, not the local build manifest's {sha256}; it was not run, and nothing was changed",
+            real.display()
+        )));
+    }
+    let version = reported_version(&real)?;
+    Ok(Verified { path: real, version, sha256: have })
+}
+
+/// `program` is EKKA's runner release for the version it reports, byte for byte (module doc). Returns its real path.
+pub fn verify(program: &Path, release: &dyn RunnerRelease, trust: &Trust, rekor: &dyn RekorSource) -> Result<Verified> {
+    let (real, installed) = checked(program)?;
     let version = reported_version(&real)?;
 
     let manifest: Value = serde_json::from_slice(&release.get(&version, "manifest.json", 64 * 1024)?)
@@ -268,6 +291,26 @@ mod tests {
         let e = verify(&p, &r, &t, &k).unwrap_err();
         assert!(e.reason.contains("it was not run"), "{e}");
         assert!(!marker.exists(), "the program was run before it was checked");
+    }
+
+    #[test]
+    fn a_local_build_of_ekka_keeps_every_check_before_it_runs_and_must_hash_to_the_manifest() {
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("ran");
+        let p = program(d.path(), "ekka", &format!("touch '{}'; echo 'ekka {V}'", marker.display()));
+        let sha = sha256_hex(&std::fs::read(&p).unwrap());
+        let e = verify_local(&p, &"0".repeat(64)).unwrap_err();
+        assert!(e.reason.contains("not the local build manifest's") && e.reason.contains("it was not run"), "{e}");
+        assert!(!marker.exists(), "a program that is not the manifest's is never run");
+        let v = verify_local(&p, &sha).unwrap();
+        assert_eq!((v.version.as_str(), v.sha256.as_str()), (V, sha.as_str()));
+        // The checks made before running it stay: a folder others can write refuses even the right bytes.
+        let open = d.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let q = program(&open, "ekka", &format!("echo 'ekka {V}'"));
+        let e = verify_local(&q, &sha256_hex(&std::fs::read(&q).unwrap())).unwrap_err();
+        assert!(e.reason.contains("it was not run"), "{e}");
     }
 
     #[test]

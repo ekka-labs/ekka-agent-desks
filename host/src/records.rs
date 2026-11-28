@@ -150,6 +150,34 @@ pub fn image_bytes(pin: &DeskImagePin) -> Result<Vec<u8>> {
     pretty(&Image { image: &pin.image, id: &pin.image_id })
 }
 
+/// The desk image record for a developer's local build (`--local-build`, dev only): `ekka-desk:local` by its
+/// content id, exactly the two fields the runner reads (it refuses any other, so the record carries no `source`;
+/// root's `local-build.json` beside it says this is a local build).
+pub fn local_image_bytes(image_id: &str) -> Result<Vec<u8>> {
+    if !is_digest(image_id) {
+        return Err(refused("the local desk image id is not sha256:<64 lowercase hex>"));
+    }
+    #[derive(Serialize)]
+    struct Image<'a> {
+        image: &'a str,
+        id: &'a str,
+    }
+    pretty(&Image { image: crate::local_build::LOCAL_IMAGE, id: image_id })
+}
+
+/// The desk image record this installation should hold: a local build's image when it names one, otherwise the
+/// published pinned image, otherwise none (desks wait, closed).
+pub fn expected_image(
+    pin: Option<&DeskImagePin>,
+    local: Option<&crate::local_build::LocalBuild>,
+) -> Result<Option<Vec<u8>>> {
+    match (local.and_then(|l| l.desk_image.as_ref()), pin) {
+        (Some(i), _) => local_image_bytes(&i.image_id).map(Some),
+        (None, Some(pin)) => image_bytes(pin).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
 #[derive(Debug, Serialize, serde::Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CeilingProfile {
@@ -219,20 +247,19 @@ fn pretty<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Writes (or, checking, compares) the three records under `dir`, reached from `top`, all owned by `root`.
 /// Writes (or, checking, compares) the records under `dir`, reached from `top`, all owned by `root`. Without a
-/// published desk image pinned, the image record is not written: desks wait, closed, until one is.
+/// desk image record (`expected_image`), none is written: desks wait, closed, until there is one.
 pub fn write(
     ctx: &mut Ctx,
     top: &Path,
     dir: &Path,
     root: Owner,
-    desk_image: Option<&DeskImagePin>,
+    desk_image: Option<&[u8]>,
     resources: Option<Resources>,
 ) -> Result<()> {
     let mut files = vec![(BASELINE, baseline_bytes()?), (CEILING, ceiling_bytes(resources)?)];
-    if let Some(pin) = desk_image {
-        files.push((IMAGE, image_bytes(pin)?));
+    if let Some(record) = desk_image {
+        files.push((IMAGE, record.to_vec()));
     }
     let fd = ctx.trusted_dir(top, dir, root.uid, 0o755)?;
     for (name, data) in files {
@@ -337,7 +364,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("private/var/lib/ekka-agent-desks/backend");
         let mut ctx = Ctx::apply();
-        write(&mut ctx, t.path(), &dir, me(), Some(&pin()), Some(RES)).unwrap();
+        write(&mut ctx, t.path(), &dir, me(), Some(&image_bytes(&pin()).unwrap()), Some(RES)).unwrap();
         assert_eq!(ctx.changes.len(), 8, "{:?}", ctx.changes); // five folders made, three records
         for name in [BASELINE, IMAGE, CEILING] {
             let m = std::fs::metadata(dir.join(name)).unwrap();
@@ -349,11 +376,18 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(BASELINE)).unwrap(), kit::BASELINE_POLICY);
 
         let mut again = Ctx::apply();
-        write(&mut again, t.path(), &dir, me(), Some(&pin()), Some(RES)).unwrap();
+        write(&mut again, t.path(), &dir, me(), Some(&image_bytes(&pin()).unwrap()), Some(RES)).unwrap();
         assert!(again.changes.is_empty(), "{:?}", again.changes);
         let mut check = Ctx::check();
-        write(&mut check, t.path(), &dir, me(), Some(&pin()), Some(Resources { max_cpu_millicores: 2000, ..RES }))
-            .unwrap();
+        write(
+            &mut check,
+            t.path(),
+            &dir,
+            me(),
+            Some(&image_bytes(&pin()).unwrap()),
+            Some(Resources { max_cpu_millicores: 2000, ..RES }),
+        )
+        .unwrap();
         assert_eq!(check.changes.len(), 1, "a changed ceiling is one change: {:?}", check.changes);
         assert_eq!(
             std::fs::read(dir.join(CEILING)).unwrap(),
@@ -371,9 +405,24 @@ mod tests {
         std::fs::write(t.path().join("wide-open.json"), b"{}").unwrap();
         std::os::unix::fs::symlink(t.path().join("wide-open.json"), dir.join(CEILING)).unwrap();
         let mut ctx = Ctx::apply();
-        let e = write(&mut ctx, t.path(), &dir, me(), Some(&pin()), Some(RES)).unwrap_err();
+        let e = write(&mut ctx, t.path(), &dir, me(), Some(&image_bytes(&pin()).unwrap()), Some(RES)).unwrap_err();
         assert!(e.reason.contains("provider-ceiling.json is a link"), "{e}");
         assert_eq!(std::fs::read(t.path().join("wide-open.json")).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn a_local_desk_image_is_recorded_exactly_as_the_runner_reads_it() {
+        let lb = crate::local_build::LocalBuild {
+            ekka: None,
+            ekka_backend: None,
+            desk_image: Some(crate::local_build::Image { image_id: ID.into() }),
+        };
+        let v: serde_json::Value =
+            serde_json::from_slice(&expected_image(Some(&pin()), Some(&lb)).unwrap().unwrap()).unwrap();
+        assert_eq!(v, serde_json::json!({"image": "ekka-desk:local", "id": ID}), "only the two fields, no source");
+        assert_eq!(expected_image(Some(&pin()), None).unwrap().unwrap(), image_bytes(&pin()).unwrap());
+        assert_eq!(expected_image(None, None).unwrap(), None);
+        assert!(local_image_bytes("ekka-desk:local").is_err());
     }
 
     #[test]
@@ -388,7 +437,7 @@ mod tests {
             t.path(),
             &t.path().join("var/lib/ekka-agent-desks/backend"),
             me(),
-            Some(&pin()),
+            Some(&image_bytes(&pin()).unwrap()),
             Some(RES),
         )
         .unwrap_err();

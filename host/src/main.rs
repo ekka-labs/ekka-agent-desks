@@ -18,6 +18,7 @@ mod http1;
 mod identity;
 mod install;
 mod kit;
+mod local_build;
 mod meter;
 mod net;
 mod platform;
@@ -42,14 +43,15 @@ const HELP: &str = "ekka-desk-host: installs and checks one EKKA desk host (this
 
   ekka-desk-host install --profile developer-native --runtime docker-desktop \\
       --env <env> --org <tenant id> --identity-profile <file> \\
-      [--ekka <absolute path>] [--rotate-ca] [--rotate-adapter-key]
+      [--ekka <absolute path>] [--rotate-ca] [--rotate-adapter-key] [--local-build <dir>]
       Installs for the developer running it, run from /usr/local/libexec/ekka-desk-host/ekka-desk-host (root's).
       Asks for the password once, and only when something root owns must change. One installation per Mac:
       another organization, developer or environment is refused before any change. --rotate-ca replaces an
       installation CA whose key is no longer root's alone, and the gateway certificate with it. Desks on a
       developer's Mac have no CPU or memory limit of their own in this release; Docker Desktop's VM bounds them.
       The adapter's signing key is made once and never replaced, except with --rotate-adapter-key (then register
-      the new key again).
+      the new key again). --local-build <dir> (--env dev only) installs the builds <dir>/local-build.json names
+      in place of releases, by their sha256; status and doctor say LOCAL BUILD for each.
 
   <one-time setup authorization> | ekka-desk-host gateway-setup [--json]
       The gateway's one-time setup, as yourself: the authorization (ekds_...) comes on stdin only, from
@@ -87,6 +89,7 @@ fn parse_install(args: &[String]) -> Result<install::Args> {
             "--desk-memory-mib" => a.memory_mib = Some(number(args, &mut i, "--desk-memory-mib")?),
             "--rotate-ca" => a.rotate_ca = true,
             "--rotate-adapter-key" => a.rotate_adapter_key = true,
+            "--local-build" => a.local_build = Some(PathBuf::from(value(args, &mut i, "--local-build")?)),
             "--raise-ceiling" => a.raise_ceiling = true,
             other => return Err(usage(format!("install does not take {other:?}"))),
         }
@@ -191,6 +194,9 @@ fn run(args: Vec<String>) -> Result<ExitCode> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&s).map_err(|e| refused(e.to_string()))?);
             } else {
+                for line in s.local_build.iter().flat_map(|lb| lb.lines()) {
+                    println!("{line}");
+                }
                 let mut all = s.checks.clone();
                 all.push(s.bootstrap.clone());
                 print_checks(s.ok, &all);
@@ -204,6 +210,9 @@ fn run(args: Vec<String>) -> Result<ExitCode> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&d).map_err(|e| refused(e.to_string()))?);
             } else {
+                for line in d.local_build.iter().flat_map(|lb| lb.lines()) {
+                    println!("{line}");
+                }
                 print_checks(d.ok, &d.checks);
                 println!("note: {}", d.desk_limits);
             }
@@ -282,6 +291,31 @@ mod tests {
         ];
         v.push("--rotate-adapter-key");
         assert!(parse_install(&s(&v)).unwrap().rotate_adapter_key);
+    }
+
+    #[test]
+    fn a_local_build_is_refused_outside_dev_before_anything_else() {
+        let t = tempfile::tempdir().unwrap();
+        for env in ["staging", "prod"] {
+            let e = run(s(&[
+                "install",
+                "--profile",
+                "developer-native",
+                "--runtime",
+                "docker-desktop",
+                "--env",
+                env,
+                "--org",
+                "7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7",
+                "--identity-profile",
+                "/tmp/p.json",
+                "--local-build",
+                &t.path().display().to_string(),
+            ]))
+            .unwrap_err();
+            assert_eq!(e.kind, error::Kind::Refused, "{env}: {e}");
+            assert!(e.reason.contains("--local-build is for --env dev only"), "{env}: {e}");
+        }
     }
 
     #[test]
