@@ -371,6 +371,24 @@ The backend adapter, which carries desk administration through EKKA, runs from E
 
 `up.sh` pulls the pinned digest and checks its signature with cosign before anything runs it. The signature must come from the release workflow of `ekka-labs/ekka-backend` on a version tag; any other image does not run.
 
+## The published desk image
+
+A server builds its desk image itself, from `desk/image` in its checkout (`ekka-desk:local`). Each release of this repository, a `vX.Y.Z` tag, also publishes that recipe as `ghcr.io/ekka-labs/ekka-desk`, for linux/amd64 and linux/arm64. It is for a host that records a desk image only from a signed, published digest, never from one built where it runs. A server does not use it.
+
+The release workflow, `.github/workflows/desk-image.yml`, builds each platform from the tagged commit on a runner of that processor type, with no build arguments, as `up.sh` does. It signs the multi-platform index and each platform image keyless with cosign, and attaches each platform image's SPDX SBOM as a signed attestation. Pin the index digest, never the tag. Read the digest, then check its signature:
+
+```sh
+docker buildx imagetools inspect ghcr.io/ekka-labs/ekka-desk:v1.2.3
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/ekka-labs/ekka-agent-desks/\.github/workflows/desk-image\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/ekka-labs/ekka-desk@sha256:<index digest>
+```
+
+An image signed by anything else, or not signed, fails the check. To check a platform image's SBOM, run `cosign verify-attestation --type spdxjson` with the same two options on that platform's digest, as `imagetools inspect` lists it.
+
+The image's `ekka.desk.source` label is the one `up.sh` puts on its own build of the same recipe. The recipe installs Debian's current packages at build time, so two builds of one recipe can differ: the signed digest names the image, not the recipe.
+
 ## Connect a provider's key
 
 A provider's key is set on this machine, at install or when it changes. People's own `ekka desk connect` points here. The key comes from a pipe, never as an argument and never typed at the terminal, so it is not on screen, in `ps` or in shell history:

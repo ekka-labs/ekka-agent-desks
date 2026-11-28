@@ -1,0 +1,393 @@
+# The desk image (desk/image), built in CI and published for a host that records a desk image only from a signed,
+# published digest. A server does not use it: up.sh still builds the same recipe on the server (ekka-desk:local).
+#
+# Each platform is built from the recipe exactly as up.sh builds it (no build arguments, the same ekka.desk.source
+# label), on a runner of its own processor type: nothing is emulated. The build writes an OCI layout and nothing
+# else; it can push nowhere. The image is then copied by digest into a registry that lives only inside the job,
+# pulled back by that digest, and checked: its platform, its desk user, and the tools a desk runs.
+#
+# On a pull request that changes the recipe or this file: after both builds, one job joins the two images and signs
+# them exactly as a release does, but into a registry that lives only inside the job and with a throwaway key.
+# Nothing leaves the run. Keyless signing is the release's alone: it writes an entry to Sigstore's public
+# transparency log, which a pull request must not do.
+#
+# On a version tag (v1.2.3): the same builds. Then one job, the only one that can write a package or ask for a
+# signing identity, pushes both images and an index that joins them, names the index by the digest the joining
+# command reports and by nothing else, signs the index and each platform image keyless, attaches each platform's
+# SBOM attestation, verifies all of it with the identity a host pins, and only then points the version tag at that
+# digest. A host pins the index digest; Docker pulls the image for its own processor type.
+#
+# What a consumer sees if a release run stops:
+#   - in a build job: nothing; nothing is pushed.
+#   - after the join, before signing is verified: an unsigned index, tagged only
+#     release-staging-<run id>-<attempt> (no consumer uses it). No version tag. A host that verifies before it pins
+#     refuses it.
+#   - after verification, before the last step: a signed index, no version tag. Re-run the job.
+#   - after the last step: the release.
+#
+# Verify a release with:
+#   cosign verify \
+#     --certificate-identity-regexp '^https://github\.com/ekka-labs/ekka-agent-desks/\.github/workflows/desk-image\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     ghcr.io/ekka-labs/ekka-desk@sha256:<digest>
+name: desk image
+on:
+  pull_request:
+    paths:
+      - desk/image/**
+      - .github/workflows/desk-image.yml
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  # One release at a time; a pull request's newer push cancels its older run.
+  group: desk-image-${{ github.event_name == 'push' && 'release' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The builder, by digest (moby/buildkit v0.35.1). A tag alone is whatever was last pushed under it.
+  BUILDKIT: moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, arch: amd64, os: ubuntu-24.04 }
+          - { platform: linux/arm64, arch: arm64, os: ubuntu-24.04-arm }
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    services:
+      # The job's own registry: the built image is checked as it is pulled, by digest, never from the build's cache.
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports: ["5000:5000"]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: A version tag is vX.Y.Z
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag $TAG is not vX.Y.Z"; exit 1; }
+
+      - name: This runner is the platform it builds
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$(docker version --format '{{.Server.Arch}}')" == "$ARCH" ]] \
+            || { echo "::error::runner is $(docker version --format '{{.Server.Arch}}'), not $ARCH"; exit 1; }
+
+      - name: A builder, pinned by digest
+        run: |
+          set -euo pipefail
+          docker buildx version
+          docker buildx create --use --name desk --driver docker-container --driver-opt "image=$BUILDKIT"
+          docker buildx inspect --bootstrap desk
+
+      - name: Build the recipe as up.sh does, into an OCI layout
+        id: build
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+          REVISION: ${{ github.sha }}
+          VERSION: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: |
+          set -euo pipefail
+          # The label up.sh puts on the image it builds (step_images): the recipe's files, in order, hashed.
+          src=$( { find desk/image -type f | LC_ALL=C sort | xargs cat; } | sha256sum | cut -c1-16)
+          labels=(--label "ekka.desk.source=$src"
+                  --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+                  --label "org.opencontainers.image.revision=$REVISION")
+          [[ -z $VERSION ]] || labels+=(--label "org.opencontainers.image.version=$VERSION")
+          start=$SECONDS
+          docker buildx build --platform "$PLATFORM" --provenance=false --sbom=false "${labels[@]}" \
+            --output "type=oci,dest=out/image-$ARCH,tar=false" desk/image
+          took=$((SECONDS - start))
+          # The layout holds exactly one image, for this platform.
+          line=$(jq -er '.manifests | if length == 1 then .[0] else error("not one image") end
+                         | "\(.platform.os)/\(.platform.architecture) \(.digest)"' "out/image-$ARCH/index.json")
+          [[ "$line" =~ ^$PLATFORM\ (sha256:[0-9a-f]{64})$ ]] || { echo "::error::the layout holds $line"; exit 1; }
+          digest=${BASH_REMATCH[1]}
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "$PLATFORM: built in ${took}s, $digest (ekka.desk.source=$src)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: The image, pulled by its digest, is this platform and runs a desk's tools as the desk user
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t localhost:5000/ekka-desk:ci "oci-layout://$PWD/out/image-$ARCH@$DIGEST"
+          ref="localhost:5000/ekka-desk@$DIGEST"
+          docker pull -q "$ref" > /dev/null
+          [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$ref")" == "$PLATFORM" ]] \
+            || { echo "::error::the pulled image is not $PLATFORM"; exit 1; }
+          # The same check as the install job's, on the image a release would publish. uid 1000: a server's build.
+          docker run --rm --network none --entrypoint sh "$ref" -c \
+            'echo "dpkg: $(dpkg --print-architecture)  uid: $(id -u)"; claude --version; git --version; gh --version | head -1' \
+            | tee run.txt
+          grep -qx "dpkg: $ARCH  uid: 1000" run.txt || { echo "::error::not $ARCH, or not the desk user"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_ENV"
+
+      # Handed to the next job before the SBOM tool, a third-party program, runs in this job.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: out/image-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0  # the layers are compressed already
+
+      - uses: anchore/sbom-action@da167eac915b4e86f08b264dbdbc867b61be6f0c  # v0.20.5
+        with:
+          image: ${{ env.ref }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.arch }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: The SBOM is an SPDX document that lists packages
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          jq -e '.spdxVersion and (.packages | length > 0)' "sbom-$ARCH.spdx.json" > /dev/null
+          echo "SBOM: $(jq '.packages | length' "sbom-$ARCH.spdx.json") packages, $(wc -c < "sbom-$ARCH.spdx.json") bytes"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sbom-${{ matrix.arch }}
+          path: sbom-${{ matrix.arch }}.spdx.json
+          if-no-files-found: error
+          retention-days: 1
+
+  rehearse:
+    # A pull request: the release's join, signing and verification, into the job's own registry with a throwaway
+    # key. The join step is the publish job's, word for word.
+    if: github.event_name == 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: {}
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports: ["5000:5000"]
+    env:
+      REPO: localhost:5000/ekka-desk
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: in
+
+      - name: cosign, pinned (sha256 from sigstore's cosign_checksums.txt for v2.6.5)
+        run: |
+          set -euo pipefail
+          [[ $(uname -m) == x86_64 ]] || { echo "::error::cosign is pinned for x86_64 only here"; exit 1; }
+          curl -fsSL -o "$RUNNER_TEMP/cosign" https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-amd64
+          echo "c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644  $RUNNER_TEMP/cosign" | sha256sum -c -
+          sudo install -m 0755 "$RUNNER_TEMP/cosign" /usr/local/bin/cosign
+          cosign version | grep GitVersion
+
+      - name: Join the two platforms into one index, named by its digest only
+        id: index
+        env:
+          # A reference no consumer uses: the version tag is pointed at the index only after it is verified.
+          STAGING: release-staging-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker buildx version
+          # Each build handed over a layout holding exactly one image, for its own platform.
+          for arch in amd64 arm64; do
+            line=$(jq -er '.manifests | if length == 1 then .[0] else error("not one image") end
+                           | "\(.platform.os)/\(.platform.architecture) \(.digest)"' "in/image-$arch/index.json")
+            [[ "$line" =~ ^linux/$arch\ (sha256:[0-9a-f]{64})$ ]] || { echo "::error::image-$arch holds $line"; exit 1; }
+            declare "$arch=${BASH_REMATCH[1]}"
+          done
+          docker buildx imagetools create --metadata-file created.json -t "$REPO:$STAGING" \
+            "oci-layout://$PWD/in/image-amd64@$amd64" "oci-layout://$PWD/in/image-arm64@$arm64"
+          # The digest the joining command reports. From here on the index is named by it alone: no step reads a tag
+          # to learn what to check, sign or publish.
+          digest="$(jq -r '."containerimage.descriptor".digest' created.json)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::the join reported no digest"; exit 1; }
+          docker buildx imagetools inspect --raw "$REPO@$digest" > index.json
+          [[ "sha256:$(sha256sum < index.json | cut -c1-64)" == "$digest" ]] \
+            || { echo "::error::the registry answered other bytes for $digest"; exit 1; }
+          # The index holds exactly the two images built above, each under its own platform.
+          got="$(jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture) \(.digest)"' index.json | sort)"
+          want="$(printf 'linux/amd64 %s\nlinux/arm64 %s\n' "$amd64" "$arm64" | sort)"
+          [[ "$got" == "$want" ]] || { echo "::error::the index is not the two built images"; echo "$got"; exit 1; }
+          # Each image's content id: the sha256 of its config, which Docker's classic image store reports as its Id.
+          config() { jq -r .config.digest "in/image-$1/blobs/sha256/${2#sha256:}"; }
+          { echo "index=$REPO@$digest"; echo "amd64=$REPO@$amd64"; echo "arm64=$REPO@$arm64"
+            echo "amd64_config=$(config amd64 "$amd64")"; echo "arm64_config=$(config arm64 "$arm64")"; } >> "$GITHUB_OUTPUT"
+
+      - name: Sign the index and each platform with a throwaway key, attest each SBOM, and verify all of it
+        env:
+          COSIGN_PASSWORD: ""
+          INDEX: ${{ steps.index.outputs.index }}
+          AMD64: ${{ steps.index.outputs.amd64 }}
+          ARM64: ${{ steps.index.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          in=$PWD/in
+          cd "$RUNNER_TEMP"
+          cosign generate-key-pair
+          cosign generate-key-pair --output-key-prefix other
+          key=(--key cosign.pub --insecure-ignore-tlog --allow-insecure-registry)
+          # Before it is signed, verification refuses the index: the check below checks something.
+          if cosign verify "${key[@]}" "$INDEX" > /dev/null 2>&1; then
+            echo "::error::an unsigned index passed verification"; exit 1
+          fi
+          for ref in "$INDEX" "$AMD64" "$ARM64"; do
+            [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest to sign: $ref"; exit 1; }
+            cosign sign --yes --key cosign.key --tlog-upload=false --allow-insecure-registry "$ref"
+          done
+          cosign attest --yes --key cosign.key --tlog-upload=false --allow-insecure-registry \
+            --type spdxjson --predicate "$in/sbom-amd64/sbom-amd64.spdx.json" "$AMD64"
+          cosign attest --yes --key cosign.key --tlog-upload=false --allow-insecure-registry \
+            --type spdxjson --predicate "$in/sbom-arm64/sbom-arm64.spdx.json" "$ARM64"
+          for ref in "$INDEX" "$AMD64" "$ARM64"; do
+            cosign verify "${key[@]}" "$ref" > /dev/null
+          done
+          for ref in "$AMD64" "$ARM64"; do
+            cosign verify-attestation "${key[@]}" --type spdxjson "$ref" > /dev/null
+          done
+          # A key that did not sign it is refused.
+          if cosign verify --key other.pub --insecure-ignore-tlog --allow-insecure-registry "$INDEX" > /dev/null 2>&1; then
+            echo "::error::another key's verification passed"; exit 1
+          fi
+          echo "signed, attested and verified: $INDEX"
+
+  publish:
+    # A version tag: the only job that can write a package or ask for a signing identity. It checks out nothing and
+    # runs no third-party action: GitHub's own download action, docker, and cosign pinned by sha256.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      # Push to this organization's ghcr with the workflow's own token.
+      packages: write
+      # Keyless signing: a short-lived OIDC token naming THIS workflow run. It grants no repository write; Sigstore
+      # certifies the run's identity.
+      id-token: write
+    env:
+      # The one place the published image is named.
+      REPO: ghcr.io/ekka-labs/ekka-desk
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: in
+
+      - name: cosign, pinned (sha256 from sigstore's cosign_checksums.txt for v2.6.5)
+        run: |
+          set -euo pipefail
+          [[ $(uname -m) == x86_64 ]] || { echo "::error::cosign is pinned for x86_64 only here"; exit 1; }
+          curl -fsSL -o "$RUNNER_TEMP/cosign" https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-amd64
+          echo "c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644  $RUNNER_TEMP/cosign" | sha256sum -c -
+          sudo install -m 0755 "$RUNNER_TEMP/cosign" /usr/local/bin/cosign
+          cosign version | grep GitVersion
+
+      - name: Sign in to ghcr.io with the workflow's own token
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Join the two platforms into one index, named by its digest only
+        id: index
+        env:
+          # A reference no consumer uses: the version tag is pointed at the index only after it is verified.
+          STAGING: release-staging-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          docker buildx version
+          # Each build handed over a layout holding exactly one image, for its own platform.
+          for arch in amd64 arm64; do
+            line=$(jq -er '.manifests | if length == 1 then .[0] else error("not one image") end
+                           | "\(.platform.os)/\(.platform.architecture) \(.digest)"' "in/image-$arch/index.json")
+            [[ "$line" =~ ^linux/$arch\ (sha256:[0-9a-f]{64})$ ]] || { echo "::error::image-$arch holds $line"; exit 1; }
+            declare "$arch=${BASH_REMATCH[1]}"
+          done
+          docker buildx imagetools create --metadata-file created.json -t "$REPO:$STAGING" \
+            "oci-layout://$PWD/in/image-amd64@$amd64" "oci-layout://$PWD/in/image-arm64@$arm64"
+          # The digest the joining command reports. From here on the index is named by it alone: no step reads a tag
+          # to learn what to check, sign or publish.
+          digest="$(jq -r '."containerimage.descriptor".digest' created.json)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::the join reported no digest"; exit 1; }
+          docker buildx imagetools inspect --raw "$REPO@$digest" > index.json
+          [[ "sha256:$(sha256sum < index.json | cut -c1-64)" == "$digest" ]] \
+            || { echo "::error::the registry answered other bytes for $digest"; exit 1; }
+          # The index holds exactly the two images built above, each under its own platform.
+          got="$(jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture) \(.digest)"' index.json | sort)"
+          want="$(printf 'linux/amd64 %s\nlinux/arm64 %s\n' "$amd64" "$arm64" | sort)"
+          [[ "$got" == "$want" ]] || { echo "::error::the index is not the two built images"; echo "$got"; exit 1; }
+          # Each image's content id: the sha256 of its config, which Docker's classic image store reports as its Id.
+          config() { jq -r .config.digest "in/image-$1/blobs/sha256/${2#sha256:}"; }
+          { echo "index=$REPO@$digest"; echo "amd64=$REPO@$amd64"; echo "arm64=$REPO@$arm64"
+            echo "amd64_config=$(config amd64 "$amd64")"; echo "arm64_config=$(config arm64 "$arm64")"; } >> "$GITHUB_OUTPUT"
+
+      - name: Sign the index and each platform keyless, attest each SBOM, and verify all of it
+        env:
+          INDEX: ${{ steps.index.outputs.index }}
+          AMD64: ${{ steps.index.outputs.amd64 }}
+          ARM64: ${{ steps.index.outputs.arm64 }}
+          IDENTITY: ^https://github\.com/${{ github.repository }}/\.github/workflows/desk-image\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$
+          ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          set -euo pipefail
+          # Before it is signed, verification refuses the index: the check below checks something.
+          if cosign verify --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" \
+               "$INDEX" > /dev/null 2>&1; then
+            echo "::error::an unsigned index passed verification"; exit 1
+          fi
+          for ref in "$INDEX" "$AMD64" "$ARM64"; do
+            [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest to sign: $ref"; exit 1; }
+            cosign sign --yes "$ref"
+          done
+          cosign attest --yes --type spdxjson --predicate in/sbom-amd64/sbom-amd64.spdx.json "$AMD64"
+          cosign attest --yes --type spdxjson --predicate in/sbom-arm64/sbom-arm64.spdx.json "$ARM64"
+          for ref in "$INDEX" "$AMD64" "$ARM64"; do
+            cosign verify --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" "$ref" > /dev/null
+          done
+          for ref in "$AMD64" "$ARM64"; do
+            cosign verify-attestation --type spdxjson \
+              --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" "$ref" > /dev/null
+          done
+
+      - name: Last, point the version tag at the verified index
+        env:
+          TAG: ${{ github.ref_name }}
+          INDEX: ${{ steps.index.outputs.index }}
+          AMD64: ${{ steps.index.outputs.amd64 }}
+          ARM64: ${{ steps.index.outputs.arm64 }}
+          AMD64_CONFIG: ${{ steps.index.outputs.amd64_config }}
+          ARM64_CONFIG: ${{ steps.index.outputs.arm64_config }}
+        run: |
+          set -euo pipefail
+          # One source that is an index is copied byte for byte: the tag names the same digest.
+          docker buildx imagetools create -t "$REPO:$TAG" "$INDEX"
+          now="sha256:$(docker buildx imagetools inspect --raw "$REPO:$TAG" | sha256sum | cut -c1-64)"
+          [[ "$REPO@$now" == "$INDEX" ]] || { echo "::error::$REPO:$TAG names $now, not the signed index $INDEX"; exit 1; }
+          { echo "published, signed and verified (pin this one): $INDEX"
+            echo "  tag: $REPO:$TAG"
+            echo "  linux/amd64: $AMD64 (config $AMD64_CONFIG)"
+            echo "  linux/arm64: $ARM64 (config $ARM64_CONFIG)"; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign out of ghcr.io
+        if: always()
+        run: docker logout ghcr.io
