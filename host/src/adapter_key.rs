@@ -119,7 +119,9 @@ fn public_of(pem: &[u8]) -> Result<PublicJwk> {
     PublicJwk::from_point(key.public_key_raw())
 }
 
-fn read_key(dir: &OwnedFd, path: &Path, dev_uid: u32) -> KeyState {
+/// The key in the developer's `D/backend`, given as an open folder handle: opened without a link, the developer's
+/// alone (0600, no ACL), at most 16 KiB, an ES256 key. Root reads it this way too, to decide the sign-in.
+pub fn read_key(dir: &OwnedFd, path: &Path, dev_uid: u32) -> KeyState {
     let what = path.display().to_string();
     let fd = match fsx::open_file_at(dir, KEY_FILE) {
         Ok(None) => return KeyState::Absent,

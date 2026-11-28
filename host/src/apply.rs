@@ -269,11 +269,9 @@ pub struct RootPlan {
     /// Allow the desk CPU or memory ceiling to go up (it may always go down); recorded when used.
     #[serde(default)]
     pub raise_ceiling: bool,
-    /// The RFC 7638 thumbprint of the usable adapter key at `D/backend/adapter-key.pem`, as the developer's side
-    /// read it. Root writes the adapter's desk-pass sign-in only when Govern registered exactly this key
-    /// (`adapter::signin`); root never reads the key itself.
+    /// `install --rotate-adapter-key`: the adapter key is about to be replaced, so no sign-in is written for it.
     #[serde(default)]
-    pub adapter_kid: Option<String>,
+    pub rotate_adapter_key: bool,
     /// A developer's local build in place of the releases it names: dev only (`local_build`). Root hashes the
     /// local adapter itself and records `"source": "local-build"`.
     #[serde(default)]
@@ -309,9 +307,6 @@ impl RootPlan {
                 return Err(refused("the adapter is configured but not pinned or not staged"));
             }
         }
-        if self.adapter_kid.as_deref().is_some_and(|k| !crate::adapter_key::is_kid(k)) {
-            return Err(refused("the plan's adapter key thumbprint is not one"));
-        }
         for p in [Some(&self.gateway_staged), self.adapter_staged.as_ref()].into_iter().flatten() {
             if !p.is_absolute() {
                 return Err(refused("a staged program is not named by an absolute path"));
@@ -329,9 +324,10 @@ fn program(
     bin_path: &Path,
     pin: &Pinned,
     staged: &Path,
-    root: Owner,
+    owners: Owners,
     checked: Option<&[u8]>,
 ) -> Result<()> {
+    let root = owners.root;
     if let Some(have) = read(bin, &pin.binary, MAX_PROGRAM)? {
         if verify_binary(pin, &have).is_ok()
             && fsx::holds(bin.expect("read found it"), &pin.binary, &have, 0o755, root)?
@@ -346,15 +342,9 @@ fn program(
     let bytes = match checked {
         // A local build root already read and hashed, before any change (`local_adapter`): those same bytes.
         Some(b) => b.to_vec(),
-        None => {
-            let fd = rustix::fs::open(
-                staged,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                Mode::empty(),
-            )
-            .map_err(|e| errno(format!("opening the staged {}", pin.binary), e))?;
-            fsx::read_regular(fd, &pin.binary, MAX_PROGRAM)?
-        }
+        // What the developer staged: opened one folder at a time from `/`, never through a link anywhere on the way,
+        // each folder root's or theirs; read once from that one handle, and these bytes are hashed and installed.
+        None => fsx::read_regular(fsx::open_owned_path(staged, owners.dev.uid)?, &pin.binary, MAX_PROGRAM)?,
     };
     verify_binary(pin, &bytes)?;
     ctx.file(bin, bin_path, &pin.binary, &bytes, 0o755, root)
@@ -755,7 +745,16 @@ pub fn root_apply(
         let issuer = identity::issuer(&binding.env, &binding.org)?;
         // The desk-pass sign-in only when this installation's registration names this key and the pinned adapter
         // reads it; otherwise left out (an older adapter refuses a file that has it).
-        let signin = adapter::signin(l, &binding, plan.registration.as_ref(), plan.adapter_kid.as_deref(), pins).ok();
+        // The key's thumbprint as root reads it now, under the install lock, through the folder handle it checked
+        // (no link, the developer's 0600 file, no ACL): never the plan's word for it. A key being replaced is none.
+        let key_kid = match (&be, plan.rotate_adapter_key) {
+            (Some(dir), false) => {
+                let path = l.backend_dir().join(crate::adapter_key::KEY_FILE);
+                crate::adapter_key::read_key(dir, &path, dev.uid).kid().map(str::to_string)
+            }
+            _ => None,
+        };
+        let signin = adapter::signin(l, &binding, plan.registration.as_ref(), key_kid.as_deref(), pins).ok();
         let cfg = adapter::config_bytes(l, &binding.org, inputs, &issuer, signin.as_ref())?;
         ctx.file(dfd.as_ref(), &d, "backend-config.json", &cfg, 0o644, root)?;
     }
@@ -769,9 +768,9 @@ pub fn root_apply(
     let rel = ctx.sub_dir(rels.as_ref(), &opt.join("releases"), &release, 0o755, root)?;
     let bin = ctx.sub_dir(rel.as_ref(), &rel_path, "bin", 0o755, root)?;
     let bin_path = rel_path.join("bin");
-    program(ctx, bin.as_ref(), &bin_path, &pins.gateway, &plan.gateway_staged, root, None)?;
+    program(ctx, bin.as_ref(), &bin_path, &pins.gateway, &plan.gateway_staged, owners, None)?;
     if let (Some(pin), Some(staged)) = (&pins.adapter, &plan.adapter_staged) {
-        program(ctx, bin.as_ref(), &bin_path, pin, staged, root, local_adapter.as_deref())?;
+        program(ctx, bin.as_ref(), &bin_path, pin, staged, owners, local_adapter.as_deref())?;
     }
     let record = ReleaseRecord {
         schema: "ekka-desk-host.release/v1",
@@ -862,10 +861,12 @@ pub(crate) mod tests {
 
     pub(crate) fn rig() -> Rig {
         let dir = tempfile::tempdir().unwrap();
-        let top = dir.path().join("root");
+        // Its real path: a Mac's temporary folder is under /var, a link, and root reads what is staged without one.
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let top = base.join("root");
         std::fs::create_dir(&top).unwrap();
         std::fs::set_permissions(&top, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let home = dir.path().join("home");
+        let home = base.join("home");
         std::fs::create_dir(&home).unwrap();
         let staged = home.join("openshell-gateway");
         std::fs::write(&staged, fake_program()).unwrap();
@@ -888,7 +889,7 @@ pub(crate) mod tests {
             adapter: None,
             rotate_ca: false,
             raise_ceiling: false,
-            adapter_kid: None,
+            rotate_adapter_key: false,
             local_build: None,
         };
         let roots = std::fs::read(crate::net::system_roots_path()).unwrap();
@@ -1110,9 +1111,9 @@ pub(crate) mod tests {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../vendor/ekka-contracts/backend/adapter-config.v1.schema.json"))
                 .unwrap();
-        let apply = |r: &mut Rig, registered_kid: Option<&str>, plan_kid: Option<&str>, from: Option<&str>| {
+        let apply = |r: &mut Rig, registered_kid: Option<&str>, rotating: bool, from: Option<&str>| {
             r.plan.registration.as_mut().unwrap().adapter_kid = registered_kid.map(str::to_string);
-            r.plan.adapter_kid = plan_kid.map(str::to_string);
+            r.plan.rotate_adapter_key = rotating;
             r.pins.adapter_signin_from = from.map(str::to_string);
             root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
             let v = adapter_config(r);
@@ -1120,9 +1121,9 @@ pub(crate) mod tests {
             v["backend_gateway"]["signin"].clone()
         };
         // Today: no adapter release reads it, so it is never written, even for the registered key.
-        assert!(apply(&mut r, Some(&kid), Some(&kid), None).is_null());
+        assert!(apply(&mut r, Some(&kid), false, None).is_null());
         // A release that reads it, and the registered key: written, naming this installation, this gateway and the key.
-        let signin = apply(&mut r, Some(&kid), Some(&kid), Some("0.3.0"));
+        let signin = apply(&mut r, Some(&kid), false, Some("0.3.0"));
         let b = Binding::read(&r.layout.binding()).unwrap().unwrap();
         assert_eq!(
             signin,
@@ -1130,12 +1131,12 @@ pub(crate) mod tests {
                 "key_path": r.layout.backend_dir().join("adapter-key.pem").display().to_string()})
         );
         assert_eq!(adapter_config(&r)["backend_gateway"]["issuer"], identity::issuer("prod", ORG).unwrap());
-        // Any one of these missing, and it is taken out again: an older adapter, another key, no key, no kid.
-        assert!(apply(&mut r, Some(&kid), Some(&kid), Some("0.4.0")).is_null(), "the pinned 0.3.0 predates 0.4.0");
-        assert!(apply(&mut r, Some("oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U"), Some(&kid), Some("0.3.0")).is_null());
-        assert!(apply(&mut r, Some(&kid), None, Some("0.3.0")).is_null());
-        assert!(apply(&mut r, None, Some(&kid), Some("0.3.0")).is_null());
-        assert!(apply(&mut r, Some(&kid), Some(&kid), Some("0.3.0")).is_object());
+        // Any one of these missing, and it is taken out again: an older adapter, another key, a key being replaced, no registered kid.
+        assert!(apply(&mut r, Some(&kid), false, Some("0.4.0")).is_null(), "the pinned 0.3.0 predates 0.4.0");
+        assert!(apply(&mut r, Some("oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U"), false, Some("0.3.0")).is_null());
+        assert!(apply(&mut r, Some(&kid), true, Some("0.3.0")).is_null());
+        assert!(apply(&mut r, None, false, Some("0.3.0")).is_null());
+        assert!(apply(&mut r, Some(&kid), false, Some("0.3.0")).is_object());
         r.plan.registration = None;
         root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
         assert!(adapter_config(&r)["backend_gateway"]["signin"].is_null(), "not registered: never written");
@@ -1234,6 +1235,48 @@ pub(crate) mod tests {
         root_apply(&plain.plan, &plain.layout, owners(), &plain.pins, &plain.roots, &mut Ctx::apply()).unwrap();
         let v = serde_json::to_value(crate::status::status_with(&plain.layout, &plain.pins, None, owners())).unwrap();
         assert!(v.get("local_build").is_none());
+    }
+
+    /// Root reads what the developer staged one folder at a time, never through a link anywhere on the way: a folder
+    /// on the path swapped for a link is refused, even when the program behind it is the pinned one.
+    #[test]
+    fn a_staged_program_reached_through_a_linked_folder_is_refused() {
+        let mut r = rig();
+        let real = r.layout.home.join("real-cache");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::copy(&r.plan.gateway_staged, real.join("openshell-gateway")).unwrap();
+        std::os::unix::fs::symlink(&real, r.layout.home.join("cache-link")).unwrap();
+        r.plan.gateway_staged = r.layout.home.join("cache-link/openshell-gateway");
+        let e = root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap_err();
+        assert!(e.reason.contains("is a link"), "{e}");
+        let bin = r.layout.release_dir(&r.pins.release_id()).join("bin/openshell-gateway");
+        assert!(!bin.exists(), "nothing was installed from behind the link");
+    }
+
+    /// Root decides the sign-in from the key it reads itself, under the install lock, never from what the plan says.
+    #[test]
+    fn the_sign_in_follows_the_key_root_reads_not_the_plan() {
+        let mut r = rig();
+        with_adapter(&mut r, "0.3.0");
+        registered(&mut r, owners());
+        r.pins.adapter_signin_from = Some("0.3.0".into());
+        let kid =
+            crate::adapter_key::ensure(&r.layout, owners(), false, None).unwrap().state.kid().unwrap().to_string();
+        r.plan.registration.as_mut().unwrap().adapter_kid = Some(kid.clone());
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(adapter_config(&r)["backend_gateway"]["signin"].is_object(), "the registered key is on disk");
+        // Another key on disk than the one Govern registered: taken out, whatever the plan says.
+        crate::adapter_key::ensure(&r.layout, owners(), true, None).unwrap();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(adapter_config(&r)["backend_gateway"]["signin"].is_null());
+        // A key root cannot use as it is (readable by others): no sign-in.
+        crate::adapter_key::ensure(&r.layout, owners(), true, None).unwrap();
+        let key = r.layout.backend_dir().join(crate::adapter_key::KEY_FILE);
+        let kid = crate::adapter_key::inspect(&r.layout, owners()).kid().unwrap().to_string();
+        r.plan.registration.as_mut().unwrap().adapter_kid = Some(kid);
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(adapter_config(&r)["backend_gateway"]["signin"].is_null());
     }
 
     /// The adapter opens its key one folder at a time from `/`, refusing a link: `/var` is one on a Mac, so the

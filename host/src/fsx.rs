@@ -199,7 +199,10 @@ pub fn open_owned_path(path: &Path, uid: u32) -> Result<OwnedFd> {
     let (file, dirs) = names.split_last().ok_or_else(|| refused(format!("{} names no file", path.display())))?;
     let owned = |fd: &OwnedFd, at: &Path| -> Result<rustix::fs::Stat> {
         let st = fstat(fd).map_err(|e| errno(format!("reading {}", at.display()), e))?;
-        if (st.st_uid != 0 && st.st_uid != uid) || mode_bits(st.st_mode) & 0o022 != 0 {
+        // A folder others may write is refused, unless it is sticky (as /private/tmp is): there, no one can rename or
+        // remove an entry they do not own, and the next one down is checked to be root's or uid's.
+        let sticky = FileType::from_raw_mode(st.st_mode) == FileType::Directory && mode_bits(st.st_mode) & 0o1000 != 0;
+        if (st.st_uid != 0 && st.st_uid != uid) || (mode_bits(st.st_mode) & 0o022 != 0 && !sticky) {
             return Err(refused(format!(
                 "{} is uid {} mode {:o}: it and every folder above it must be root's or uid {uid}'s and writable by \
                  nobody else",
@@ -488,6 +491,25 @@ mod tests {
         let names: Vec<String> =
             std::fs::read_dir(t.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
+    }
+
+    #[test]
+    fn a_developers_file_is_read_one_folder_at_a_time_never_through_a_link_or_an_open_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(t.path()).unwrap();
+        let dir = base.join("build");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("p"), b"program").unwrap();
+        assert!(open_owned_path(&dir.join("p"), me().uid).is_ok());
+        std::os::unix::fs::symlink(&dir, base.join("link")).unwrap();
+        assert!(open_owned_path(&base.join("link/p"), me().uid).unwrap_err().reason.contains("is a link"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_owned_path(&dir.join("p"), me().uid).unwrap_err().reason.contains("writable by nobody else"));
+        // A sticky folder others may write (as /private/tmp is) is passed: what is below it is still checked.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(open_owned_path(&dir.join("p"), me().uid).is_ok());
+        std::fs::set_permissions(dir.join("p"), std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(open_owned_path(&dir.join("p"), me().uid).is_err(), "a file others may write is never read");
     }
 
     #[test]

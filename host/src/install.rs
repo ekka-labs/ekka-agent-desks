@@ -353,10 +353,6 @@ pub fn run(args: &Args) -> Result<Outcome> {
 
     println!("== what root owns");
     let owners = Owners { root: Owner { uid: 0, gid: 0 }, dev: Owner { uid: user.uid, gid: user.gid } };
-    // The adapter key as it is now, read only: root writes the adapter's desk-pass sign-in only for the key Govern
-    // registered. A key about to be replaced is no key.
-    let key_kid =
-        if args.rotate_adapter_key { None } else { adapter_key::inspect(&l, owners).kid().map(str::to_string) };
     let plan = RootPlan {
         schema: PLAN_SCHEMA.into(),
         want: want.clone(),
@@ -367,7 +363,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
         adapter: adapter_inputs,
         rotate_ca: args.rotate_ca,
         raise_ceiling: args.raise_ceiling,
-        adapter_kid: key_kid,
+        rotate_adapter_key: args.rotate_adapter_key,
         local_build: local.clone(),
     };
     let roots = std::fs::read(crate::net::system_roots_path())

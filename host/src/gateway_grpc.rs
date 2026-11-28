@@ -81,10 +81,10 @@ fn with_pass<T>(message: T, pass: &Pass) -> std::result::Result<tonic::Request<T
     Ok(r)
 }
 
-/// A refusal as a stop that names the call; the gateway's message is kept short and free of control characters.
-fn refused_by(what: &str, s: &tonic::Status) -> Stop {
-    let msg: String = s.message().chars().filter(|c| !c.is_control()).take(300).collect();
-    Stop::Failed(format!("{what}: the gateway answered {:?}: {msg}", s.code()))
+/// A refusal as a stop that names the call and its gRPC status code, in this tool's own words. The gateway's message
+/// is never repeated: it reaches the output and `D/gateway/setup.json`, and it is the gateway's text, not ours.
+fn refused_by(rpc: &str, what: &str, s: &tonic::Status) -> Stop {
+    Stop::Failed(format!("{what}: the gateway refused {rpc} ({:?}); its log says why", s.code()))
 }
 
 fn role_name(r: i32) -> &'static str {
@@ -123,7 +123,7 @@ impl GatewayAdmin for GatewayGrpc {
         match self.rt.block_on(self.client.get_workspace(req)) {
             Ok(_) => Ok(true),
             Err(s) if s.code() == tonic::Code::NotFound => Ok(false),
-            Err(s) => Err(refused_by("reading the workspace", &s)),
+            Err(s) => Err(refused_by("GetWorkspace", "reading the workspace", &s)),
         }
     }
 
@@ -132,7 +132,7 @@ impl GatewayAdmin for GatewayGrpc {
         match self.rt.block_on(self.client.create_workspace(req)) {
             Ok(_) => Ok(()),
             Err(s) if s.code() == tonic::Code::AlreadyExists => Ok(()),
-            Err(s) => Err(refused_by("making the workspace", &s)),
+            Err(s) => Err(refused_by("CreateWorkspace", "making the workspace", &s)),
         }
     }
 
@@ -151,7 +151,7 @@ impl GatewayAdmin for GatewayGrpc {
             let page = self
                 .rt
                 .block_on(self.client.list_workspace_members(req))
-                .map_err(|s| refused_by("listing the workspace's members", &s))?
+                .map_err(|s| refused_by("ListWorkspaceMembers", "listing the workspace's members", &s))?
                 .into_inner();
             out.extend(
                 page.members
@@ -184,7 +184,7 @@ impl GatewayAdmin for GatewayGrpc {
         match self.rt.block_on(self.client.add_workspace_member(req)) {
             Ok(_) => Ok(()),
             Err(s) if s.code() == tonic::Code::AlreadyExists => Ok(()),
-            Err(s) => Err(refused_by(&format!("adding {} to {workspace}", m.subject), &s)),
+            Err(s) => Err(refused_by("AddWorkspaceMember", &format!("adding {} to {workspace}", m.subject), &s)),
         }
     }
 
@@ -200,7 +200,7 @@ impl GatewayAdmin for GatewayGrpc {
             let page = self
                 .rt
                 .block_on(self.client.list_provider_profiles(req))
-                .map_err(|s| refused_by("listing the provider profiles", &s))?
+                .map_err(|s| refused_by("ListProviderProfiles", "listing the provider profiles", &s))?
                 .into_inner();
             for p in &page.profiles {
                 let m = DynamicMessage::decode(self.profile.clone(), p.encode_to_vec().as_slice())
@@ -231,16 +231,14 @@ impl GatewayAdmin for GatewayGrpc {
         let answer = self
             .rt
             .block_on(self.client.import_provider_profiles(req))
-            .map_err(|s| refused_by("importing the provider profiles", &s))?
+            .map_err(|s| refused_by("ImportProviderProfiles", "importing the provider profiles", &s))?
             .into_inner();
         if !answer.imported {
-            let why: Vec<String> = answer
-                .diagnostics
-                .iter()
-                .take(10)
-                .map(|d| format!("{} {}: {}", d.profile_id, d.field, d.message.chars().take(200).collect::<String>()))
-                .collect();
-            return Err(Stop::Failed(format!("the gateway did not import the profiles: {}", why.join("; "))));
+            return Err(Stop::Failed(format!(
+                "importing the provider profiles: the gateway refused ImportProviderProfiles with {} diagnostic(s); \
+                 its log says why",
+                answer.diagnostics.len()
+            )));
         }
         Ok(())
     }
@@ -270,6 +268,8 @@ pub(crate) mod tests {
         pub bearers: Vec<String>,
         /// Refuse an import, as the gateway does with diagnostics.
         pub refuse_import: bool,
+        /// Answer GetWorkspace with this error message (gateway text that must never be repeated).
+        pub fail_get: Option<String>,
         pub next_version: u64,
     }
 
@@ -303,6 +303,9 @@ pub(crate) mod tests {
             r: tonic::Request<api::GetWorkspaceRequest>,
         ) -> std::result::Result<tonic::Response<api::GetWorkspaceResponse>, tonic::Status> {
             self.auth("GetWorkspace", &r)?;
+            if let Some(text) = self.0.lock().unwrap().fail_get.clone() {
+                return Err(tonic::Status::internal(text));
+            }
             if self.0.lock().unwrap().workspaces.contains(&r.get_ref().name) {
                 Ok(tonic::Response::new(api::GetWorkspaceResponse::default()))
             } else {
@@ -382,7 +385,7 @@ pub(crate) mod tests {
                 let d = api::ProviderProfileDiagnostic {
                     profile_id: clash.unwrap_or_else(|| "github".into()),
                     field: "id".into(),
-                    message: "custom provider profile already exists".into(),
+                    message: "GATEWAY-TEXT custom provider profile already exists".into(),
                     severity: "error".into(),
                     ..Default::default()
                 };
@@ -532,10 +535,23 @@ pub(crate) mod tests {
         let fresh = serve();
         fresh.fake.0.lock().unwrap().refuse_import = true;
         let e = reconcile(&mut OnePass, &mut client(&fresh), AUD, &want(), &SystemTime::now).unwrap_err();
-        assert!(
-            matches!(&e, Stop::Failed(why) if why.contains("did not import") && why.contains("already exists")),
-            "{e:?}"
-        );
+        assert!(matches!(&e, Stop::Failed(why) if why.contains("ImportProviderProfiles")), "{e:?}");
+    }
+
+    /// What the gateway says in a refusal or a diagnostic is never repeated: it reaches the output and setup.json.
+    /// Only the call's name and the gRPC status code are said, with this tool's own words.
+    #[test]
+    fn the_gateways_own_words_are_never_repeated() {
+        let s = serve();
+        s.fake.0.lock().unwrap().fail_get = Some("GATEWAY-TEXT something it chose to say".into());
+        let e = reconcile(&mut OnePass, &mut client(&s), AUD, &want(), &SystemTime::now).unwrap_err();
+        let Stop::Failed(why) = e else { panic!("{e:?}") };
+        assert!(!why.contains("GATEWAY-TEXT"), "{why}");
+        assert!(why.contains("GetWorkspace") && why.contains("Internal"), "{why}");
+        let fresh = serve();
+        fresh.fake.0.lock().unwrap().refuse_import = true;
+        let e = reconcile(&mut OnePass, &mut client(&fresh), AUD, &want(), &SystemTime::now).unwrap_err();
+        assert!(!format!("{e:?}").contains("GATEWAY-TEXT"), "{e:?}");
     }
 
     #[test]
