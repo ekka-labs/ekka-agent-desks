@@ -10,6 +10,9 @@ pub const GATEWAY_TEMPLATE: &str = include_str!("../../deploy/gateway/gateway.to
 /// The per-user LaunchAgent every Mac service is written from.
 pub const LAUNCH_AGENT_TEMPLATE: &str = include_str!("../../deploy/macos/launch-agent.plist.template");
 
+/// Sigstore's public trusted root: Fulcio's certificate authorities and Rekor's keys, pinned as fetched.
+pub const SIGSTORE_TRUSTED_ROOT: &str = include_str!("../../deploy/macos/sigstore-trusted-root.json");
+
 /// The reviewed baseline sandbox policy, recorded byte for byte.
 pub const BASELINE_POLICY: &[u8] = include_bytes!("../../desk/policy.json");
 

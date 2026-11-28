@@ -154,6 +154,17 @@ class TheCheckItself(unittest.TestCase):
                      '"https://host/x" + "' + AT + 'github.com/o/r"')):
             self.assertEqual(public_check.hits(text), [], f"allowed case number {n}")
 
+    def test_only_the_exact_release_signer_identity_names_the_runner_repository(self):
+        signer = "https://github.com/" + ORG + "ekka-runner/.github/workflows/release-binaries.yml@refs/tags/v"
+        self.assertEqual(public_check.SIGNER, signer)
+        for n, text in enumerate((signer, signer + "0.6.24", 'IDENTITY: &str = "' + signer + '";')):
+            self.assertEqual(public_check.hits(text), [], f"allowed signer case number {n}")
+        for n, text in enumerate((ORG + "ekka-runner", "https://github.com/" + ORG + "ekka-runner",
+                                  "https://github.com/" + ORG + "ekka-runner/issues/1",
+                                  "https://github.com/" + ORG + "ekka-runner/.github/workflows/other.yml@refs/tags/v",
+                                  signer.replace("https://", "http://"))):
+            self.assertTrue(public_check.hits(text), f"refused runner case number {n}")
+
     def test_a_hit_names_its_kind_and_line_never_the_value(self):
         value = "someone" + AT + "somecompany.io"
         r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "public_check.py"), "--stdin"],

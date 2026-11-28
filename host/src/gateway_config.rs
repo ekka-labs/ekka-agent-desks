@@ -200,7 +200,8 @@ mod tests {
     fn render_sample() -> (Layout, Gateway, String) {
         let l = Layout::system(501, PathBuf::from("/Users/dev"));
         let p = Profile::parse(include_str!("../../deploy/macos/identity-profile.sample.json")).unwrap();
-        let g = crate::identity::gateway_oidc("prod", &p.org, p.gateway_id.as_deref().unwrap()).unwrap();
+        let id = crate::registration::Registration::from_answer(p.registration.as_ref().unwrap()).unwrap().gateway_id;
+        let g = crate::identity::gateway_oidc("prod", &p.org, &id).unwrap();
         let text = render(&l, &g, &l.docker_socket(), &Pins::embedded().unwrap()).unwrap();
         (l, g, text)
     }

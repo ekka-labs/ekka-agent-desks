@@ -1,0 +1,88 @@
+name: release-host
+
+# Publishes ekka-desk-host (host/) for Apple Silicon on a host-v<version> tag. Built and tested on macos-15 from the
+# tagged commit, packed as a tar.gz with its sha256 file, and signed keyless with Sigstore by this workflow (the
+# .sig and .crt beside it). The signature is verified exactly as the placement command in host/README.md verifies it,
+# before anything is published. The tag must be the version host/Cargo.toml declares. Any error stops the run.
+
+on:
+  push:
+    tags: ["host-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-host
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write   # the GitHub release and its files
+      id-token: write   # keyless signing: a short-lived identity naming this run; no stored key
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: The tag is the version host/Cargo.toml declares
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' host/Cargo.toml | head -1)
+          [[ "$TAG" =~ ^host-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag $TAG is not host-vX.Y.Z"; exit 1; }
+          [[ "$TAG" == "host-v$v" ]] || { echo "::error::tag $TAG but host/Cargo.toml says $v"; exit 1; }
+
+      - name: The pinned Rust toolchain (host/rust-toolchain.toml)
+        working-directory: host
+        run: rustup toolchain install 1.92.0 --profile minimal --component clippy,rustfmt
+
+      - name: Test, build and pack
+        working-directory: host
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo test --locked
+          cargo build --locked --release
+          f="ekka-desk-host-${TAG#host-v}-aarch64-apple-darwin.tar.gz"
+          mkdir -p ../out
+          cp target/release/ekka-desk-host ../out/
+          cd ../out
+          file ekka-desk-host | grep -q 'Mach-O 64-bit executable arm64'
+          tar -czf "$f" ekka-desk-host
+          rm ekka-desk-host
+          shasum -a 256 "$f" > "$f.sha256"
+
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159  # v3.9.2
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign keyless, then verify as the placement command does
+        working-directory: out
+        env:
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release-host.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          f=$(ls ekka-desk-host-*-aarch64-apple-darwin.tar.gz)
+          cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.crt" "$f"
+          shasum -a 256 -c "$f.sha256"
+          cosign verify-blob --certificate "$f.crt" --signature "$f.sig" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" "$f"
+
+      - name: Publish the release
+        working-directory: out
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "ekka-desk-host ${TAG#host-v}" \
+            --notes "ekka-desk-host for Apple Silicon. Place it with the command in host/README.md, which checks this archive's sha256 and its signature by this workflow." \
+            ekka-desk-host-*

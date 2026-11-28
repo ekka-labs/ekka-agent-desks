@@ -231,11 +231,26 @@ fn check_tls(l: &Layout) -> Check {
     )
 }
 
-fn check_gateway_config(l: &Layout) -> Check {
+fn check_gateway_config(l: &Layout, binding: Option<&Binding>) -> Check {
     from(
         "gateway_config",
         (|| {
+            if std::fs::symlink_metadata(l.gateway_toml()).is_err() {
+                return Err("waiting: the gateway is not registered for this installation yet".into());
+            }
             expect(&l.gateway_toml(), 0, 0o644)?;
+            let record = l.d().join(crate::registration::RECORD);
+            expect(&record, 0, 0o644)?;
+            let r: crate::registration::Record =
+                serde_json::from_slice(&std::fs::read(&record).map_err(|e| e.to_string())?)
+                    .map_err(|_| "the gateway's registration record is unreadable".to_string())?;
+            let ours = binding.is_some_and(|b| {
+                r.installation_id == b.installation_id
+                    && crate::identity::issuer(&b.env, &b.org).is_ok_and(|i| i == r.issuer)
+            });
+            if !ours {
+                return Err("the gateway's registration is not this installation's".into());
+            }
             let text = std::fs::read_to_string(l.gateway_toml()).map_err(|e| e.to_string())?;
             let found = gateway_config::findings_of_text(&text);
             if found.is_empty() {
@@ -340,7 +355,7 @@ pub fn status(l: &Layout, pins: &Pins, env: Option<&str>) -> Status {
             check_records(l, pins),
             check_folders(l),
             check_tls(l),
-            check_gateway_config(l),
+            check_gateway_config(l, binding.as_ref()),
         ]);
     }
     let docker = Docker::new(&l.docker_socket());

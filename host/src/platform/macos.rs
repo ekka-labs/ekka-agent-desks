@@ -363,6 +363,16 @@ pub fn bootstrap(uid: u32, label: &str, plist: &Path, changed: bool) -> Result<(
     last
 }
 
+/// Stops one service and takes it out of the developer's login session.
+pub fn bootout(uid: u32, label: &str) -> Result<()> {
+    launchctl(&["bootout", &format!("gui/{uid}/{label}")], &format!("stopping {label}"))
+}
+
+/// Restarts a running service, so it reads its configuration again.
+pub fn kickstart(uid: u32, label: &str) -> Result<()> {
+    launchctl(&["kickstart", "-k", &format!("gui/{uid}/{label}")], &format!("restarting {label}"))
+}
+
 /// Writes one LaunchAgent file as the developer, 0644, replacing it whole; a link in its place is refused.
 /// Returns whether it changed.
 pub fn write_plist(path: &Path, text: &str) -> Result<bool> {
@@ -399,15 +409,47 @@ pub fn write_plist(path: &Path, text: &str) -> Result<bool> {
 /// Where `ekka-desk-host` must be, root's, before it may ask for root. sudo runs this path and nothing else.
 pub const HOST_BINARY: &str = "/usr/local/libexec/ekka-desk-host/ekka-desk-host";
 
+/// The one root command that places this program, for `version`. Everything happens as root inside a folder root
+/// makes for it (mode 0700), using only the system's own programs and a cosign fetched into that same folder and
+/// checked against its pinned sha256: the release archive is checked against its sha256 file and its keyless
+/// signature by this kit's release workflow for exactly that tag, and the program is installed from those very
+/// bytes, atomically. Nothing the developer can write is hashed, run or installed by root.
+pub fn bootstrap_command(version: &str) -> String {
+    format!(
+        "sudo /bin/sh -euc '\n\
+         v={version}\n\
+         d=$(/usr/bin/mktemp -d /private/tmp/ekka-desk-host.XXXXXXXX); cd \"$d\"\n\
+         r=https://github.com/ekka-labs/ekka-agent-desks/releases/download/host-v$v\n\
+         f=ekka-desk-host-$v-aarch64-apple-darwin.tar.gz\n\
+         for x in \"$f\" \"$f.sha256\" \"$f.sig\" \"$f.crt\"; do /usr/bin/curl -fsSLo \"$x\" \"$r/$x\"; done\n\
+         /usr/bin/curl -fsSLo cosign https://github.com/sigstore/cosign/releases/download/{COSIGN_VERSION}/cosign-darwin-arm64\n\
+         echo \"{COSIGN_SHA256}  cosign\" | /usr/bin/shasum -a 256 -c -\n\
+         /bin/chmod 0700 cosign\n\
+         /usr/bin/shasum -a 256 -c \"$f.sha256\"\n\
+         ./cosign verify-blob --certificate \"$f.crt\" --signature \"$f.sig\" \\\n\
+         \x20 --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\n\
+         \x20 --certificate-identity \"{HOST_SIGNER}$v\" \"$f\"\n\
+         /usr/bin/tar -xzf \"$f\" ekka-desk-host\n\
+         /usr/bin/install -d -o root -g wheel -m 0755 /usr/local/libexec/ekka-desk-host\n\
+         /usr/bin/install -o root -g wheel -m 0755 ekka-desk-host /usr/local/libexec/ekka-desk-host/.ekka-desk-host.new\n\
+         /bin/mv -f /usr/local/libexec/ekka-desk-host/.ekka-desk-host.new {HOST_BINARY}\n\
+         cd /; /bin/rm -rf \"$d\"'"
+    )
+}
+
+/// The identity that signs this kit's ekka-desk-host releases; the version tag follows.
+pub const HOST_SIGNER: &str =
+    "https://github.com/ekka-labs/ekka-agent-desks/.github/workflows/release-host.yml@refs/tags/host-v";
+/// The cosign the bootstrap command fetches, by version and by its published sha256 (darwin-arm64).
+const COSIGN_VERSION: &str = "v2.6.5";
+const COSIGN_SHA256: &str = "4d41cc18f0563907c0c785b51db76e1d1af10db4422b605ba876b1758e1771ab";
+
 fn place_it(why: &str) -> String {
     format!(
         "ekka-desk-host asks for root only when it runs from {HOST_BINARY}, a root-owned copy nobody else can change \
-         ({why}). Nothing was changed. Check the program you downloaded against the sha256 published with its \
-         release, then put it there and run it from there:\n\
-         \x20   shasum -a 256 <downloaded ekka-desk-host>\n\
-         \x20   sudo install -d -o root -g wheel -m 0755 /usr/local/libexec/ekka-desk-host\n\
-         \x20   sudo install -o root -g wheel -m 0755 <downloaded ekka-desk-host> {HOST_BINARY}\n\
-         \x20   {HOST_BINARY} install ..."
+         ({why}). Nothing was changed. Place it with this one root command (it checks the signed release itself, \
+         inside a folder only root can write), then run it from there:\n\n{}\n\n    {HOST_BINARY} install ...",
+        bootstrap_command(env!("CARGO_PKG_VERSION"))
     )
 }
 
@@ -493,8 +535,45 @@ mod tests {
         std::fs::write(&exe, b"x").unwrap();
         let e = trusted_self(&exe, Path::new(HOST_BINARY), Path::new("/"), 0).unwrap_err();
         assert_eq!(e.kind, crate::error::Kind::Refused);
-        assert!(e.reason.contains(HOST_BINARY) && e.reason.contains("shasum -a 256"), "{e}");
-        assert!(e.reason.contains("sudo install -o root -g wheel -m 0755"), "{e}");
+        assert!(e.reason.contains(HOST_BINARY), "{e}");
+        assert!(e.reason.contains(&bootstrap_command(env!("CARGO_PKG_VERSION"))), "{e}");
+    }
+
+    #[test]
+    fn the_placement_command_verifies_and_installs_only_bytes_root_fetched_into_its_own_folder() {
+        let c = bootstrap_command("1.2.3");
+        // Root makes the folder (mktemp -d: root's, 0700) and everything is fetched into it as root.
+        assert!(c.starts_with("sudo /bin/sh -euc '") && c.contains("/usr/bin/mktemp -d /private/tmp/"), "{c}");
+        assert!(!c.contains("<downloaded"), "never a developer's file by name: {c}");
+        // cosign is pinned by sha256 before it runs; the archive by its sha256 file and its signature, by exactly
+        // this kit's release workflow for exactly this tag; the program comes out of those very bytes.
+        let pos = |needle: &str| c.find(needle).unwrap_or_else(|| panic!("{needle} missing in {c}"));
+        assert!(pos(COSIGN_SHA256) < pos("./cosign verify-blob"));
+        assert!(pos("shasum -a 256 -c \"$f.sha256\"") < pos("/usr/bin/tar -xzf"));
+        assert!(pos("./cosign verify-blob") < pos("/usr/bin/tar -xzf"));
+        assert!(c.contains(&format!("--certificate-identity \"{HOST_SIGNER}$v\"")) && c.contains("v=1.2.3"));
+        // Atomic: installed beside, then renamed over the program.
+        assert!(
+            pos(".ekka-desk-host.new")
+                < pos(&format!("/bin/mv -f /usr/local/libexec/ekka-desk-host/.ekka-desk-host.new {HOST_BINARY}"))
+        );
+        // Only the system's own programs run as root, and the cosign root fetched and checked itself.
+        for line in c.lines().skip(1) {
+            let first = line.split_whitespace().next().unwrap_or("");
+            assert!(
+                first.starts_with("/usr/bin/")
+                    || first.starts_with("/bin/")
+                    || first.starts_with("./cosign")
+                    || ["v=", "d=", "r=", "f=", "for", "echo", "cd", "--cert"].iter().any(|ok| first.starts_with(ok)),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_docs_give_the_same_placement_command_as_the_refusal() {
+        let readme = include_str!("../../README.md");
+        assert!(readme.contains(&bootstrap_command(env!("CARGO_PKG_VERSION"))), "host/README.md is out of date");
     }
 
     #[test]

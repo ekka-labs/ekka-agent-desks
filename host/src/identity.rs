@@ -4,16 +4,17 @@
 //! scope claim and the key-set lifetime are Govern's contract. A profile can say which registered gateway this is,
 //! and nothing that widens what the gateway accepts.
 //!
-//! The identity profile, version 2:
+//! The identity profile, version 3:
 //!
 //! ```json
-//! { "schema": "ekka-desk-host.identity-profile/v2",
+//! { "schema": "ekka-desk-host.identity-profile/v3",
 //!   "org": "<the organization's tenant id>",
-//!   "gateway_id": "urn:ekka:desk-gateway:development:<uuid>" }
+//!   "registration": <Govern's answer to the gateway's registration, as it was given> }
 //! ```
 //!
-//! `gateway_id` is left out until the gateway is registered; the gateway then waits and install says so. Any other
-//! field (an issuer, a role, a subject, a secret) is refused.
+//! `registration` is left out until the gateway is registered; the gateway then waits and install says so. Root uses
+//! it only when it is this installation's (`registration`). Any other field (an issuer, a role, a subject, a secret)
+//! is refused.
 
 use std::path::Path;
 
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{refused, Result};
 use crate::util::is_uuid;
 
-pub const SCHEMA: &str = "ekka-desk-host.identity-profile/v2";
+pub const SCHEMA: &str = "ekka-desk-host.identity-profile/v3";
 const MAX_FILE: u64 = 64 * 1024;
 const GATEWAY_ID_PREFIX: &str = "urn:ekka:desk-gateway:";
 
@@ -39,7 +40,7 @@ pub struct Profile {
     pub schema: String,
     pub org: String,
     #[serde(default)]
-    pub gateway_id: Option<String>,
+    pub registration: Option<serde_json::Value>,
 }
 
 /// The gateway's `[openshell.gateway.oidc]` settings, every one computed.
@@ -130,8 +131,8 @@ impl Profile {
         if !is_uuid(&p.org) {
             return Err(refused("the identity profile's org is not a lowercase tenant id"));
         }
-        if let Some(g) = &p.gateway_id {
-            gateway_class(g)?;
+        if let Some(r) = &p.registration {
+            gateway_class(&crate::registration::Registration::from_answer(r)?.gateway_id)?;
         }
         Ok(p)
     }
@@ -148,7 +149,7 @@ mod tests {
     fn the_sample_profile_is_accepted() {
         let p = Profile::parse(SAMPLE).unwrap();
         assert_eq!(p.org, ORG);
-        assert!(p.gateway_id.is_some());
+        assert!(p.registration.is_some());
     }
 
     #[test]
@@ -186,7 +187,7 @@ mod tests {
         assert!(gateway_class("urn:ekka:desk-gateway:development:not-a-uuid").is_err());
         assert!(gateway_class("ekka-desks").is_err());
         let mut p: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
-        p.as_object_mut().unwrap().remove("gateway_id");
-        assert_eq!(Profile::parse(&p.to_string()).unwrap().gateway_id, None, "before registration");
+        p.as_object_mut().unwrap().remove("registration");
+        assert_eq!(Profile::parse(&p.to_string()).unwrap().registration, None, "before registration");
     }
 }

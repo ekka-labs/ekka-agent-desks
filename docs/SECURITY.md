@@ -66,10 +66,14 @@ and EKKA's backend adapter all run as that developer's own user, started at logi
 Linux VM. The trust boundary is different from a server's, and this is what it is:
 
 - **Root's part is small and checked.** The host tool asks for the password only when run from its root-owned copy at
-  `/usr/local/libexec/ekka-desk-host/ekka-desk-host`. Root writes the programs, the gateway configuration, the
+  `/usr/local/libexec/ekka-desk-host/ekka-desk-host`, placed by one root command that checks the release's sha256
+  and its signature by this repository's release workflow inside a folder only root can write
+  ([the command](../host/README.md#place-it-once)). The `ekka` program the Enclave runs is checked byte for byte
+  against EKKA's signed release for the version it reports. Root writes the programs, the gateway configuration, the
   installation's certificate authority and the desk records; nothing running as the developer can replace them, and an
   access control list that would let it is refused. The gateway trusts sign-in only from EKKA for the bound organization,
-  and a desk's CPU and memory never exceed fixed maxima.
+  a desk's CPU and memory never exceed fixed maxima and go up only when asked by name, and the gateway runs only with a
+  registration made for this installation.
 - **The developer's own user is one boundary.** The Enclave's sockets admit only that user, so another account on the Mac
   cannot reach them. Code already running as that developer can: it can stop the Enclave and answer the gateway in its
   place, and so approve desk changes on that Mac. Nothing on the Mac can prevent that, because the operating system cannot

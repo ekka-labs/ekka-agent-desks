@@ -7,7 +7,7 @@
 
 use std::os::fd::AsFd;
 
-use crate::error::{failed, Result};
+use crate::error::{failed, refused, Result};
 
 /// What an ACL must not grant to anyone but root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +90,7 @@ unsafe fn entries_of(acl: sys::Acl) -> Result<(usize, Vec<Allow>)> {
         let e = std::io::Error::last_os_error();
         return match e.raw_os_error() {
             Some(libc::ENOENT) | Some(libc::ENOTSUP) => Ok((0, Vec::new())),
-            _ => Err(failed(format!("reading an access control list: {e}"))),
+            _ => Err(refused(format!("an access control list could not be read ({e}); refused rather than skipped"))),
         };
     }
     let mut out = Vec::new();
@@ -103,16 +103,22 @@ unsafe fn entries_of(acl: sys::Acl) -> Result<(usize, Vec<Allow>)> {
             which = sys::ACL_NEXT_ENTRY;
             count += 1;
             let mut tag = 0;
-            if sys::acl_get_tag_type(entry, &mut tag) != 0 || tag != sys::ACL_EXTENDED_ALLOW {
+            if sys::acl_get_tag_type(entry, &mut tag) != 0 {
+                sys::acl_free(acl);
+                return Err(refused("an access control list entry could not be read; refused rather than skipped"));
+            }
+            if tag != sys::ACL_EXTENDED_ALLOW {
                 continue;
             }
             let mut set: sys::Permset = std::ptr::null_mut();
             let mut perms = 0;
-            if sys::acl_get_permset(entry, &mut set) == 0 {
-                for p in sys::ALL {
-                    if sys::acl_get_perm_np(set, p as i32) == 1 {
-                        perms |= p;
-                    }
+            if sys::acl_get_permset(entry, &mut set) != 0 {
+                sys::acl_free(acl);
+                return Err(refused("an access control list entry's permissions could not be read; refused"));
+            }
+            for p in sys::ALL {
+                if sys::acl_get_perm_np(set, p as i32) == 1 {
+                    perms |= p;
                 }
             }
             let q = sys::acl_get_qualifier(entry);

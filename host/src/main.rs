@@ -8,6 +8,7 @@ mod adapter;
 mod apply;
 mod binding;
 mod bootstrap;
+mod ekka;
 mod error;
 mod fsx;
 mod gateway_config;
@@ -19,8 +20,10 @@ mod meter;
 mod net;
 mod platform;
 mod records;
+mod registration;
 mod release;
 mod runtime;
+mod sigstore;
 mod status;
 mod tls;
 mod util;
@@ -35,11 +38,12 @@ const HELP: &str = "ekka-desk-host: installs and checks one EKKA desk host (this
 
   ekka-desk-host install --profile developer-native --runtime docker-desktop \\
       --env <env> --org <tenant id> --identity-profile <file> \\
-      [--ekka <absolute path>] [--desk-cpu-millicores <n> --desk-memory-mib <n>] [--rotate-ca]
+      [--ekka <absolute path>] [--desk-cpu-millicores <n> --desk-memory-mib <n> [--raise-ceiling]] [--rotate-ca]
       Installs for the developer running it, run from /usr/local/libexec/ekka-desk-host/ekka-desk-host (root's).
       Asks for the password once, and only when something root owns must change. One installation per Mac:
       another organization, developer or environment is refused before any change. --rotate-ca replaces an
-      installation CA whose key is no longer root's alone, and the gateway certificate with it.
+      installation CA whose key is no longer root's alone, and the gateway certificate with it. A desk ceiling
+      only goes down unless --raise-ceiling is given; every raise is recorded.
 
   ekka-desk-host status [--json]     what this host observes, with a reason for each failure
   ekka-desk-host doctor [--json]     status, and live probes that change nothing
@@ -72,6 +76,7 @@ fn parse_install(args: &[String]) -> Result<install::Args> {
             "--desk-cpu-millicores" => a.cpu_millicores = Some(number(args, &mut i, "--desk-cpu-millicores")?),
             "--desk-memory-mib" => a.memory_mib = Some(number(args, &mut i, "--desk-memory-mib")?),
             "--rotate-ca" => a.rotate_ca = true,
+            "--raise-ceiling" => a.raise_ceiling = true,
             other => return Err(usage(format!("install does not take {other:?}"))),
         }
         i += 1;

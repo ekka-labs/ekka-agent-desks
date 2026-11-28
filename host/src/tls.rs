@@ -17,7 +17,7 @@ use rcgen::{
     BasicConstraints, Certificate, CertificateParams, CidrSubnet, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
     GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose, NameConstraints, SanType, PKCS_ECDSA_P256_SHA256, PKCS_ED25519,
 };
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{pem::PemObject, ServerName};
 use rustls::{ClientConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -176,6 +176,34 @@ impl JwtKeys {
         }
         Ok((key.public_key_pem(), base64::engine::general_purpose::STANDARD.encode(key.public_key_raw())))
     }
+}
+
+/// Whether the CA certificate (PEM) carries exactly this key's public key.
+pub fn cert_matches_key(cert_pem: &[u8], key_pem: &str) -> Result<bool> {
+    let cert = rustls::pki_types::CertificateDer::from_pem_slice(cert_pem)
+        .map_err(|_| refused("the installation CA certificate is not PEM"))?;
+    let key = KeyPair::from_pem(key_pem).map_err(|_| refused("the installation's CA key is not a key"))?;
+    Ok(crate::sigstore::spki_of(&cert)? == key.public_key_der())
+}
+
+/// Whether the gateway certificate (PEM) chains to the CA certificate (PEM) now, as a server certificate.
+pub fn leaf_chains_to(leaf_pem: &[u8], ca_pem: &[u8]) -> bool {
+    use rustls::pki_types::{CertificateDer, UnixTime};
+    let (Ok(leaf), Ok(ca)) = (CertificateDer::from_pem_slice(leaf_pem), CertificateDer::from_pem_slice(ca_pem)) else {
+        return false;
+    };
+    let Ok(anchor) = webpki::anchor_from_trusted_cert(&ca) else { return false };
+    let Ok(ee) = webpki::EndEntityCert::try_from(&leaf) else { return false };
+    ee.verify_for_usage(
+        webpki::ALL_VERIFICATION_ALGS,
+        &[anchor],
+        &[],
+        UnixTime::now(),
+        webpki::KeyUsage::server_auth(),
+        None,
+        None,
+    )
+    .is_ok()
 }
 
 /// The raw Ed25519 key in an SPKI PEM, in base64, as the Enclave's `EKKA_OPENSHELL_GATEWAY_KEY_B64` holds it.

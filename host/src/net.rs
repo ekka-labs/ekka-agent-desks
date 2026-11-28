@@ -84,6 +84,15 @@ fn parse(url: &str) -> Result<Url> {
 
 /// The body of `url`, at most `max` bytes, over https only.
 pub fn get(url: &str, max: usize) -> Result<Vec<u8>> {
+    request(url, "GET", None, max)
+}
+
+/// A JSON POST to `url` (no redirects followed), its answer at most `max` bytes, over https only.
+pub fn post_json(url: &str, body: &str, max: usize) -> Result<Vec<u8>> {
+    request(url, "POST", Some(body), max)
+}
+
+fn request(url: &str, method: &str, body: Option<&str>, max: usize) -> Result<Vec<u8>> {
     let roots = pem_certs(
         &std::fs::read(system_roots_path()).map_err(|e| {
             failed(format!("reading the system's public roots ({}): {e}", system_roots_path().display()))
@@ -108,12 +117,16 @@ pub fn get(url: &str, max: usize) -> Result<Vec<u8>> {
             ClientConnection::new(config.clone(), name).map_err(|e| failed(format!("TLS to {}: {e}", u.host)))?;
         let mut tls = StreamOwned::new(conn, tcp);
         let agent = concat!("ekka-desk-host/", env!("CARGO_PKG_VERSION"));
-        http1::write_request(&mut tls, "GET", &u.target, &u.host, &[("User-Agent", agent), ("Accept", "*/*")], &[])
+        let mut headers = vec![("User-Agent", agent), ("Accept", "*/*")];
+        if body.is_some() {
+            headers.push(("Content-Type", "application/json"));
+        }
+        http1::write_request(&mut tls, method, &u.target, &u.host, &headers, body.unwrap_or("").as_bytes())
             .map_err(|e| failed(format!("asking {}: {e}", u.host)))?;
         let resp = http1::read_response(BufReader::new(tls))?;
         match resp.status {
             200 => return resp.bytes(max),
-            301 | 302 | 303 | 307 | 308 => {
+            301 | 302 | 303 | 307 | 308 if body.is_none() => {
                 url = resp
                     .header("Location")
                     .filter(|l| l.starts_with("https://"))
