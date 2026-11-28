@@ -123,6 +123,9 @@ allow every Node.js process to. The native binary connects as
 `/usr/local/bin/claude` and can be allowed on its own.
 
 The installer builds it on the server from this checkout (`ekka-desk:local`).
+Each release also publishes it, built and signed in CI, for a host that takes a
+desk image only by a signed digest: see
+[the published desk image](docs/OPERATIONS.md#the-published-desk-image).
 
 ## Development
 
