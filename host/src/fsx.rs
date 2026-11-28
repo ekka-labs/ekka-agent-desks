@@ -153,6 +153,36 @@ pub fn open_trusted_dir(path: &Path, top: &Path, owner: u32, make: Option<u32>) 
     }
 }
 
+/// The developer's own folder `name` inside the trusted folder `parent`, opened without following a link, and
+/// theirs alone: owned by `uid`, closed to group and others, no access control list letting anyone else change it.
+/// `None` when it is not there. `what` names it in a reason.
+pub fn private_dir(parent: &OwnedFd, name: &str, what: &Path, uid: u32) -> Result<Option<OwnedFd>> {
+    let fd = match openat(parent, name, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            return Err(refused(format!("{} is a link or not a folder", what.display())))
+        }
+        Err(e) => return Err(errno(format!("opening {}", what.display()), e)),
+    };
+    let st = fstat(&fd).map_err(|e| errno(format!("reading {}", what.display()), e))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::Directory
+        || st.st_uid != uid
+        || mode_bits(st.st_mode) & 0o077 != 0
+    {
+        return Err(refused(format!(
+            "{} is uid {} mode {:o}; it must be uid {uid} mode 700 (install sets it)",
+            what.display(),
+            st.st_uid,
+            mode_bits(st.st_mode)
+        )));
+    }
+    if let Some(why) = acl::unsafe_grant(&fd, Guard::Writes)? {
+        return Err(refused(format!("{}: {why}", what.display())));
+    }
+    Ok(Some(fd))
+}
+
 /// The folder `name` inside the trusted folder `parent`, made if missing, with exactly `mode` and `owner`. A
 /// folder that exists with another owner is refused, never taken over.
 pub fn ensure_dir(parent: &OwnedFd, name: &str, mode: u32, owner: Owner, what: &str) -> Result<(OwnedFd, Wrote)> {
@@ -268,6 +298,43 @@ pub fn write_at(dir: &OwnedFd, name: &str, data: &[u8], mode: u32, owner: Owner)
     Ok(Wrote::Changed)
 }
 
+/// `data` as a NEW regular file `name` in `dir`, with `mode` and `owner`, never replacing anything: it is written
+/// whole beside under another name, saved, and then linked into place, which fails if `name` exists by then. So a
+/// reader sees no file or the whole file, and a file made meanwhile by anyone else is never overwritten.
+/// `Wrote::Unchanged` when `name` already exists (it was left as it is).
+pub fn create_at(dir: &OwnedFd, name: &str, data: &[u8], mode: u32, owner: Owner) -> Result<Wrote> {
+    if !is_plain_name(name) {
+        return Err(failed(format!("{name:?} is not a plain file name")));
+    }
+    let tmp = format!(".{name}.{}.tmp", hex(&random_bytes::<6>()?));
+    let fd = openat(
+        dir,
+        tmp.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| errno(format!("writing {name}"), e))?;
+    let result = (|| {
+        acl::clear(&fd)?;
+        let mut f = File::from(fd);
+        f.write_all(data).map_err(|e| failed(format!("writing {name}: {e}")))?;
+        fchown(f.as_fd(), Some(Uid::from_raw(owner.uid)), Some(Gid::from_raw(owner.gid)))
+            .map_err(|e| errno(format!("giving {name} to uid {}", owner.uid), e))?;
+        fchmod(f.as_fd(), Mode::from_raw_mode(mode as rustix::fs::RawMode))
+            .map_err(|e| errno(format!("setting the mode of {name}"), e))?;
+        fsync(f.as_fd()).map_err(|e| errno(format!("saving {name}"), e))?;
+        match rustix::fs::linkat(dir, tmp.as_str(), dir, name, AtFlags::empty()) {
+            Ok(()) => Ok(Wrote::Changed),
+            Err(Errno::EXIST) => Ok(Wrote::Unchanged),
+            Err(e) => Err(errno(format!("putting {name} in place"), e)),
+        }
+    })();
+    let _ = unlinkat(dir, tmp.as_str(), AtFlags::empty());
+    let wrote = result?;
+    fsync(dir).map_err(|e| errno(format!("{name} was made, and the disk did not confirm it is saved"), e))?;
+    Ok(wrote)
+}
+
 /// The link `name` in `dir` pointing at `target`, replaced atomically. Unchanged when it already points there. A
 /// file or folder in its place is refused.
 pub fn link_at(dir: &OwnedFd, name: &str, target: &str) -> Result<Wrote> {
@@ -351,6 +418,23 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn a_create_never_replaces_what_is_there_not_even_a_link() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = open_trusted_dir(t.path(), t.path(), me().uid, None).unwrap();
+        assert_eq!(create_at(&dir, "k.pem", b"first", 0o600, me()).unwrap(), Wrote::Changed);
+        assert_eq!(std::fs::metadata(t.path().join("k.pem")).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(create_at(&dir, "k.pem", b"second", 0o600, me()).unwrap(), Wrote::Unchanged);
+        assert_eq!(std::fs::read(t.path().join("k.pem")).unwrap(), b"first", "never overwritten");
+        std::fs::write(t.path().join("theirs"), b"theirs").unwrap();
+        std::os::unix::fs::symlink(t.path().join("theirs"), t.path().join("l.pem")).unwrap();
+        assert_eq!(create_at(&dir, "l.pem", b"ours", 0o600, me()).unwrap(), Wrote::Unchanged);
+        assert_eq!(std::fs::read(t.path().join("theirs")).unwrap(), b"theirs", "nothing written through a link");
+        let names: Vec<String> =
+            std::fs::read_dir(t.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
     }
 
     #[test]

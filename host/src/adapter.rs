@@ -5,14 +5,23 @@
 //! Every value comes from this machine: the organization (the binding), the Enclave's API gate (from its node id),
 //! Govern's gate-token keys (Govern's own published configuration), and the gateway as the adapter reaches it here
 //! (`https://127.0.0.1:8080`, this installation's CA, EKKA's issuer for the organization).
+//!
+//! `backend_gateway.signin` (contracts 0.89.0, `ekka_desk_pass.v1`) makes the adapter exchange each admitted
+//! operation's Gate Token at Govern for a short-lived pass, proving it is this installation's with its own key
+//! (`adapter_key`). An adapter built before that refuses a file that has it, so it is written only when every one of
+//! these holds (`signin`): the gateway's registration is this installation's, the key here is the one Govern
+//! registered, and the pinned adapter release reads it. Otherwise it is left out and the reason is said.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::binding::Binding;
 use crate::error::{refused, Result};
 use crate::platform::macos::{Layout, CA_CERT, GATEWAY_PORT, WORKSPACE};
+use crate::registration::Registration;
+use crate::release::Pins;
 use crate::tls::GATEWAY_IP;
 use crate::util::{is_plain_absolute_path, is_uuid};
 
@@ -142,8 +151,56 @@ pub struct AdapterInputs {
     pub govern_keys: Vec<GovernKey>,
 }
 
-/// The adapter's configuration file for this installation.
-pub fn config_bytes(l: &Layout, org: &str, inputs: &AdapterInputs, issuer: &str) -> Result<Vec<u8>> {
+/// The desk-pass sign-in mode's name in the adapter's configuration.
+pub const SIGNIN_MODE: &str = "ekka_desk_pass.v1";
+
+/// `backend_gateway.signin` for the desk-pass mode: who the adapter is at Govern, which gateway it signs in to, and
+/// where its key is (never the key).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signin {
+    pub installation_id: String,
+    pub gateway_id: String,
+    pub key_path: String,
+}
+
+/// The adapter's desk-pass sign-in for this installation, or why it is not written. `key_kid` is the thumbprint of
+/// the usable key at `D/backend/adapter-key.pem`, when there is one.
+pub fn signin(
+    l: &Layout,
+    binding: &Binding,
+    registration: Option<&Registration>,
+    key_kid: Option<&str>,
+    pins: &Pins,
+) -> std::result::Result<Signin, String> {
+    let r = registration.ok_or("waiting: the gateway is not registered for this installation yet")?;
+    r.verify(binding).map_err(|e| e.reason)?;
+    let key = key_kid.ok_or("this installation's adapter key is missing or not safe to use (see adapter_key)")?;
+    match r.adapter_kid.as_deref() {
+        None => return Err("Govern's registration names no adapter key (adapter_kid)".into()),
+        Some(registered) if registered != key => {
+            return Err(format!(
+                "this installation's adapter key (kid {key}) is not the one Govern registered; register it again"
+            ))
+        }
+        Some(_) => {}
+    }
+    crate::release::adapter_signin(pins)?;
+    Ok(Signin {
+        installation_id: binding.installation_id.clone(),
+        gateway_id: r.gateway_id.clone(),
+        key_path: l.backend_dir().join(crate::adapter_key::KEY_FILE).display().to_string(),
+    })
+}
+
+/// The adapter's configuration file for this installation, with the desk-pass sign-in when `signin` is given.
+pub fn config_bytes(
+    l: &Layout,
+    org: &str,
+    inputs: &AdapterInputs,
+    issuer: &str,
+    signin: Option<&Signin>,
+) -> Result<Vec<u8>> {
     if !is_uuid(org) || !is_uuid(&inputs.node_id) {
         return Err(refused("the adapter's organization or the Enclave's node id is not a lowercase UUID"));
     }
@@ -156,7 +213,7 @@ pub fn config_bytes(l: &Layout, org: &str, inputs: &AdapterInputs, issuer: &str)
         return Err(refused("an adapter path is not a plain absolute path"));
     }
     let node = inputs.node_id.replace('-', "");
-    let doc = json!({
+    let mut doc = json!({
         "config_version": 1,
         "organization_id": org,
         "api_gate_instance": format!("enclave{}Api", &node[..8]),
@@ -172,6 +229,27 @@ pub fn config_bytes(l: &Layout, org: &str, inputs: &AdapterInputs, issuer: &str)
         "socket_path": paths[1].display().to_string(),
         "state_dir": paths[2].display().to_string(),
     });
+    if let Some(s) = signin {
+        if !is_uuid(&s.installation_id) || !is_plain_absolute_path(&s.key_path) {
+            return Err(refused("the adapter's sign-in names no installation id or no plain key path"));
+        }
+        // The real path (`/private/var/...`): the adapter opens it one folder at a time and refuses a link.
+        if Path::new(&s.key_path) != l.backend_dir().join(crate::adapter_key::KEY_FILE) {
+            return Err(refused("the adapter's key path is not this installation's D/backend/adapter-key.pem"));
+        }
+        crate::identity::gateway_class(&s.gateway_id)?;
+        // The contract's rule for this mode: the issuer is Govern's for this organization, `<origin>/oidc/orgs/<org>`.
+        let govern = issuer.strip_prefix("https://").and_then(|r| r.split_once('/'));
+        if !govern.is_some_and(|(host, path)| !host.is_empty() && path == format!("oidc/orgs/{org}")) {
+            return Err(refused("the desk-pass sign-in needs Govern's issuer for this organization"));
+        }
+        doc["backend_gateway"]["signin"] = json!({
+            "mode": SIGNIN_MODE,
+            "installation_id": s.installation_id,
+            "gateway_id": s.gateway_id,
+            "key_path": s.key_path,
+        });
+    }
     let mut out = serde_json::to_vec_pretty(&doc).map_err(|e| refused(format!("the adapter's configuration: {e}")))?;
     out.push(b'\n');
     Ok(out)
@@ -219,9 +297,10 @@ EKKA_GOVERN_URL=https://govern.example.com\nOTHER=x\n";
             }],
         };
         let issuer = "https://govern.example.com/oidc/orgs/7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7";
-        let v: Value =
-            serde_json::from_slice(&config_bytes(&l, "7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7", &inputs, issuer).unwrap())
-                .unwrap();
+        let v: Value = serde_json::from_slice(
+            &config_bytes(&l, "7c1e2a3b-4d5e-4f60-8a71-92b3c4d5e6f7", &inputs, issuer, None).unwrap(),
+        )
+        .unwrap();
         let schema: Value =
             serde_json::from_str(include_str!("../../vendor/ekka-contracts/backend/adapter-config.v1.schema.json"))
                 .unwrap();
@@ -240,6 +319,6 @@ EKKA_GOVERN_URL=https://govern.example.com\nOTHER=x\n";
         assert_eq!(v["socket_path"], "/private/var/db/ekka-dev/501/run/backend/backend.sock");
         assert_eq!(v["state_dir"], "/private/var/db/ekka-dev/501/backend");
         assert_eq!(v["backend_gateway"]["url"], "https://127.0.0.1:8080");
-        assert!(config_bytes(&l, "not-a-uuid", &inputs, issuer).is_err());
+        assert!(config_bytes(&l, "not-a-uuid", &inputs, issuer, None).is_err());
     }
 }

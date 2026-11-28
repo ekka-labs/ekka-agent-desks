@@ -30,6 +30,8 @@ toml = "0.8.23"
 zeroize = "1.8.1"
 
 [dev-dependencies]
+# Tests only: the vendored contract schemas' `pattern` rules (src/schema_check.rs). Never in the program.
+regex-lite = "0.1.9"
 tempfile = "3.25.0"
 
 [profile.release]

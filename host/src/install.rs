@@ -4,9 +4,10 @@
 //! In order: run only from the root-owned copy of this program; refuse another organization, developer or
 //! environment before any change (one installation per Mac); check every download and image as the developer;
 //! work out what root must change, and ask for the password once only when something does; then, as the
-//! developer, write the LaunchAgents and start them in the login session (the gateway only after the Enclave's
-//! interceptor answers), start a fresh memory meter, and run the gateway's one-time setup when it can. Every
-//! other step reads first and changes only what differs. What cannot be done yet is named, with what it waits for.
+//! developer, make the adapter's signing key if there is none, write the LaunchAgents and start them in the login
+//! session (the gateway only after the Enclave's interceptor answers), start a fresh memory meter, and say whether
+//! the gateway's one-time setup (`gateway-setup`) is done. Every other step reads first and changes only what
+//! differs. What cannot be done yet is named, with what it waits for.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -14,9 +15,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::adapter::{self, AdapterInputs};
+use crate::adapter_key;
 use crate::apply::{self, Ctx, Owners, RootPlan, PLAN_SCHEMA};
 use crate::binding::{Binding, Want};
-use crate::bootstrap::{self, Desired, GatewayAdmin, GovernExchangeNotYetAvailable, Pass, Stop};
 use crate::error::{failed, refused, usage, Result};
 use crate::fsx::Owner;
 use crate::identity::{self, Profile};
@@ -40,6 +41,8 @@ pub struct Args {
     pub memory_mib: Option<u64>,
     pub rotate_ca: bool,
     pub raise_ceiling: bool,
+    /// Replace the adapter's signing key, which is otherwise never replaced; the new one must be registered.
+    pub rotate_adapter_key: bool,
 }
 
 /// What an install did and what it still waits for.
@@ -63,35 +66,6 @@ fn wait_for(what: &str, limit: Duration, mut ready: impl FnMut() -> bool) -> boo
     }
     say(format!("{what}: not yet, after {} s", limit.as_secs()));
     false
-}
-
-/// The gateway calls for setup are made with Govern's setup pass, which this release cannot obtain; until then
-/// no call is ever made (the pass source stops first).
-struct GatewayNotCalled;
-
-fn no_pass<T>() -> std::result::Result<T, Stop> {
-    Err(Stop::Pending("no gateway call without a setup pass".into()))
-}
-
-impl GatewayAdmin for GatewayNotCalled {
-    fn workspace_exists(&mut self, _: &Pass, _: &str) -> std::result::Result<bool, Stop> {
-        no_pass()
-    }
-    fn create_workspace(&mut self, _: &Pass, _: &str) -> std::result::Result<(), Stop> {
-        no_pass()
-    }
-    fn members(&mut self, _: &Pass, _: &str) -> std::result::Result<Vec<bootstrap::Member>, Stop> {
-        no_pass()
-    }
-    fn add_member(&mut self, _: &Pass, _: &str, _: &bootstrap::Member) -> std::result::Result<(), Stop> {
-        no_pass()
-    }
-    fn profiles(&mut self, _: &Pass) -> std::result::Result<Vec<bootstrap::ProviderProfile>, Stop> {
-        no_pass()
-    }
-    fn import_profiles(&mut self, _: &Pass, _: &[bootstrap::ProviderProfile]) -> std::result::Result<(), Stop> {
-        no_pass()
-    }
 }
 
 /// The gateway's LaunchAgent, as `registration::finish` drives it.
@@ -331,6 +305,11 @@ pub fn run(args: &Args) -> Result<Outcome> {
     };
 
     println!("== what root owns");
+    let owners = Owners { root: Owner { uid: 0, gid: 0 }, dev: Owner { uid: user.uid, gid: user.gid } };
+    // The adapter key as it is now, read only: root writes the adapter's desk-pass sign-in only for the key Govern
+    // registered. A key about to be replaced is no key.
+    let key_kid =
+        if args.rotate_adapter_key { None } else { adapter_key::inspect(&l, owners).kid().map(str::to_string) };
     let plan = RootPlan {
         schema: PLAN_SCHEMA.into(),
         want: want.clone(),
@@ -341,10 +320,10 @@ pub fn run(args: &Args) -> Result<Outcome> {
         adapter: adapter_inputs,
         rotate_ca: args.rotate_ca,
         raise_ceiling: args.raise_ceiling,
+        adapter_kid: key_kid,
     };
     let roots = std::fs::read(crate::net::system_roots_path())
         .map_err(|e| failed(format!("reading the system's public roots: {e}")))?;
-    let owners = Owners { root: Owner { uid: 0, gid: 0 }, dev: Owner { uid: user.uid, gid: user.gid } };
     let mut check = Ctx::check();
     apply::root_apply(&plan, &l, owners, &pins, &roots, &mut check)?;
     if check.changes.is_empty() {
@@ -378,6 +357,24 @@ pub fn run(args: &Args) -> Result<Outcome> {
             false
         }
     };
+
+    println!("== the adapter's signing key");
+    let registered_kid = registration.as_ref().filter(|_| registered).and_then(|r| r.adapter_kid.as_deref());
+    let key = adapter_key::ensure(&l, owners, args.rotate_adapter_key, registered_kid)?;
+    out.changes.extend(key.changed.clone());
+    out.pending.extend(key.problem.clone());
+    if let Some(kid) = key.state.kid() {
+        say(format!(
+            "kid {kid}: its public half is in status --json (adapter_public_jwk), for registering the gateway"
+        ));
+    }
+    if plan.adapter.is_some() && key.problem.is_none() {
+        if let Err(why) = adapter::signin(&l, &binding, registration.as_ref(), key.state.kid(), &pins) {
+            out.pending.push(format!("the adapter's desk-pass sign-in is not written: {why}"));
+        }
+    }
+    // The adapter reads its configuration once, when it starts.
+    let adapter_config_changed = out.changes.iter().any(|c| c.contains(&l.adapter_config().display().to_string()));
 
     println!("== the services, in your login session");
     let public = std::fs::read_to_string(l.jwt_dir().join(macos::JWT_PUBLIC))
@@ -492,7 +489,8 @@ pub fn run(args: &Args) -> Result<Outcome> {
             if wait_for("the gateway", Duration::from_secs(60), || tls::probe(addr, tls::GATEWAY_DNS, &ca).is_ok()) {
                 say("the gateway answers with verified TLS on 127.0.0.1");
                 if plan.adapter.is_some() {
-                    macos::bootstrap(user.uid, LABEL_BACKEND, &l.plist(LABEL_BACKEND), changed[LABEL_BACKEND])?;
+                    let again = changed[LABEL_BACKEND] || adapter_config_changed;
+                    macos::bootstrap(user.uid, LABEL_BACKEND, &l.plist(LABEL_BACKEND), again)?;
                 }
             } else {
                 out.pending.push(format!("the gateway did not answer; see {}", l.logs().join("gateway.log").display()));
@@ -505,28 +503,12 @@ pub fn run(args: &Args) -> Result<Outcome> {
     say(format!("a fresh {} runs on your Docker Desktop", meter::NAME));
 
     println!("== the gateway's one-time setup");
-    match (registration.as_ref().filter(|_| registered).map(|r| &r.gateway_id), &enclave) {
-        (Some(gateway_id), Some(e)) => {
-            let want = Desired::for_subjects(
-                &format!("enclave/{}", e.node_id),
-                &format!("adapter/{}", binding.installation_id),
-            )
-            .map_err(|s| failed(format!("{s:?}")))?;
-            match bootstrap::reconcile(
-                &mut GovernExchangeNotYetAvailable,
-                &mut GatewayNotCalled,
-                gateway_id,
-                &want,
-                &std::time::SystemTime::now,
-            ) {
-                Ok(r) if r.ready => out.changes.extend(r.changed),
-                Ok(r) => out.pending.extend(r.problems),
-                Err(Stop::Pending(why)) => out.pending.push(why),
-                Err(Stop::Expired) => out.pending.push("the setup pass expired; run install again to resume".into()),
-                Err(Stop::Failed(why)) => return Err(failed(format!("the gateway's setup: {why}"))),
-            }
-        }
-        _ => out.pending.push("the gateway's setup: it needs the registered gateway and the enrolled Enclave".into()),
+    match crate::gateway_setup::check(&l, owners) {
+        Ok(()) => say("done: the gateway read back the desks workspace, its two members and every profile"),
+        Err(why) => out.pending.push(format!(
+            "the gateway's one-time setup: {why}. ekka desk setup --local opens a one-time authorization at Govern \
+             and passes it to ekka-desk-host gateway-setup on stdin"
+        )),
     }
     Ok(out)
 }

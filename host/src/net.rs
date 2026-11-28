@@ -89,10 +89,54 @@ pub fn get(url: &str, max: usize) -> Result<Vec<u8>> {
 
 /// A JSON POST to `url` (no redirects followed), its answer at most `max` bytes, over https only.
 pub fn post_json(url: &str, body: &str, max: usize) -> Result<Vec<u8>> {
-    request(url, "POST", Some(body), max)
+    request(url, "POST", Some((body.as_bytes(), "application/json")), max)
 }
 
-fn request(url: &str, method: &str, body: Option<&str>, max: usize) -> Result<Vec<u8>> {
+/// An `application/x-www-form-urlencoded` POST and its answer, whatever its status: what an OAuth token endpoint
+/// takes. A fake stands in for it in tests.
+pub trait FormPost {
+    /// The answer's status and body (at most 64 KiB). The body is zeroed when dropped: it may hold a token.
+    fn post_form(&mut self, url: &str, form: &[(&str, &str)]) -> Result<(u16, zeroize::Zeroizing<Vec<u8>>)>;
+}
+
+/// The form body for `form`, every value percent-encoded; zeroed when dropped, as it may hold a secret.
+pub fn form_body(form: &[(&str, &str)]) -> zeroize::Zeroizing<String> {
+    let mut out = zeroize::Zeroizing::new(String::new());
+    for (i, (k, v)) in form.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        out.push_str(&http1::query_escape(k));
+        out.push('=');
+        out.push_str(&http1::query_escape(v));
+    }
+    out
+}
+
+/// The real one: https only, verified against the system's public roots, no redirect followed.
+pub struct Https;
+
+impl FormPost for Https {
+    fn post_form(&mut self, url: &str, form: &[(&str, &str)]) -> Result<(u16, zeroize::Zeroizing<Vec<u8>>)> {
+        let body = form_body(form);
+        let (status, bytes) =
+            exchange(url, "POST", Some((body.as_bytes(), "application/x-www-form-urlencoded")), 64 * 1024, false)?;
+        Ok((status, zeroize::Zeroizing::new(bytes)))
+    }
+}
+
+fn request(url: &str, method: &str, body: Option<(&[u8], &str)>, max: usize) -> Result<Vec<u8>> {
+    match exchange(url, method, body, max, body.is_none())? {
+        (200, bytes) => Ok(bytes),
+        (s, _) => {
+            Err(failed(format!("{} answered {s} for a download", parse(url).map(|u| u.host).unwrap_or_default())))
+        }
+    }
+}
+
+/// One request and its answer's status and body (at most `max` bytes), following up to five https redirects when
+/// `follow` is set.
+fn exchange(url: &str, method: &str, body: Option<(&[u8], &str)>, max: usize, follow: bool) -> Result<(u16, Vec<u8>)> {
     let roots = pem_certs(
         &std::fs::read(system_roots_path()).map_err(|e| {
             failed(format!("reading the system's public roots ({}): {e}", system_roots_path().display()))
@@ -118,22 +162,21 @@ fn request(url: &str, method: &str, body: Option<&str>, max: usize) -> Result<Ve
         let mut tls = StreamOwned::new(conn, tcp);
         let agent = concat!("ekka-desk-host/", env!("CARGO_PKG_VERSION"));
         let mut headers = vec![("User-Agent", agent), ("Accept", "*/*")];
-        if body.is_some() {
-            headers.push(("Content-Type", "application/json"));
+        if let Some((_, kind)) = body {
+            headers.push(("Content-Type", kind));
         }
-        http1::write_request(&mut tls, method, &u.target, &u.host, &headers, body.unwrap_or("").as_bytes())
+        http1::write_request(&mut tls, method, &u.target, &u.host, &headers, body.map_or(&[][..], |(b, _)| b))
             .map_err(|e| failed(format!("asking {}: {e}", u.host)))?;
         let resp = http1::read_response(BufReader::new(tls))?;
         match resp.status {
-            200 => return resp.bytes(max),
-            301 | 302 | 303 | 307 | 308 if body.is_none() => {
+            301 | 302 | 303 | 307 | 308 if follow => {
                 url = resp
                     .header("Location")
                     .filter(|l| l.starts_with("https://"))
                     .ok_or_else(|| refused(format!("{} redirected somewhere that is not https", u.host)))?
                     .to_string();
             }
-            s => return Err(failed(format!("{} answered {s} for a download", u.host))),
+            s => return Ok((s, resp.bytes(max)?)),
         }
     }
     Err(failed("a download redirected too many times"))
@@ -150,6 +193,12 @@ mod tests {
         assert!(parse("https://github.com/a b").is_err());
         let u = parse("https://GitHub.com:8443/NVIDIA/x?y=1").unwrap();
         assert_eq!((u.host.as_str(), u.port, u.target.as_str()), ("github.com", 8443, "/NVIDIA/x?y=1"));
+    }
+
+    #[test]
+    fn a_form_is_percent_encoded_field_by_field() {
+        let body = form_body(&[("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"), ("a b", "x&y=z")]);
+        assert_eq!(&*body, "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&a%20b=x%26y%3Dz");
     }
 
     #[test]

@@ -41,6 +41,10 @@ pub struct Registration {
     pub endpoint: String,
     pub workspace: String,
     pub oidc: Oidc,
+    /// The RFC 7638 thumbprint of the adapter key Govern registered (`gateway.adapter_kid`). The adapter's
+    /// desk-pass sign-in is written only when this installation's key has this thumbprint (`adapter::signin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_kid: Option<String>,
 }
 
 impl Registration {
@@ -68,6 +72,7 @@ impl Registration {
                 user_role: otext("user_role").ok_or_else(bad)?,
                 jwks_ttl_secs: o["jwks_ttl_secs"].as_u64().ok_or_else(bad)?,
             },
+            adapter_kid: text("adapter_kid"),
         })
     }
 
@@ -280,6 +285,7 @@ pub(crate) mod tests {
         let b = binding();
         let good = Registration::from_answer(&answer(&b)).unwrap();
         assert_eq!(good.verify(&b).unwrap().audience, GATEWAY);
+        assert_eq!(good.adapter_kid.as_deref(), Some("x"), "the registered adapter key's thumbprint is kept");
         for (path, value) in [
             ("/gateway/installation_id", serde_json::json!("5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d")),
             ("/gateway/tenant_id", serde_json::json!("0d0e0f10-1112-4314-8516-171819202122")),

@@ -3,7 +3,7 @@
 //!
 //! It runs on a one-time EKKA setup pass held in memory only: never written, never printed, never passed to
 //! another program. Two small traits keep the two outside parties apart: `SetupPass` obtains the pass (Govern's
-//! exchange), and `GatewayAdmin` makes the gateway calls with it. Every step reads first and changes only what is
+//! exchange of a setup authorization, `gateway_setup`), and `GatewayAdmin` makes the gateway calls with it. Every step reads first and changes only what is
 //! missing, so running it twice, or again after an interruption, ends in the same state. A member already present
 //! with another role, or a profile that differs at the gateway, is reported and left alone, never changed
 //! silently. When the pass has expired the run stops and asks for a fresh authorization.
@@ -23,14 +23,13 @@ pub struct Pass {
     expires_at: SystemTime,
 }
 
-// The pass's maker and its user are Govern's exchange and the gateway client; until they land, only the tests
-// make and read a pass.
-#[allow(dead_code)]
 impl Pass {
     pub fn new(token: String, expires_at: SystemTime) -> Self {
         Pass { token, expires_at }
     }
-    /// The bearer, for the gateway call that needs it and nothing else.
+    /// The bearer, for the gateway call that needs it and nothing else. Only the gateway's admin client reads it,
+    /// and this build has none yet (`gateway_setup::NoAdminClient`); the tests' fake gateway does.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn bearer(&self) -> &str {
         &self.token
     }
@@ -65,6 +64,9 @@ pub enum Stop {
     Expired,
     /// The gateway refused or failed; the reason names the step.
     Failed(String),
+    /// Govern refused the authorization (used, closed, expired, or its opener no longer may); nothing was changed
+    /// at the gateway. A fresh authorization is needed.
+    Refused(String),
 }
 
 /// Obtains the one-time setup pass. Govern's exchange implements this when it is available.
@@ -86,6 +88,11 @@ pub struct ProviderProfile {
 
 /// The gateway calls setup makes, each with the pass.
 pub trait GatewayAdmin {
+    /// Whether this client can reach the gateway's admin API at all; asked before any authorization is redeemed,
+    /// so one is never spent on a client that cannot use the pass.
+    fn available(&self) -> Result<(), String> {
+        Ok(())
+    }
     fn workspace_exists(&mut self, pass: &Pass, name: &str) -> Result<bool, Stop>;
     fn create_workspace(&mut self, pass: &Pass, name: &str) -> Result<(), Stop>;
     fn members(&mut self, pass: &Pass, workspace: &str) -> Result<Vec<Member>, Stop>;
@@ -119,6 +126,21 @@ impl Desired {
             ],
             profiles,
         })
+    }
+}
+
+impl Desired {
+    /// A digest of everything setup brings the gateway to: the record of a finished setup names it, so `status`
+    /// can tell a setup made for another Enclave, installation or set of profiles from this one.
+    pub fn digest(&self) -> String {
+        let doc = serde_json::json!({
+            "workspace": self.workspace,
+            "members": self.members.iter().map(|m| serde_json::json!({"subject": m.subject, "role": m.role}))
+                .collect::<Vec<_>>(),
+            "profiles": self.profiles.iter().map(|p| serde_json::json!({"name": p.name, "definition": p.definition}))
+                .collect::<Vec<_>>(),
+        });
+        crate::util::sha256_hex(doc.to_string().as_bytes())
     }
 }
 
@@ -204,19 +226,6 @@ pub fn reconcile(
     r.problems.dedup();
     r.ready = r.problems.is_empty();
     Ok(r)
-}
-
-/// The setup pass while Govern's exchange is not available to this host: setup waits, changing nothing.
-pub struct GovernExchangeNotYetAvailable;
-
-impl SetupPass for GovernExchangeNotYetAvailable {
-    fn obtain(&mut self, _gateway_audience: &str) -> Result<Pass, Stop> {
-        Err(Stop::Pending(
-            "the gateway's one-time setup needs an EKKA setup pass from Govern, which this release cannot obtain yet; \
-             nothing was changed at the gateway"
-                .into(),
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -370,18 +379,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_digest_names_the_subjects_and_the_profiles() {
+        let a = want();
+        assert_eq!(a.digest(), want().digest());
+        let other = Desired::for_subjects(
+            "enclave/0d0e0f10-1112-4314-8516-171819202122",
+            "adapter/5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d",
+        )
+        .unwrap();
+        assert_ne!(a.digest(), other.digest(), "another Enclave");
+        let mut edited = want();
+        edited.profiles[0].definition["description"] = "edited".into();
+        assert_ne!(a.digest(), edited.digest(), "another profile");
+    }
+
+    #[test]
     fn the_pass_is_held_in_memory_and_never_shown() {
         let p = Pass::new("secret-bearer".into(), SystemTime::now() + Duration::from_secs(60));
         assert!(!format!("{p:?}").contains("secret-bearer"));
         let report = reconcile(&mut govern(), &mut FakeGateway::default(), AUD, &want(), &SystemTime::now).unwrap();
         assert!(!serde_json::to_string(&report).unwrap().contains("setup-pass"));
-    }
-
-    #[test]
-    fn without_governs_exchange_setup_waits_and_changes_nothing() {
-        let mut gw = FakeGateway::default();
-        let stop = reconcile(&mut GovernExchangeNotYetAvailable, &mut gw, AUD, &want(), &SystemTime::now).unwrap_err();
-        assert!(matches!(stop, Stop::Pending(_)));
-        assert!(gw.bearers_seen.is_empty() && gw.workspaces.is_empty());
     }
 }

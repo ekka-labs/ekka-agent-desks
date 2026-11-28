@@ -268,6 +268,11 @@ pub struct RootPlan {
     /// Allow the desk CPU or memory ceiling to go up (it may always go down); recorded when used.
     #[serde(default)]
     pub raise_ceiling: bool,
+    /// The RFC 7638 thumbprint of the usable adapter key at `D/backend/adapter-key.pem`, as the developer's side
+    /// read it. Root writes the adapter's desk-pass sign-in only when Govern registered exactly this key
+    /// (`adapter::signin`); root never reads the key itself.
+    #[serde(default)]
+    pub adapter_kid: Option<String>,
 }
 
 pub const PLAN_SCHEMA: &str = "ekka-desk-host.root-plan/v2";
@@ -291,6 +296,9 @@ impl RootPlan {
             if pins.adapter.is_none() || self.adapter_staged.is_none() {
                 return Err(refused("the adapter is configured but not pinned or not staged"));
             }
+        }
+        if self.adapter_kid.as_deref().is_some_and(|k| !crate::adapter_key::is_kid(k)) {
+            return Err(refused("the plan's adapter key thumbprint is not one"));
         }
         for p in [Some(&self.gateway_staged), self.adapter_staged.as_ref()].into_iter().flatten() {
             if !p.is_absolute() {
@@ -699,7 +707,10 @@ pub fn root_apply(
     }
     if let Some(inputs) = &plan.adapter {
         let issuer = identity::issuer(&binding.env, &binding.org)?;
-        let cfg = adapter::config_bytes(l, &binding.org, inputs, &issuer)?;
+        // The desk-pass sign-in only when this installation's registration names this key and the pinned adapter
+        // reads it; otherwise left out (an older adapter refuses a file that has it).
+        let signin = adapter::signin(l, &binding, plan.registration.as_ref(), plan.adapter_kid.as_deref(), pins).ok();
+        let cfg = adapter::config_bytes(l, &binding.org, inputs, &issuer, signin.as_ref())?;
         ctx.file(dfd.as_ref(), &d, "backend-config.json", &cfg, 0o644, root)?;
     }
 
@@ -821,6 +832,7 @@ pub(crate) mod tests {
             adapter: None,
             rotate_ca: false,
             raise_ceiling: false,
+            adapter_kid: None,
         };
         let roots = std::fs::read(crate::net::system_roots_path()).unwrap();
         Rig { dir, layout, pins, plan, roots }
@@ -1000,6 +1012,108 @@ pub(crate) mod tests {
         std::fs::write(t.join(CA_CERT), other_ca).unwrap();
         let e = root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap_err();
         assert!(e.reason.contains("is not the certificate of the installation CA's key"), "{e}");
+    }
+
+    /// A rig with the backend adapter pinned (at `version`) and staged, and the enrolled Enclave's inputs.
+    pub(crate) fn with_adapter(r: &mut Rig, version: &str) {
+        let mut program = fake_program();
+        program.extend_from_slice(b" and the adapter");
+        let staged = r.layout.home.join("ekka-backend");
+        std::fs::write(&staged, &program).unwrap();
+        r.pins.adapter = Some(Pinned {
+            binary: "ekka-backend".into(),
+            archive_url: "https://example.com/a.tar.gz".into(),
+            checksums_url: "https://example.com/sums.txt".into(),
+            release_asset: "ekka-backend-aarch64-apple-darwin.tar.gz".into(),
+            archive_sha256: "a".repeat(64),
+            binary_sha256: crate::util::sha256_hex(&program),
+        });
+        r.pins.adapter_version = Some(version.into());
+        r.plan.adapter_staged = Some(staged);
+        r.plan.adapter = Some(AdapterInputs {
+            node_id: "2f8e7d6c-5b4a-4392-8170-6e5d4c3b2a19".into(),
+            govern_keys: vec![crate::adapter::GovernKey {
+                key_id: "govern-gate-token-v1".into(),
+                public_key_b64: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".into(),
+            }],
+        });
+    }
+
+    fn adapter_config(r: &Rig) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(r.layout.adapter_config()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_adapter_signs_in_with_a_desk_pass_only_for_its_registered_key_and_a_release_that_reads_it() {
+        let mut r = rig();
+        with_adapter(&mut r, "0.3.0");
+        registered(&mut r, owners());
+        let key = crate::adapter_key::ensure(&r.layout, owners(), false, None).unwrap();
+        let kid = key.state.kid().unwrap().to_string();
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../vendor/ekka-contracts/backend/adapter-config.v1.schema.json"))
+                .unwrap();
+        let apply = |r: &mut Rig, registered_kid: Option<&str>, plan_kid: Option<&str>, from: Option<&str>| {
+            r.plan.registration.as_mut().unwrap().adapter_kid = registered_kid.map(str::to_string);
+            r.plan.adapter_kid = plan_kid.map(str::to_string);
+            r.pins.adapter_signin_from = from.map(str::to_string);
+            root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+            let v = adapter_config(r);
+            assert_eq!(crate::schema_check::errors(&v, &schema), Vec::<String>::new(), "the whole file, every time");
+            v["backend_gateway"]["signin"].clone()
+        };
+        // Today: no adapter release reads it, so it is never written, even for the registered key.
+        assert!(apply(&mut r, Some(&kid), Some(&kid), None).is_null());
+        // A release that reads it, and the registered key: written, naming this installation, this gateway and the key.
+        let signin = apply(&mut r, Some(&kid), Some(&kid), Some("0.3.0"));
+        let b = Binding::read(&r.layout.binding()).unwrap().unwrap();
+        assert_eq!(
+            signin,
+            serde_json::json!({"mode": "ekka_desk_pass.v1", "installation_id": b.installation_id, "gateway_id": GATEWAY,
+                "key_path": r.layout.backend_dir().join("adapter-key.pem").display().to_string()})
+        );
+        assert_eq!(adapter_config(&r)["backend_gateway"]["issuer"], identity::issuer("prod", ORG).unwrap());
+        // Any one of these missing, and it is taken out again: an older adapter, another key, no key, no kid.
+        assert!(apply(&mut r, Some(&kid), Some(&kid), Some("0.4.0")).is_null(), "the pinned 0.3.0 predates 0.4.0");
+        assert!(apply(&mut r, Some("oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U"), Some(&kid), Some("0.3.0")).is_null());
+        assert!(apply(&mut r, Some(&kid), None, Some("0.3.0")).is_null());
+        assert!(apply(&mut r, None, Some(&kid), Some("0.3.0")).is_null());
+        assert!(apply(&mut r, Some(&kid), Some(&kid), Some("0.3.0")).is_object());
+        r.plan.registration = None;
+        root_apply(&r.plan, &r.layout, owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        assert!(adapter_config(&r)["backend_gateway"]["signin"].is_null(), "not registered: never written");
+    }
+
+    /// The adapter opens its key one folder at a time from `/`, refusing a link: `/var` is one on a Mac, so the
+    /// path written is the real one.
+    #[test]
+    fn the_adapter_key_path_is_the_real_private_var_path() {
+        let l = Layout::system(501, PathBuf::from("/Users/dev"));
+        let mut r = rig();
+        with_adapter(&mut r, "0.3.0");
+        let b = registered(&mut r, owners());
+        let mut reg = r.plan.registration.clone().unwrap();
+        reg.adapter_kid = Some("oKIywvGUpTVTyxMQ3bwIIeQUudfr_CkLMjCE19ECD-U".into());
+        r.pins.adapter_signin_from = Some("0.3.0".into());
+        let s = crate::adapter::signin(&l, &b, Some(&reg), reg.adapter_kid.as_deref(), &r.pins).unwrap();
+        assert_eq!(s.key_path, "/private/var/db/ekka-dev/501/backend/adapter-key.pem");
+        let cfg = crate::adapter::config_bytes(
+            &l,
+            ORG,
+            r.plan.adapter.as_ref().unwrap(),
+            &identity::issuer("prod", ORG).unwrap(),
+            Some(&s),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cfg).unwrap();
+        assert_eq!(v["backend_gateway"]["signin"]["key_path"], "/private/var/db/ekka-dev/501/backend/adapter-key.pem");
+        assert!(!String::from_utf8(cfg).unwrap().contains("\"/var/"), "never through the /var link");
+        let issuer = identity::issuer("prod", ORG).unwrap();
+        let mut wrong = s.clone();
+        wrong.key_path = "/var/db/ekka-dev/501/backend/adapter-key.pem".into();
+        assert!(crate::adapter::config_bytes(&l, ORG, r.plan.adapter.as_ref().unwrap(), &issuer, Some(&wrong)).is_err());
+        let keycloak = "https://desks.example.com/realms/ekka-desks";
+        assert!(crate::adapter::config_bytes(&l, ORG, r.plan.adapter.as_ref().unwrap(), keycloak, Some(&s)).is_err());
     }
 
     #[test]

@@ -38,6 +38,10 @@ pub struct Pins {
     pub gateway: Pinned,
     /// `None` while the adapter's Darwin release is not pinned: the host then installs no adapter and says so.
     pub adapter: Option<Pinned>,
+    /// The pinned adapter's release version (`0.2.0`), when one is pinned.
+    pub adapter_version: Option<String>,
+    /// The first adapter release that reads the desk-pass sign-in (`ADAPTER_SIGNIN_MIN_VERSION`).
+    pub adapter_signin_from: Option<String>,
     pub supervisor: ImagePin,
     pub sandbox: ImagePin,
     pub meter_image: String,
@@ -105,6 +109,9 @@ impl Pins {
         // TODO(adapter release): the Darwin adapter is not published yet; its pins are null until it is.
         let adapter = match (a["version"].as_str(), a["archive_sha256"].as_str(), a["binary_sha256"].as_str()) {
             (Some(v), Some(_), Some(_)) => {
+                if version_parts(v).is_none() {
+                    return Err(failed("deploy/pins.json: macos.ekka_backend.version is not <major>.<minor>.<patch>"));
+                }
                 let release = text(&a["release"], "macos.ekka_backend.release")?;
                 let asset = text(&a["release_asset"], "macos.ekka_backend.release_asset")?;
                 Some(Pinned {
@@ -132,6 +139,8 @@ impl Pins {
         };
         Ok(Pins {
             gateway,
+            adapter_version: adapter.as_ref().and(a["version"].as_str()).map(str::to_string),
+            adapter_signin_from: ADAPTER_SIGNIN_MIN_VERSION.map(str::to_string),
             adapter,
             supervisor: img("supervisor")?,
             sandbox: img("sandbox")?,
@@ -159,6 +168,49 @@ impl Pins {
         }
         format!("{}-{}", env!("CARGO_PKG_VERSION"), &sha256_hex(basis.as_bytes())[..12])
     }
+}
+
+/// The first backend adapter release that reads `backend_gateway.signin` (the desk-pass sign-in, contracts
+/// `backend/adapter-config.v1` from 0.89.0). An older adapter refuses a configuration that has it, so the host
+/// writes `signin` only for a pinned adapter at or after this version. `None` until that release is published: no
+/// pinned adapter reads it yet, and `signin` is never written.
+pub const ADAPTER_SIGNIN_MIN_VERSION: Option<&str> = None;
+
+/// `major.minor.patch`, numbers only (a pre-release or build suffix is not a release this compares).
+fn version_parts(v: &str) -> Option<(u64, u64, u64)> {
+    let mut it = v.split('.').map(|p| {
+        (!p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse::<u64>().ok())
+            .flatten()
+    });
+    let parts = (it.next()??, it.next()??, it.next()??);
+    it.next().is_none().then_some(parts)
+}
+
+/// Whether an adapter pinned at `pinned` reads the desk-pass sign-in, given the first release that does; why not
+/// when it does not.
+pub fn signin_support(pinned: Option<&str>, min: Option<&str>) -> std::result::Result<(), String> {
+    let Some(pinned) = pinned else {
+        return Err("waiting: no backend adapter is pinned for a Mac in this release".into());
+    };
+    let Some(min) = min else {
+        return Err(format!(
+            "waiting: the pinned backend adapter {pinned} does not read the desk-pass sign-in, and no adapter release \
+             that does is published yet"
+        ));
+    };
+    match (version_parts(pinned), version_parts(min)) {
+        (Some(have), Some(want)) if have >= want => Ok(()),
+        (Some(_), Some(_)) => Err(format!(
+            "waiting: the pinned backend adapter {pinned} predates {min}, the first that reads the desk-pass sign-in"
+        )),
+        _ => Err(format!("the adapter version {pinned:?} or {min:?} is not <major>.<minor>.<patch>")),
+    }
+}
+
+/// Whether this release's pinned adapter reads the desk-pass sign-in (`signin_support` for these pins).
+pub fn adapter_signin(pins: &Pins) -> std::result::Result<(), String> {
+    signin_support(pins.adapter_version.as_deref(), pins.adapter_signin_from.as_deref())
 }
 
 /// The one entry for `asset` in a `sha256sum`-style checksum file. Every line must be `<64 hex>  <name>` (or
@@ -343,6 +395,7 @@ mod tests {
         assert!(p.gateway.archive_url.starts_with("https://github.com/NVIDIA/OpenShell/releases/download/v0.1.9/"));
         assert_eq!(p.gateway.archive_sha256, "b348a57b97dc755d6a668631d328dd03fa88dc1b3565f16a094c9c59a420c51a");
         assert!(p.adapter.is_none(), "the Darwin adapter is not published yet; pin it when it is");
+        assert_eq!(p.adapter_version, None);
         assert!(p.desk_image.is_none(), "no published desk image for a Mac yet; pin it when there is");
         assert_eq!(
             p.meter_image,
@@ -432,11 +485,32 @@ mod tests {
         p["macos"]["ekka_backend"]["binary_sha256"] = "b".repeat(64).into();
         let pins = Pins::parse(&p.to_string()).unwrap();
         let a = pins.adapter.clone().unwrap();
+        assert_eq!(pins.adapter_version.as_deref(), Some("0.2.0"));
         assert_eq!(
             a.archive_url,
             "https://github.com/ekka-labs/ekka-backend/releases/download/v0.2.0/ekka-backend-aarch64-apple-darwin.tar.gz"
         );
         assert_ne!(pins.release_id(), Pins::embedded().unwrap().release_id(), "a new pin makes a new release");
+    }
+
+    #[test]
+    fn signin_is_written_only_for_an_adapter_release_that_reads_it() {
+        // Today: nothing pinned, and no release that reads it named.
+        assert!(adapter_signin(&Pins::embedded().unwrap()).unwrap_err().starts_with("waiting"));
+        assert_eq!(ADAPTER_SIGNIN_MIN_VERSION, None, "no adapter release reads signin yet; name it when one does");
+        let e = signin_support(Some("0.2.0"), None).unwrap_err();
+        assert!(e.contains("0.2.0") && e.contains("no adapter release that does is published yet"), "{e}");
+        assert!(signin_support(Some("0.2.0"), Some("0.3.0")).unwrap_err().contains("predates 0.3.0"));
+        assert!(signin_support(Some("0.10.0"), Some("0.3.0")).is_ok(), "compared as numbers, not text");
+        assert!(signin_support(Some("0.3.0"), Some("0.3.0")).is_ok());
+        assert!(signin_support(Some("1.0.0"), Some("0.3.0")).is_ok());
+        assert!(signin_support(Some("0.3.0-rc.1"), Some("0.3.0")).is_err(), "a pre-release is not a release");
+        assert!(signin_support(None, Some("0.3.0")).is_err());
+        let mut p: Value = serde_json::from_str(kit::PINS_JSON).unwrap();
+        p["macos"]["ekka_backend"]["version"] = "v0.2".into();
+        p["macos"]["ekka_backend"]["archive_sha256"] = "a".repeat(64).into();
+        p["macos"]["ekka_backend"]["binary_sha256"] = "b".repeat(64).into();
+        assert!(Pins::parse(&p.to_string()).is_err(), "a pinned adapter's version must be comparable");
     }
 
     /// NVIDIA's real v0.1.9 Darwin gateway, downloaded over https (GitHub redirects the asset) into a temporary

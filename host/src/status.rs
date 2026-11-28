@@ -1,7 +1,9 @@
 //! `status` and `doctor`: what this host observes, as versioned, secret-free JSON with a reason for each failure.
 //!
 //! `status` reads state: the binding, the release, the records, the folders, the certificates' files, the
-//! services and the meter. `doctor` adds live probes that change nothing: the interceptor and the adapter answer
+//! services, the meter, the adapter's signing key (its public JWK and thumbprint, never the key), whether the
+//! adapter's desk-pass sign-in is written (or why not), and whether the gateway's one-time setup read back what this
+//! installation needs. `doctor` adds live probes that change nothing: the interceptor and the adapter answer
 //! on their sockets, the gateway completes verified TLS for both its names and refuses a wrong one, the gateway
 //! cannot be reached on this Mac's network address, its configuration has no unsafe setting, and the developer's
 //! own XDG folders hold no gateway state. No value printed is a key, a token or a password: only paths, owners,
@@ -15,6 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::adapter;
+use crate::adapter_key::{self, KeyState, PublicJwk};
+use crate::apply::Owners;
 use crate::binding::Binding;
 use crate::fsx;
 use crate::gateway_config;
@@ -72,7 +76,13 @@ pub struct Status {
     pub release: String,
     pub adapter_pinned: bool,
     pub enclave_enrolled: bool,
+    /// The adapter's signing key's public half, for registering the gateway (`adapter_public_jwk`); `None` unless
+    /// the key is there and safe to use.
+    pub adapter_public_jwk: Option<PublicJwk>,
+    /// Its RFC 7638 thumbprint, as Govern names the registered key (`adapter_kid`).
+    pub adapter_kid: Option<String>,
     pub services: Vec<Service>,
+    /// The gateway's one-time setup (`gateway-setup`): ok when the last setup read back what this installation needs.
     pub bootstrap: Check,
     /// Said plainly: a developer's Mac gives a desk no CPU or memory limit of its own in this release.
     pub desk_limits: String,
@@ -348,8 +358,78 @@ fn check_host_binary() -> Check {
     )
 }
 
+/// The adapter's signing key: there, the developer's alone (0600), and an ES256 key.
+fn check_adapter_key(state: &KeyState) -> Check {
+    match state {
+        KeyState::Usable { .. } => pass("adapter_key"),
+        KeyState::NoFolder => fail("adapter_key", "not installed: run ekka-desk-host install"),
+        KeyState::Absent => fail("adapter_key", "missing: run ekka-desk-host install, which makes it"),
+        KeyState::NotUsed(why) => fail("adapter_key", format!("{why}; run install --rotate-adapter-key")),
+    }
+}
+
+/// Whether the adapter's configuration carries the desk-pass sign-in for this installation, or why not.
+fn check_adapter_signin(l: &Layout, pins: &Pins, binding: &Binding, key: &KeyState) -> Check {
+    from(
+        "adapter_signin",
+        (|| {
+            let text = match std::fs::read(l.adapter_config()) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(if pins.adapter.is_none() {
+                        "waiting: no backend adapter is pinned for a Mac in this release, so it has no configuration"
+                            .to_string()
+                    } else {
+                        "waiting: the adapter's configuration is not written; it needs the enrolled Enclave".to_string()
+                    })
+                }
+                Err(e) => return Err(format!("{}: {e}", l.adapter_config().display())),
+            };
+            let cfg: serde_json::Value =
+                serde_json::from_slice(&text).map_err(|_| format!("{} is not JSON", l.adapter_config().display()))?;
+            let signin = &cfg["backend_gateway"]["signin"];
+            if signin.is_null() {
+                // Why root left it out, from what this side can see; install says it exactly.
+                crate::release::adapter_signin(pins)?;
+                if key.kid().is_none() {
+                    return Err(
+                        "this installation's adapter key is missing or not safe to use (see adapter_key)".into()
+                    );
+                }
+                if std::fs::symlink_metadata(l.d().join(crate::registration::RECORD)).is_err() {
+                    return Err("waiting: the gateway is not registered for this installation yet".into());
+                }
+                return Err("not written: Govern registered another adapter key than this one, or install has not run                             since the registration; run install again, it says which"
+                    .into());
+            }
+            let want_key = l.backend_dir().join(adapter_key::KEY_FILE).display().to_string();
+            let ours = signin["mode"] == adapter::SIGNIN_MODE
+                && signin["installation_id"] == binding.installation_id.as_str()
+                && signin["key_path"] == want_key.as_str();
+            if !ours {
+                return Err("the adapter's sign-in is not this installation's; run install again".into());
+            }
+            if key.kid().is_none() {
+                return Err(
+                    "the adapter's sign-in names a key that is missing or not safe to use (see adapter_key)".into()
+                );
+            }
+            Ok(())
+        })(),
+    )
+}
+
 /// The status of this Mac's desk host for the developer `l.uid`.
 pub fn status(l: &Layout, pins: &Pins, env: Option<&str>) -> Status {
+    let owners = Owners {
+        root: crate::fsx::Owner { uid: 0, gid: 0 },
+        dev: crate::fsx::Owner { uid: l.uid, gid: rustix::process::getgid().as_raw() },
+    };
+    status_with(l, pins, env, owners)
+}
+
+/// `status`, with who owns what given (root is uid 0 on a real install; tests own everything themselves).
+pub fn status_with(l: &Layout, pins: &Pins, env: Option<&str>, owners: Owners) -> Status {
     let (b, binding) = check_binding(l);
     let mut checks = vec![check_host_binary(), b];
     if binding.is_some() {
@@ -379,10 +459,12 @@ pub fn status(l: &Layout, pins: &Pins, env: Option<&str>) -> Status {
     } else {
         fail("services", format!("not running: {}", stopped.join(", ")))
     });
-    let bootstrap = fail(
-        "bootstrap",
-        "pending: the gateway's one-time setup needs an EKKA setup pass from Govern, which this release cannot obtain yet",
-    );
+    let key = adapter_key::inspect(l, owners);
+    if let Some(b) = &binding {
+        checks.push(check_adapter_key(&key));
+        checks.push(check_adapter_signin(l, pins, b, &key));
+    }
+    let bootstrap = from("bootstrap", crate::gateway_setup::check(l, owners));
     let ok = checks.iter().all(|c| c.ok) && bootstrap.ok;
     Status {
         schema: STATUS_SCHEMA,
@@ -392,6 +474,8 @@ pub fn status(l: &Layout, pins: &Pins, env: Option<&str>) -> Status {
         release: pins.release_id(),
         adapter_pinned: pins.adapter.is_some(),
         enclave_enrolled: enrolled.is_some(),
+        adapter_public_jwk: key.jwk().cloned(),
+        adapter_kid: key.kid().map(str::to_string),
         services,
         bootstrap,
         desk_limits: crate::install::no_desk_limits(vm),
@@ -480,7 +564,7 @@ mod tests {
         let by_id = |id: &str| s.checks.iter().find(|c| c.id == id).unwrap();
         assert_eq!(by_id("binding").reason.as_deref(), Some("not installed: run ekka-desk-host install"));
         assert!(by_id("host_binary").reason.as_deref().unwrap().contains(macos::HOST_BINARY));
-        assert!(!s.bootstrap.ok && s.bootstrap.reason.as_deref().unwrap().starts_with("pending"));
+        assert!(!s.bootstrap.ok && s.bootstrap.reason.as_deref().unwrap().starts_with("not done"), "{:?}", s.bootstrap);
         assert!(s.desk_limits.starts_with("desks on this Mac have no CPU or memory limit of their own"));
         assert!(s.desk_limits.contains("the room check still holds jobs when the VM is short of memory"));
     }
@@ -498,6 +582,33 @@ mod tests {
         let records = s.checks.iter().find(|c| c.id == "records").unwrap();
         assert!(!records.ok && records.reason.as_deref().unwrap().contains("uid 0"), "{records:?}");
         assert!(s.checks.iter().all(|c| c.ok || c.reason.as_deref().is_some_and(|r| !r.is_empty())));
+    }
+
+    #[test]
+    fn status_shows_the_adapter_keys_public_half_and_why_the_sign_in_is_not_written() {
+        let r = apply_tests::rig();
+        root_apply(&r.plan, &r.layout, apply_tests::owners(), &r.pins, &r.roots, &mut Ctx::apply()).unwrap();
+        let before = status_with(&r.layout, &r.pins, None, apply_tests::owners());
+        let check = |s: &Status, id: &str| s.checks.iter().find(|c| c.id == id).cloned().unwrap();
+        assert_eq!(
+            check(&before, "adapter_key").reason.as_deref(),
+            Some("missing: run ekka-desk-host install, which makes it")
+        );
+        assert_eq!(before.adapter_kid, None);
+        let made = adapter_key::ensure(&r.layout, apply_tests::owners(), false, None).unwrap();
+        let s = status_with(&r.layout, &r.pins, None, apply_tests::owners());
+        assert!(check(&s, "adapter_key").ok);
+        assert_eq!(s.adapter_kid.as_deref(), made.state.kid());
+        let json: serde_json::Value = serde_json::to_value(&s).unwrap();
+        let jwk = &json["adapter_public_jwk"];
+        assert_eq!((jwk["kty"].as_str(), jwk["crv"].as_str()), (Some("EC"), Some("P-256")));
+        assert_eq!(jwk.as_object().unwrap().len(), 4, "only kty, crv, x and y: never d");
+        assert_eq!(json["adapter_kid"].as_str(), made.state.kid());
+        let pem = std::fs::read_to_string(r.layout.backend_dir().join(adapter_key::KEY_FILE)).unwrap();
+        let text = json.to_string();
+        assert!(!text.contains("PRIVATE") && !text.contains(pem.lines().nth(1).unwrap()));
+        let signin = check(&s, "adapter_signin");
+        assert!(!signin.ok && signin.reason.as_deref().unwrap().starts_with("waiting"), "{signin:?}");
     }
 
     #[test]
