@@ -63,6 +63,13 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    outputs:
+      # One name per platform: the legs of a matrix share one set of outputs. What the next job joins and attests
+      # must equal what was checked here, not merely what the downloaded artifacts say.
+      digest_amd64: ${{ steps.check.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.check.outputs.digest_arm64 }}
+      sbom_amd64: ${{ steps.sbom.outputs.sbom_amd64 }}
+      sbom_arm64: ${{ steps.sbom.outputs.sbom_arm64 }}
     services:
       # The job's own registry: the built image is checked as it is pulled, by digest, never from the build's cache.
       registry:
@@ -89,10 +96,23 @@ jobs:
           [[ "$(docker version --format '{{.Server.Arch}}')" == "$ARCH" ]] \
             || { echo "::error::runner is $(docker version --format '{{.Server.Arch}}'), not $ARCH"; exit 1; }
 
+      - name: Docker buildx, pinned (sha256 from Docker's checksums.txt for v0.38.0, the version up.sh pins)
+        run: |
+          set -euo pipefail
+          case $(uname -m) in
+            x86_64)  f=buildx-v0.38.0.linux-amd64; sha=4fe4cc38adf48169132749b6ca22a990928db0118e3407584ee553723115d287 ;;
+            aarch64) f=buildx-v0.38.0.linux-arm64; sha=38e890e1a162bfdbf32fbe91404991dc4fc28e55b0de901b34374a061bab4d2c ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/docker-buildx" "https://github.com/docker/buildx/releases/download/v0.38.0/$f"
+          echo "$sha  $RUNNER_TEMP/docker-buildx" | sha256sum -c -
+          # The user's plugin folder comes before the runner's own, so this is the buildx every docker command runs.
+          install -D -m 0755 "$RUNNER_TEMP/docker-buildx" "${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins/docker-buildx"
+          v=$(docker buildx version); echo "$v"
+          [[ "$v" == *" v0.38.0 "* ]] || { echo "::error::docker runs another buildx"; exit 1; }
+
       - name: A builder, pinned by digest
         run: |
           set -euo pipefail
-          docker buildx version
           docker buildx create --use --name desk --driver docker-container --driver-opt "image=$BUILDKIT"
           docker buildx inspect --bootstrap desk
 
@@ -124,6 +144,7 @@ jobs:
           echo "$PLATFORM: built in ${took}s, $digest (ekka.desk.source=$src)" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: The image, pulled by its digest, is this platform and runs a desk's tools as the desk user
+        id: check
         env:
           PLATFORM: ${{ matrix.platform }}
           ARCH: ${{ matrix.arch }}
@@ -141,6 +162,7 @@ jobs:
             | tee run.txt
           grep -qx "dpkg: $ARCH  uid: 1000" run.txt || { echo "::error::not $ARCH, or not the desk user"; exit 1; }
           echo "ref=$ref" >> "$GITHUB_ENV"
+          echo "digest_$ARCH=$DIGEST" >> "$GITHUB_OUTPUT"
 
       # Handed to the next job before the SBOM tool, a third-party program, runs in this job.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -166,6 +188,7 @@ jobs:
           upload-release-assets: false
 
       - name: The SBOM is an SPDX document that lists packages
+        id: sbom
         env:
           ARCH: ${{ matrix.arch }}
         run: |
@@ -173,6 +196,7 @@ jobs:
           jq -e '.spdxVersion and (.packages | length > 0)' "sbom-$ARCH.spdx.json" > /dev/null
           echo "SBOM: $(jq '.packages | length' "sbom-$ARCH.spdx.json") packages, $(jq '[.files[]?] | length' \
             "sbom-$ARCH.spdx.json") file entries, $(wc -c < "sbom-$ARCH.spdx.json") bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "sbom_$ARCH=sha256:$(sha256sum < "sbom-$ARCH.spdx.json" | cut -c1-64)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
@@ -183,7 +207,7 @@ jobs:
 
   rehearse:
     # A pull request: the release's join, signing and verification, into the job's own registry with a throwaway
-    # key. The join step is the publish job's, word for word.
+    # key. The buildx, join and SBOM steps are the publish job's, word for word.
     if: github.event_name == 'pull_request'
     needs: build
     runs-on: ubuntu-24.04
@@ -209,20 +233,38 @@ jobs:
           sudo install -m 0755 "$RUNNER_TEMP/cosign" /usr/local/bin/cosign
           cosign version | grep GitVersion
 
+      - name: Docker buildx, pinned (sha256 from Docker's checksums.txt for v0.38.0, the version up.sh pins)
+        run: |
+          set -euo pipefail
+          case $(uname -m) in
+            x86_64)  f=buildx-v0.38.0.linux-amd64; sha=4fe4cc38adf48169132749b6ca22a990928db0118e3407584ee553723115d287 ;;
+            aarch64) f=buildx-v0.38.0.linux-arm64; sha=38e890e1a162bfdbf32fbe91404991dc4fc28e55b0de901b34374a061bab4d2c ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/docker-buildx" "https://github.com/docker/buildx/releases/download/v0.38.0/$f"
+          echo "$sha  $RUNNER_TEMP/docker-buildx" | sha256sum -c -
+          # The user's plugin folder comes before the runner's own, so this is the buildx every docker command runs.
+          install -D -m 0755 "$RUNNER_TEMP/docker-buildx" "${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins/docker-buildx"
+          v=$(docker buildx version); echo "$v"
+          [[ "$v" == *" v0.38.0 "* ]] || { echo "::error::docker runs another buildx"; exit 1; }
+
       - name: Join the two platforms into one index, named by its digest only
         id: index
         env:
           # A reference no consumer uses: the version tag is pointed at the index only after it is verified.
           STAGING: release-staging-${{ github.run_id }}-${{ github.run_attempt }}
+          # The digest each build job checked (pulled, run), from its job outputs, not from the artifact.
+          CHECKED_AMD64: ${{ needs.build.outputs.digest_amd64 }}
+          CHECKED_ARM64: ${{ needs.build.outputs.digest_arm64 }}
         run: |
           set -euo pipefail
-          docker buildx version
-          # Each build handed over a layout holding exactly one image, for its own platform.
+          # Each build handed over a layout holding exactly one image, for its own platform: the one it checked.
           for arch in amd64 arm64; do
+            checked="CHECKED_${arch^^}"; checked=${!checked}
+            [[ "$checked" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no checked digest for $arch"; exit 1; }
             line=$(jq -er '.manifests | if length == 1 then .[0] else error("not one image") end
                            | "\(.platform.os)/\(.platform.architecture) \(.digest)"' "in/image-$arch/index.json")
-            [[ "$line" =~ ^linux/$arch\ (sha256:[0-9a-f]{64})$ ]] || { echo "::error::image-$arch holds $line"; exit 1; }
-            declare "$arch=${BASH_REMATCH[1]}"
+            [[ "$line" == "linux/$arch $checked" ]] || { echo "::error::image-$arch holds $line, not $checked"; exit 1; }
+            declare "$arch=$checked"
           done
           docker buildx imagetools create --metadata-file created.json -t "$REPO:$STAGING" \
             "oci-layout://$PWD/in/image-amd64@$amd64" "oci-layout://$PWD/in/image-arm64@$arm64"
@@ -241,6 +283,18 @@ jobs:
           config() { jq -r .config.digest "in/image-$1/blobs/sha256/${2#sha256:}"; }
           { echo "index=$REPO@$digest"; echo "amd64=$REPO@$amd64"; echo "arm64=$REPO@$arm64"
             echo "amd64_config=$(config amd64 "$amd64")"; echo "arm64_config=$(config arm64 "$arm64")"; } >> "$GITHUB_OUTPUT"
+
+      - name: Each SBOM is the one its build job checked
+        env:
+          SBOM_AMD64: ${{ needs.build.outputs.sbom_amd64 }}
+          SBOM_ARM64: ${{ needs.build.outputs.sbom_arm64 }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            want="SBOM_${arch^^}"; want=${!want}
+            [[ "$want" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no SBOM hash for $arch"; exit 1; }
+            echo "${want#sha256:}  in/sbom-$arch/sbom-$arch.spdx.json" | sha256sum -c -
+          done
 
       - name: Sign the index and each platform with a throwaway key, attest each SBOM, and verify all of it
         env:
@@ -281,7 +335,7 @@ jobs:
 
   publish:
     # A version tag: the only job that can write a package or ask for a signing identity. It checks out nothing and
-    # runs no third-party action: GitHub's own download action, docker, and cosign pinned by sha256.
+    # runs no third-party action: GitHub's own download action, docker, and buildx and cosign pinned by sha256.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
@@ -309,6 +363,20 @@ jobs:
           sudo install -m 0755 "$RUNNER_TEMP/cosign" /usr/local/bin/cosign
           cosign version | grep GitVersion
 
+      - name: Docker buildx, pinned (sha256 from Docker's checksums.txt for v0.38.0, the version up.sh pins)
+        run: |
+          set -euo pipefail
+          case $(uname -m) in
+            x86_64)  f=buildx-v0.38.0.linux-amd64; sha=4fe4cc38adf48169132749b6ca22a990928db0118e3407584ee553723115d287 ;;
+            aarch64) f=buildx-v0.38.0.linux-arm64; sha=38e890e1a162bfdbf32fbe91404991dc4fc28e55b0de901b34374a061bab4d2c ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/docker-buildx" "https://github.com/docker/buildx/releases/download/v0.38.0/$f"
+          echo "$sha  $RUNNER_TEMP/docker-buildx" | sha256sum -c -
+          # The user's plugin folder comes before the runner's own, so this is the buildx every docker command runs.
+          install -D -m 0755 "$RUNNER_TEMP/docker-buildx" "${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins/docker-buildx"
+          v=$(docker buildx version); echo "$v"
+          [[ "$v" == *" v0.38.0 "* ]] || { echo "::error::docker runs another buildx"; exit 1; }
+
       - name: Sign in to ghcr.io with the workflow's own token
         env:
           TOKEN: ${{ github.token }}
@@ -320,15 +388,19 @@ jobs:
         env:
           # A reference no consumer uses: the version tag is pointed at the index only after it is verified.
           STAGING: release-staging-${{ github.run_id }}-${{ github.run_attempt }}
+          # The digest each build job checked (pulled, run), from its job outputs, not from the artifact.
+          CHECKED_AMD64: ${{ needs.build.outputs.digest_amd64 }}
+          CHECKED_ARM64: ${{ needs.build.outputs.digest_arm64 }}
         run: |
           set -euo pipefail
-          docker buildx version
-          # Each build handed over a layout holding exactly one image, for its own platform.
+          # Each build handed over a layout holding exactly one image, for its own platform: the one it checked.
           for arch in amd64 arm64; do
+            checked="CHECKED_${arch^^}"; checked=${!checked}
+            [[ "$checked" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no checked digest for $arch"; exit 1; }
             line=$(jq -er '.manifests | if length == 1 then .[0] else error("not one image") end
                            | "\(.platform.os)/\(.platform.architecture) \(.digest)"' "in/image-$arch/index.json")
-            [[ "$line" =~ ^linux/$arch\ (sha256:[0-9a-f]{64})$ ]] || { echo "::error::image-$arch holds $line"; exit 1; }
-            declare "$arch=${BASH_REMATCH[1]}"
+            [[ "$line" == "linux/$arch $checked" ]] || { echo "::error::image-$arch holds $line, not $checked"; exit 1; }
+            declare "$arch=$checked"
           done
           docker buildx imagetools create --metadata-file created.json -t "$REPO:$STAGING" \
             "oci-layout://$PWD/in/image-amd64@$amd64" "oci-layout://$PWD/in/image-arm64@$arm64"
@@ -348,20 +420,32 @@ jobs:
           { echo "index=$REPO@$digest"; echo "amd64=$REPO@$amd64"; echo "arm64=$REPO@$arm64"
             echo "amd64_config=$(config amd64 "$amd64")"; echo "arm64_config=$(config arm64 "$arm64")"; } >> "$GITHUB_OUTPUT"
 
+      - name: Each SBOM is the one its build job checked
+        env:
+          SBOM_AMD64: ${{ needs.build.outputs.sbom_amd64 }}
+          SBOM_ARM64: ${{ needs.build.outputs.sbom_arm64 }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            want="SBOM_${arch^^}"; want=${!want}
+            [[ "$want" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no SBOM hash for $arch"; exit 1; }
+            echo "${want#sha256:}  in/sbom-$arch/sbom-$arch.spdx.json" | sha256sum -c -
+          done
+
       - name: Sign the index and each platform keyless, attest each SBOM, and verify all of it
         env:
           INDEX: ${{ steps.index.outputs.index }}
           AMD64: ${{ steps.index.outputs.amd64 }}
           ARM64: ${{ steps.index.outputs.arm64 }}
-          IDENTITY: ^https://github\.com/${{ github.repository }}/\.github/workflows/desk-image\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$
           ISSUER: https://token.actions.githubusercontent.com
         run: |
           set -euo pipefail
-          # Before it is signed, verification refuses the index: the check below checks something.
-          if cosign verify --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" \
-               "$INDEX" > /dev/null 2>&1; then
-            echo "::error::an unsigned index passed verification"; exit 1
-          fi
+          # Exactly this workflow at this tag, never another tag's run. No check that the index is unsigned first:
+          # a re-run after a failed last step joins the same index, already signed, and signs it again (the
+          # pull request's rehearse job proves that an unsigned index is refused).
+          identity="https://github.com/$GITHUB_WORKFLOW_REF"
+          [[ "$identity" =~ ^https://github\.com/[^/]+/[^/]+/\.github/workflows/desk-image\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::not this workflow at a version tag: $identity"; exit 1; }
           for ref in "$INDEX" "$AMD64" "$ARM64"; do
             [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest to sign: $ref"; exit 1; }
             cosign sign --yes "$ref"
@@ -369,11 +453,11 @@ jobs:
           cosign attest --yes --type spdxjson --predicate in/sbom-amd64/sbom-amd64.spdx.json "$AMD64"
           cosign attest --yes --type spdxjson --predicate in/sbom-arm64/sbom-arm64.spdx.json "$ARM64"
           for ref in "$INDEX" "$AMD64" "$ARM64"; do
-            cosign verify --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" "$ref" > /dev/null
+            cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$ISSUER" "$ref" > /dev/null
           done
           for ref in "$AMD64" "$ARM64"; do
             cosign verify-attestation --type spdxjson \
-              --certificate-identity-regexp "$IDENTITY" --certificate-oidc-issuer "$ISSUER" "$ref" > /dev/null
+              --certificate-identity "$identity" --certificate-oidc-issuer "$ISSUER" "$ref" > /dev/null
           done
 
       - name: Last, point the version tag at the verified index
