@@ -36,7 +36,7 @@ OpenShell lets an outside service approve or refuse an action before it happens 
 
 | OpenShell action | What EKKA does |
 |---|---|
-| Create a desk | Allowed for a desk change run through EKKA (`ekka desk create`, on the installed machine). Refused for the Enclave's machine identity: the Enclave runs work on desks, it never makes them on its own. Recorded. |
+| Create a desk | Only a desk change run through EKKA (`ekka desk create`, on the installed machine). A create made directly at the gateway is refused, whoever signed in, and the refusal is recorded. Refused for the Enclave's machine identity: the Enclave runs work on desks, it never makes them on its own. Recorded. |
 | Delete a desk | Allowed for a desk change run through EKKA (`ekka desk delete`), recorded. Refused for the Enclave's machine identity. |
 | Change a desk's policy | Only a desk change run through EKKA, with a complete and valid policy. Never the desk itself, never the Enclave's machine identity, never while a job runs on that desk. Recorded. |
 | Propose a policy change from inside a desk | Telemetry is allowed; any proposed change is refused. |
@@ -47,8 +47,11 @@ OpenShell lets an outside service approve or refuse an action before it happens 
 | Remove a provider profile | Never while a job runs. Recorded. |
 | Open an SSH session into a desk | Refused: another way into the desk. |
 | Expose a service from a desk | Refused: another way out of the desk. |
+| Run a command inside a desk (`openshell sandbox exec`) | Not checked. NVIDIA's gateway offers no check for a running command session, so EKKA cannot see it. The desk's walls still apply to it. |
 
 That is 31 checks: 17 before an action and 14 recording what was done. They are listed in [`deploy/gateway/gateway.toml.template`](../deploy/gateway/gateway.toml.template).
+
+**The boundary, plainly:** EKKA records every desk change and enforces each desk's walls, but it does not see each command a person types inside a desk.
 
 ## Where your keys live
 
