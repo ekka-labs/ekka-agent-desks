@@ -115,15 +115,40 @@ impl Launchd for GatewayLaunchd {
     }
 }
 
-/// Removes the restart marker once launchd confirmed what it asked for.
-fn clear_pending(marker: &Path, pending: &mut Option<RestartPending>) -> Result<()> {
-    match std::fs::remove_file(marker) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(failed(format!("removing {}: {e}", marker.display()))),
+/// The restart marker, if there is one. Only "not there" is absence: a marker that cannot be read or is not one
+/// stops the install, with the fix, rather than passing as "nothing pending".
+pub fn read_pending(marker: &Path, uid: u32) -> Result<Option<RestartPending>> {
+    let fix = |why: String| {
+        refused(format!(
+            "{} {why}. Restart the gateway yourself (launchctl kickstart -k gui/{uid}/{LABEL_GATEWAY}), remove the \
+             file, and run install again",
+            marker.display()
+        ))
+    };
+    let meta = match std::fs::symlink_metadata(marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(fix(format!("cannot be read ({e})"))),
+        Ok(m) => m,
+    };
+    if !meta.file_type().is_file() || meta.len() > 64 * 1024 {
+        return Err(fix("is not a restart marker".into()));
     }
-    *pending = None;
-    Ok(())
+    let bytes = std::fs::read(marker).map_err(|e| fix(format!("cannot be read ({e})")))?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| fix("is not a restart marker".into()))
+}
+
+/// Removes the restart marker once launchd confirmed what it asked for, and only that marker: one a later install
+/// wrote meanwhile (another digest or action) is left for its own confirmation.
+fn clear_pending(marker: &Path, confirmed: &RestartPending, uid: u32) -> Result<bool> {
+    match read_pending(marker, uid)? {
+        Some(now) if &now == confirmed => match std::fs::remove_file(marker) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(failed(format!("removing {}: {e}", marker.display()))),
+        },
+        Some(_) => Ok(false),
+        None => Ok(true),
+    }
 }
 
 /// What status, doctor and install say about desk limits on a developer's Mac.
@@ -368,7 +393,7 @@ pub fn run(args: &Args) -> Result<Outcome> {
     };
     // A restart (or stop) the root step asked for, now or in an earlier install that did not finish it.
     let marker = l.run_dir().join(crate::registration::RESTART_PENDING);
-    let mut pending: Option<RestartPending> = std::fs::read(&marker).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let mut pending: Option<RestartPending> = read_pending(&marker, user.uid)?;
     let mut agents = vec![macos::enclave_agent(&l, &inputs)];
     if registered {
         agents.push(macos::gateway_agent(&l));
@@ -379,7 +404,11 @@ pub fn run(args: &Args) -> Result<Outcome> {
         if macos::service_state(user.uid, LABEL_GATEWAY).loaded || pending.is_some() {
             if finish(&launchd, &stop, Duration::from_secs(30))? {
                 out.changes.push("stopped the gateway: it has no registration for this installation".into());
-                clear_pending(&marker, &mut pending)?;
+                if let Some(p) = pending.take() {
+                    if !clear_pending(&marker, &p, user.uid)? {
+                        pending = read_pending(&marker, user.uid)?;
+                    }
+                }
             } else {
                 out.pending
                     .push("the gateway: launchd did not confirm it stopped; install finishes it next time".into());
@@ -434,7 +463,10 @@ pub fn run(args: &Args) -> Result<Outcome> {
                             macos::service_state(user.uid, LABEL_GATEWAY).running
                         })
                     {
-                        clear_pending(&marker, &mut pending)?;
+                        let p = pending.take().expect("checked just above");
+                        if !clear_pending(&marker, &p, user.uid)? {
+                            pending = read_pending(&marker, user.uid)?;
+                        }
                     }
                 }
                 GatewayAction::Reload => {
@@ -442,7 +474,11 @@ pub fn run(args: &Args) -> Result<Outcome> {
                     let restart = pending.clone().expect("a reload is for a pending restart");
                     if finish(&launchd, &restart, Duration::from_secs(30))? {
                         out.changes.push("restarted the gateway on its new trust configuration".into());
-                        clear_pending(&marker, &mut pending)?;
+                        pending = if clear_pending(&marker, &restart, user.uid)? {
+                            None
+                        } else {
+                            read_pending(&marker, user.uid)?
+                        };
                     }
                 }
                 GatewayAction::Unload | GatewayAction::Keep => {}
@@ -518,5 +554,27 @@ mod tests {
         assert!(e.reason.contains("(8 CPUs, 16384 MiB)") && e.reason.contains("a later release"), "{e}");
         // The same shape stays for a profile that sets one.
         assert!(desk_limits("server", None, None, &vm()).unwrap().is_some());
+    }
+
+    #[test]
+    fn only_a_missing_marker_is_no_marker_and_only_the_confirmed_one_is_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let m = t.path().join("gateway-restart.pending");
+        assert_eq!(read_pending(&m, 501).unwrap(), None);
+        std::fs::write(&m, b"not a marker").unwrap();
+        let e = read_pending(&m, 501).unwrap_err();
+        assert!(e.reason.contains("is not a restart marker") && e.reason.contains("kickstart -k"), "{e}");
+        std::fs::remove_file(&m).unwrap();
+        std::fs::create_dir(&m).unwrap();
+        assert!(read_pending(&m, 501).is_err(), "a folder is not absence");
+        std::fs::remove_dir(&m).unwrap();
+        // Confirmed A, while a second install wrote B: B stays for its own confirmation.
+        let a = RestartPending::new(false, "a".into());
+        let b = RestartPending::new(false, "b".into());
+        std::fs::write(&m, b.bytes()).unwrap();
+        assert!(!clear_pending(&m, &a, 501).unwrap());
+        assert_eq!(read_pending(&m, 501).unwrap(), Some(b.clone()));
+        assert!(clear_pending(&m, &b, 501).unwrap());
+        assert!(!m.exists());
     }
 }

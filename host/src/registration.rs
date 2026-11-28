@@ -127,24 +127,25 @@ impl Record {
 }
 
 /// A digest of everything the gateway trusts: its configuration, its registration record, its certificate, the CA
-/// and its token key. When the root step changes it, a running gateway must restart (or stop) to stop using the old.
-pub fn trust_digest(l: &crate::platform::macos::Layout) -> String {
+/// and its token key, read through the folders root has already checked (`d`, `tls`, `jwt`): never through a link,
+/// only regular files, at most 1 MiB each. When the root step changes it, a running gateway must restart (or stop).
+pub fn trust_digest_at(
+    d: Option<&std::os::fd::OwnedFd>,
+    tls: Option<&std::os::fd::OwnedFd>,
+    jwt: Option<&std::os::fd::OwnedFd>,
+) -> Result<String> {
     use crate::platform::macos::{CA_CERT, JWT_PUBLIC, LEAF_CERT};
-    let files = [
-        l.gateway_toml(),
-        l.d().join(RECORD),
-        l.tls_dir().join(LEAF_CERT),
-        l.tls_dir().join(CA_CERT),
-        l.jwt_dir().join(JWT_PUBLIC),
-    ];
+    let files = [(d, "gateway.toml"), (d, RECORD), (tls, LEAF_CERT), (tls, CA_CERT), (jwt, JWT_PUBLIC)];
     let mut all = Vec::new();
-    for f in files {
-        all.extend_from_slice(f.display().to_string().as_bytes());
+    for (dir, name) in files {
+        all.extend_from_slice(name.as_bytes());
         all.push(0);
-        all.extend(std::fs::read(&f).unwrap_or_default());
+        if let Some(dir) = dir {
+            all.extend(crate::fsx::read_at(dir, name, 1024 * 1024)?.unwrap_or_default());
+        }
         all.push(0);
     }
-    crate::util::sha256_hex(&all)
+    Ok(crate::util::sha256_hex(&all))
 }
 
 /// Root writes this, root-owned, into the developer's `D/run` in the same step that changes what the gateway
