@@ -1,6 +1,7 @@
 # This setup's gateway.toml. A template: setup writes deploy/state's copy with
-# @@PUBLIC_NAME@@ filled in. The bindings are the methods EKKA's adapter governs (17 validate, 12 post_commit), the
-# 29 RPC and phase pairs in all.
+# @@PUBLIC_NAME@@ filled in. The bindings are the methods EKKA's adapter governs (17 validate, 14 post_commit), the
+# 31 RPC and phase pairs in all. A method the adapter declares and this file leaves out is ignored by the gateway,
+# with only a warning at start ("ignoring manifest binding outside the operator allowlist").
 [openshell]
 version = 2
 
@@ -134,6 +135,14 @@ order = 20
 failure_policy = "fail_open"
 binding_policy = "allowlist"
 timeout = "500ms"
+
+[[openshell.gateway.interceptors.bindings]]
+rpc    = "openshell.v1.OpenShell/CreateSandbox"
+phases = ["post_commit"]  # record the committed change
+
+[[openshell.gateway.interceptors.bindings]]
+rpc    = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["post_commit"]  # record the committed change
 
 [[openshell.gateway.interceptors.bindings]]
 rpc    = "openshell.v1.OpenShell/AttachSandboxProvider"

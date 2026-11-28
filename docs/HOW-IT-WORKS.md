@@ -36,9 +36,9 @@ OpenShell lets an outside service approve or refuse an action before it happens 
 
 | OpenShell action | What EKKA does |
 |---|---|
-| Create a desk | Allowed for a desk change run through EKKA (`ekka desk create`, on the installed machine). Refused for the Enclave's machine identity: the Enclave runs work on desks, it never makes them on its own. |
+| Create a desk | Allowed for a desk change run through EKKA (`ekka desk create`, on the installed machine). Refused for the Enclave's machine identity: the Enclave runs work on desks, it never makes them on its own. Recorded. |
 | Delete a desk | Allowed for a desk change run through EKKA (`ekka desk delete`), recorded. Refused for the Enclave's machine identity. |
-| Change a desk's policy | Only a desk change run through EKKA, with a complete and valid policy. Never the desk itself, never the Enclave's machine identity, never while a job runs on that desk. |
+| Change a desk's policy | Only a desk change run through EKKA, with a complete and valid policy. Never the desk itself, never the Enclave's machine identity, never while a job runs on that desk. Recorded. |
 | Propose a policy change from inside a desk | Telemetry is allowed; any proposed change is refused. |
 | Attach a key to an existing desk | EKKA decides, for that exact key: yes, no, or wait for a person's decision. Never while a job runs. Recorded. |
 | Detach a key | Never while a job runs. Recorded. |
@@ -48,7 +48,7 @@ OpenShell lets an outside service approve or refuse an action before it happens 
 | Open an SSH session into a desk | Refused: another way into the desk. |
 | Expose a service from a desk | Refused: another way out of the desk. |
 
-That is 23 checks: 14 before an action and 9 recording what was done. They are listed in [`deploy/gateway/gateway.toml.template`](../deploy/gateway/gateway.toml.template).
+That is 31 checks: 17 before an action and 14 recording what was done. They are listed in [`deploy/gateway/gateway.toml.template`](../deploy/gateway/gateway.toml.template).
 
 ## Where your keys live
 
